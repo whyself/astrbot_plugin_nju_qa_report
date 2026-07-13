@@ -1508,7 +1508,10 @@ class ReportStorage:
                 (code, int(row["id"])),
             )
         connection.execute(
-            "CREATE UNIQUE INDEX idx_question_candidates_code ON question_candidates(question_code)"
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_question_candidates_code
+                ON question_candidates(question_code)
+            """
         )
 
     @staticmethod
@@ -1565,7 +1568,10 @@ class ReportStorage:
         for statement in statements:
             connection.execute(statement)
         connection.execute(
-            "CREATE INDEX idx_question_candidates_date ON question_candidates(report_date, id)"
+            """
+            CREATE INDEX IF NOT EXISTS idx_question_candidates_date
+                ON question_candidates(report_date, id)
+            """
         )
 
     @staticmethod

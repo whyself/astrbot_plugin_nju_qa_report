@@ -88,6 +88,26 @@ def test_storage_initialization_is_idempotent_and_uses_safety_pragmas(
     storage.close()
 
 
+def test_migrations_tolerate_indexes_left_by_an_older_partial_run(tmp_path: Path) -> None:
+    """A reload must recover when schema rows lag behind already-created indexes."""
+
+    path = tmp_path / "report.sqlite3"
+    storage = ReportStorage(path)
+    storage.initialize()
+    storage.close()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 3")
+        connection.commit()
+
+    recovered = ReportStorage(path)
+    recovered.initialize()
+    with sqlite3.connect(path) as connection:
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+    assert version == 5
+    recovered.close()
+
+
 def test_failed_migration_rolls_back_partial_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
