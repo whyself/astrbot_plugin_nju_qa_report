@@ -296,20 +296,28 @@ class InvestigationService:
         search_queries: set[str] = set()
         grep_terms: set[str] = set()
         read_documents: set[tuple[str, str]] = set()
-        max_rounds = 6
+        max_tool_rounds = 6
+        max_rounds = 8
 
         for round_no in range(1, max_rounds + 1):
             evidence = _agent_evidence(found.values(), read_sections)
+            must_finish = round_no > max_tool_rounds
             data = await self._ai.next_step(
                 cluster,
                 evidence,
                 tool_history,
-                must_finish=round_no == max_rounds,
+                must_finish=must_finish,
             )
             action = str(data.get("action", "")).strip().lower()
             if action == "tools":
-                if round_no == max_rounds:
-                    raise InvestigationError("调查 Agent 达到轮次上限后仍未给出最终结论")
+                if must_finish:
+                    tool_history.append(
+                        {
+                            "tool": "contract_error",
+                            "message": "工具调查阶段已结束；现在必须依据已有证据返回 final",
+                        }
+                    )
+                    continue
                 try:
                     calls = _parse_tool_calls(data)
                 except InvestigationError as exc:

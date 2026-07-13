@@ -47,6 +47,10 @@ def test_every_command_checks_its_role_before_serving() -> None:
         }
         if command.name == "operator_help":
             assert actions == {"VIEW_REPORT", "OPERATE"}
+        elif command.name == "report_show":
+            # Every viewer may inspect the report, while only operators receive
+            # the stored internal error summary for failed investigations.
+            assert actions == {"VIEW_REPORT", "OPERATE"}
         elif command.name.startswith("report_"):
             assert actions == {"VIEW_REPORT"}, command.name
         else:

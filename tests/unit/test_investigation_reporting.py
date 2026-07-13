@@ -29,6 +29,7 @@ from nju_report.reporting import (
     _render_mail_text,
     _visible_evidence,
     coverage_counts,
+    coverage_list_order,
     format_coverage_counts,
     format_question_detail,
 )
@@ -183,6 +184,70 @@ def test_investigation_uses_search_and_grep_and_persists_evidence(tmp_path: Path
         assert any(item.startswith("grep:") for item in result.queries)
         assert any(item.startswith("read:") for item in result.queries)
         assert storage.latest_investigation(cluster.question_code) == result
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_agent_gets_dedicated_finalization_after_six_tool_rounds(tmp_path: Path) -> None:
+    class LongRunningAi(FakeAi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rounds = 0
+
+        async def next_step(self, cluster, evidence, tool_history, *, must_finish):
+            self.rounds += 1
+            if self.rounds == 1:
+                return {
+                    "action": "tools",
+                    "tool_calls": [
+                        {"tool": "search", "query": "校园卡补办"},
+                        {"tool": "search", "query": "校园卡挂失办理"},
+                        {"tool": "grep", "text": "校园卡"},
+                    ],
+                }
+            if self.rounds == 2:
+                return {
+                    "action": "tools",
+                    "tool_calls": [
+                        {
+                            "tool": "read",
+                            "namespace": evidence[0].namespace,
+                            "document_id": evidence[0].document_id,
+                            "offset": 0,
+                            "focus": "挂失",
+                        }
+                    ],
+                }
+            if self.rounds <= 6:
+                return {
+                    "action": "tools",
+                    "tool_calls": [
+                        {"tool": "search", "query": f"补办流程 改写 {self.rounds}"}
+                    ],
+                }
+            assert must_finish is True
+            return await super().next_step(
+                cluster,
+                evidence,
+                tool_history,
+                must_finish=must_finish,
+            )
+
+    async def run() -> None:
+        storage, config, cluster, hit = _prepared_case(tmp_path, repository_status="READY")
+        ai = LongRunningAi()
+        service = InvestigationService(  # type: ignore[arg-type]
+            config,
+            storage,
+            FakeKnowledge([hit]),
+            ai,
+        )
+
+        result = await service.investigate(cluster)
+
+        assert ai.rounds == 7
+        assert result.status is CoverageStatus.PARTIAL
         storage.close()
 
     asyncio.run(run())
@@ -458,6 +523,28 @@ def test_public_counts_fold_legacy_incomplete_into_execution_error(tmp_path: Pat
     assert "程序执行异常 1" in format_coverage_counts(counts)
     assert [item.question_code for item in clusters] == [cluster.question_code]
     storage.close()
+
+
+def test_public_list_order_is_missing_partial_answerable_then_error() -> None:
+    statuses = [
+        CoverageStatus.ERROR,
+        CoverageStatus.ANSWERABLE,
+        CoverageStatus.NO_USABLE_EVIDENCE,
+        CoverageStatus.PARTIAL,
+    ]
+
+    ordered = sorted(statuses, key=coverage_list_order)
+
+    assert ordered == [
+        CoverageStatus.NO_USABLE_EVIDENCE,
+        CoverageStatus.PARTIAL,
+        CoverageStatus.ANSWERABLE,
+        CoverageStatus.ERROR,
+    ]
+    counts = {status: 1 for status in ordered}
+    text = format_coverage_counts(counts)
+    assert text.index("未找到可用信息") < text.index("部分覆盖")
+    assert text.index("部分覆盖") < text.index("明确回答")
 
 
 def test_mail_groups_questions_in_red_yellow_green_order() -> None:

@@ -70,11 +70,23 @@ def coverage_counts(
 def format_coverage_counts(counts: dict[CoverageStatus, int]) -> str:
     return (
         "状态统计："
-        f"明确回答 {counts[CoverageStatus.ANSWERABLE]}｜"
-        f"部分覆盖 {counts[CoverageStatus.PARTIAL]}｜"
         f"未找到可用信息 {counts[CoverageStatus.NO_USABLE_EVIDENCE]}｜"
+        f"部分覆盖 {counts[CoverageStatus.PARTIAL]}｜"
+        f"明确回答 {counts[CoverageStatus.ANSWERABLE]}｜"
         f"程序执行异常 {counts[CoverageStatus.ERROR]}"
     )
+
+
+def coverage_list_order(status: CoverageStatus) -> int:
+    """Order public list rows as missing, partial, answerable, then execution errors."""
+
+    public_status = public_coverage_status(status)
+    return {
+        CoverageStatus.NO_USABLE_EVIDENCE: 0,
+        CoverageStatus.PARTIAL: 1,
+        CoverageStatus.ANSWERABLE: 2,
+        CoverageStatus.ERROR: 3,
+    }[public_status]
 
 
 @dataclass(frozen=True, slots=True)

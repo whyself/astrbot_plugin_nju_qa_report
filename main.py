@@ -36,6 +36,7 @@ from .nju_report.reporting import (
     ReportService,
     coverage_counts,
     coverage_label,
+    coverage_list_order,
     format_coverage_counts,
     format_question_detail,
     public_coverage_status,
@@ -55,7 +56,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.6.5",
+    "0.6.6",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -315,6 +316,13 @@ class NjuQaReportPlugin(Star):
             )
             is status_filter
         ]
+        filtered.sort(
+            key=lambda cluster: coverage_list_order(
+                investigations[cluster.question_code].status
+                if cluster.question_code in investigations
+                else CoverageStatus.ERROR
+            )
+        )
         start = (page - 1) * page_size
         shown = filtered[start : start + page_size]
         if not shown:
@@ -369,13 +377,25 @@ class NjuQaReportPlugin(Star):
                 self.storage.latest_investigation,
                 question_code,
             )
-            yield event.plain_result(
-                format_question_detail(
-                    cluster,
-                    investigation,
-                    timezone_name=self.runtime_config.timezone,
-                )
+            detail = format_question_detail(
+                cluster,
+                investigation,
+                timezone_name=self.runtime_config.timezone,
             )
+            operator_authorization = self.permissions.authorize(
+                sender_id=event.get_sender_id(),
+                action=PermissionAction.OPERATE,
+                is_private=event.is_private_chat(),
+                is_astrbot_admin=event.is_admin(),
+            )
+            if (
+                operator_authorization.allowed
+                and investigation is not None
+                and investigation.status is CoverageStatus.ERROR
+                and investigation.error_summary
+            ):
+                detail += f"\n技术详情（仅管理员）：{investigation.error_summary}"
+            yield event.plain_result(detail)
             return
         candidate = await asyncio.to_thread(self.storage.get_question_candidate, question_code)
         if candidate is None:
@@ -934,8 +954,14 @@ class NjuQaReportPlugin(Star):
             logger.exception("NJU report rebuild after investigation failed")
             yield event.plain_result(f"调查已留档，但 HTML 更新失败：{type(exc).__name__}")
             return
+        technical_detail = (
+            f"\n技术详情：{result.error_summary}"
+            if result.status is CoverageStatus.ERROR and result.error_summary
+            else ""
+        )
         yield event.plain_result(
-            f"调查完成：{question_code} / {result.status.value}\n{result.summary}"
+            f"调查完成：{question_code} / {result.status.value}\n"
+            f"{result.summary}{technical_detail}"
         )
 
     @nju_collect_report.command("status")
