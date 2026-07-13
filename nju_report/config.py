@@ -11,6 +11,9 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _NAMESPACE_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*")
+_EMAIL_RE = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+_DEFAULT_TARGET_GROUPS = ("826811581",)
+_DEFAULT_GROUP_ALIASES = {"826811581": "南京大学迎新群"}
 
 
 class ConfigError(ValueError):
@@ -39,7 +42,7 @@ class PluginConfig:
 
     capture_enabled: bool = False
     capture_mode: str = "selected_groups"
-    target_group_ids: tuple[str, ...] = ()
+    target_group_ids: tuple[str, ...] = _DEFAULT_TARGET_GROUPS
     group_aliases: Mapping[str, str] | None = None
     command_prefixes: tuple[str, ...] = ("/",)
     capture_queue_size: int = 5000
@@ -68,7 +71,7 @@ class PluginConfig:
     purge_excluded_repository_data: bool = True
 
     daily_report_enabled: bool = False
-    daily_report_time: str = "03:30"
+    daily_report_time: str = "00:00"
     smtp_host: str = ""
     smtp_port: int = 465
     smtp_username: str = ""
@@ -101,18 +104,21 @@ class PluginConfig:
         if capture_mode not in {"selected_groups", "all_group_messages"}:
             raise ConfigError("capture_mode 必须是 selected_groups 或 all_group_messages")
 
-        target_group_ids = _id_tuple(raw.get("target_group_ids", ()), "target_group_ids")
+        target_group_ids = _id_tuple(
+            raw.get("target_group_ids", _DEFAULT_TARGET_GROUPS),
+            "target_group_ids",
+        )
         capture_enabled = _boolean(raw, "capture_enabled", False)
         if capture_enabled and capture_mode == "selected_groups" and not target_group_ids:
             raise ConfigError("启用 selected_groups 采集前必须填写 target_group_ids")
-        aliases = _aliases(raw.get("group_aliases", {}))
+        aliases = _aliases(raw.get("group_aliases", _DEFAULT_GROUP_ALIASES))
         timezone = _string(raw, "timezone", "Asia/Shanghai")
         try:
             ZoneInfo(timezone)
         except ZoneInfoNotFoundError as exc:
             raise ConfigError("timezone 不是有效的 IANA 时区") from exc
 
-        report_time = _string(raw, "daily_report_time", "03:30")
+        report_time = _string(raw, "daily_report_time", "00:00")
         _parse_time(report_time)
 
         retention = _integer(
@@ -204,11 +210,10 @@ class PluginConfig:
             smtp_username=_string(raw, "smtp_username", ""),
             smtp_password=_string(raw, "smtp_password", ""),
             smtp_use_ssl=_boolean(raw, "smtp_use_ssl", True),
-            mail_from=_string(raw, "mail_from", ""),
-            mail_recipients=_string_tuple(
+            mail_from=_optional_email(_string(raw, "mail_from", ""), "mail_from"),
+            mail_recipients=_email_tuple(
                 raw.get("mail_recipients", ()),
                 "mail_recipients",
-                allow_empty_collection=True,
             ),
         )
 
@@ -353,3 +358,18 @@ def _parse_time(value: str) -> time:
         return time(hour=hour, minute=minute)
     except (ValueError, TypeError) as exc:
         raise ConfigError("daily_report_time 必须使用 HH:MM 格式") from exc
+
+
+def _optional_email(value: str, field: str) -> str:
+    normalized = value.strip()
+    if normalized and not _EMAIL_RE.fullmatch(normalized):
+        raise ConfigError(f"{field} 必须是有效邮箱地址")
+    return normalized
+
+
+def _email_tuple(value: Any, field: str) -> tuple[str, ...]:
+    addresses = _string_tuple(value, field, allow_empty_collection=True)
+    for address in addresses:
+        if not _EMAIL_RE.fullmatch(address):
+            raise ConfigError(f"{field} 包含无效邮箱地址")
+    return addresses

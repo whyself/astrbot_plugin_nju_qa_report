@@ -26,6 +26,9 @@ def test_defaults_are_safe_and_exclude_qa_repository() -> None:
     assert config.capture_enabled is False
     assert config.daily_report_enabled is False
     assert config.timezone == "Asia/Shanghai"
+    assert config.target_group_ids == ("826811581",)
+    assert config.group_alias("826811581") == "南京大学迎新群"
+    assert config.daily_report_time == "00:00"
     assert config.scope_auto_review_enabled is True
     assert config.scope_auto_review_max_rounds == 2
     assert [item.namespace for item in config.excluded_repositories] == ["qc19gt/ogaye8"]
@@ -33,12 +36,16 @@ def test_defaults_are_safe_and_exclude_qa_repository() -> None:
 
 def test_enabled_selected_capture_requires_target_groups() -> None:
     with pytest.raises(ConfigError, match="target_group_ids"):
-        PluginConfig.from_mapping({"capture_enabled": True})
+        PluginConfig.from_mapping({"capture_enabled": True, "target_group_ids": []})
 
 
 def test_all_group_mode_can_be_enabled_without_target_list() -> None:
     config = PluginConfig.from_mapping(
-        {"capture_enabled": True, "capture_mode": "all_group_messages"}
+        {
+            "capture_enabled": True,
+            "capture_mode": "all_group_messages",
+            "target_group_ids": [],
+        }
     )
     assert config.capture_enabled is True
     assert config.target_group_ids == ()
@@ -104,3 +111,17 @@ def test_group_alias_falls_back_to_masked_group_id() -> None:
     config = PluginConfig.from_mapping({"group_aliases": {"12345678": "迎新一群"}})
     assert config.group_alias("12345678") == "迎新一群"
     assert config.group_alias("87654321") == "群聊-****4321"
+
+
+def test_email_recipients_are_validated_and_independent_from_qq_roles() -> None:
+    config = PluginConfig.from_mapping(
+        {
+            "mail_recipients": ["maintainer@example.edu.cn"],
+            "report_viewer_qq_ids": [],
+            "operator_qq_ids": [],
+        }
+    )
+    assert config.mail_recipients == ("maintainer@example.edu.cn",)
+
+    with pytest.raises(ConfigError, match="邮箱"):
+        PluginConfig.from_mapping({"mail_recipients": ["not-an-email"]})

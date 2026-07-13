@@ -41,6 +41,12 @@ def prepare_scope_input(
     )
 
 
+def redact_for_report(text: str, *, max_chars: int = 2000) -> str:
+    """Return a bounded, identifier-redacted copy safe for reports and exports."""
+
+    return _truncate(_redact(str(text)), max_chars)
+
+
 def _redact(text: str) -> str:
     redacted = _CONTROL_RE.sub("", text)
     redacted = _URL_RE.sub("[链接]", redacted)

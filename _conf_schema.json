@@ -15,14 +15,14 @@
   "target_group_ids": {
     "description": "需要采集的 QQ 群号（字符串数组）",
     "type": "list",
-    "default": [],
+    "default": ["826811581"],
     "hint": "selected_groups 模式下必填。请将 QQ 群号作为字符串填写。"
   },
   "group_aliases": {
     "description": "群号到日报群别名的映射",
     "type": "dict",
     "items": {},
-    "default": {},
+    "default": {"826811581": "南京大学迎新群"},
     "hint": "例如 {\"123456\": \"南大迎新群一\"}。日报不直接显示群号。"
   },
   "command_prefixes": {
@@ -156,7 +156,7 @@
   "daily_report_time": {
     "description": "每日日报执行时间（HH:MM）",
     "type": "string",
-    "default": "03:30"
+    "default": "00:00"
   },
   "smtp_host": {
     "description": "SMTP 服务器",
@@ -191,7 +191,7 @@
     "default": ""
   },
   "mail_recipients": {
-    "description": "日报收件地址列表",
+    "description": "日报收件地址列表（与 QQ 查看/管理权限独立配置）",
     "type": "list",
     "default": []
   }

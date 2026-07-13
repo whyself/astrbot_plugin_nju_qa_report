@@ -101,3 +101,44 @@ class ScopeResolution:
     review_attempts: tuple[ScopeAssessment, ...] = ()
     retryable: bool = False
     error_summary: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionCandidate:
+    """One locally retained scope-screening result."""
+
+    question_code: str
+    source_key: str
+    report_date: str
+    original_question: str
+    canonical_question: str
+    category: str
+    initial_decision: str
+    final_decision: str
+    reason: str
+    confidence: float
+    status: str
+    group_alias: str
+    sent_at_utc: int
+    created_at_utc: int
+    updated_at_utc: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessingWindowRecord:
+    """Persistent state and counts for one idempotent daily run."""
+
+    report_date: str
+    timezone: str
+    start_utc: int
+    end_utc: int
+    status: str
+    run_id: str
+    messages_scanned: int
+    candidates_saved: int
+    included_count: int
+    dropped_count: int
+    error_count: int
+    error_summary: str
+    created_at_utc: int
+    updated_at_utc: int

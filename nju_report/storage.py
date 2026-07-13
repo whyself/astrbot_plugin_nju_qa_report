@@ -7,12 +7,20 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from .models import ScopeAssessment, ScopeResolution, StoredMessage
+from .models import (
+    ProcessingWindowRecord,
+    QuestionCandidate,
+    ScopeAssessment,
+    ScopeResolution,
+    StoredMessage,
+)
 from .time_windows import TimeWindow
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class StorageError(RuntimeError):
@@ -131,6 +139,33 @@ class ReportStorage:
                 return None
             return int(row[0])
 
+    def question_candidate_count(self, *, report_date: str | None = None) -> int:
+        """Return the number of retained scope-screening records."""
+
+        with self._lock:
+            if report_date is None:
+                row = self._conn.execute("SELECT COUNT(*) FROM question_candidates").fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM question_candidates WHERE report_date = ?",
+                    (report_date,),
+                ).fetchone()
+            return int(row[0])
+
+    def message_local_dates(self, timezone_name: str) -> list[str]:
+        """List local dates that currently have captured messages."""
+
+        local_timezone = ZoneInfo(timezone_name)
+        dates: set[str] = set()
+        with self._lock:
+            cursor = self._conn.execute("SELECT sent_at_utc FROM messages ORDER BY sent_at_utc ASC")
+            while rows := cursor.fetchmany(1000):
+                for row in rows:
+                    dates.add(
+                        datetime.fromtimestamp(int(row[0]), tz=local_timezone).date().isoformat()
+                    )
+        return sorted(dates)
+
     def delete_expired_messages(self, cutoff_utc: int) -> int:
         """Delete raw messages older than the cutoff unless a live window needs them."""
 
@@ -204,6 +239,153 @@ class ReportStorage:
             for row in rows
         ]
 
+    def begin_processing_window(self, window: TimeWindow, *, run_id: str) -> bool:
+        """Start or retry a date; return ``False`` only when it already completed."""
+
+        if not run_id.strip():
+            raise ValueError("run_id 不能为空")
+        report_date = window.report_date.isoformat()
+        now = int(time.time())
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT status FROM processing_windows WHERE report_date = ?",
+                (report_date,),
+            ).fetchone()
+            if existing is not None and existing["status"] == "COMPLETED":
+                return False
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO processing_windows (
+                        report_date, timezone, start_utc, end_utc, status, run_id,
+                        messages_scanned, candidates_saved, included_count,
+                        dropped_count, error_count, error_summary,
+                        created_at_utc, updated_at_utc
+                    ) VALUES (?, ?, ?, ?, 'RUNNING', ?, 0, 0, 0, 0, 0, '', ?, ?)
+                    """,
+                    (
+                        report_date,
+                        window.timezone_name,
+                        window.start_timestamp,
+                        window.end_timestamp,
+                        run_id,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE processing_windows
+                    SET timezone = ?, start_utc = ?, end_utc = ?, status = 'RUNNING',
+                        run_id = ?, messages_scanned = 0, candidates_saved = 0,
+                        included_count = 0, dropped_count = 0, error_count = 0,
+                        error_summary = '', updated_at_utc = ?
+                    WHERE report_date = ?
+                    """,
+                    (
+                        window.timezone_name,
+                        window.start_timestamp,
+                        window.end_timestamp,
+                        run_id,
+                        now,
+                        report_date,
+                    ),
+                )
+            return True
+
+    def complete_processing_window(
+        self,
+        report_date: str,
+        *,
+        messages_scanned: int,
+        candidates_saved: int,
+        included_count: int,
+        dropped_count: int,
+        error_count: int,
+    ) -> None:
+        """Atomically persist successful run totals."""
+
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE processing_windows
+                SET status = 'COMPLETED', messages_scanned = ?, candidates_saved = ?,
+                    included_count = ?, dropped_count = ?, error_count = ?,
+                    error_summary = '', updated_at_utc = ?
+                WHERE report_date = ? AND status = 'RUNNING'
+                """,
+                (
+                    messages_scanned,
+                    candidates_saved,
+                    included_count,
+                    dropped_count,
+                    error_count,
+                    int(time.time()),
+                    report_date,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError("日报处理窗口不是可完成的 RUNNING 状态")
+
+    def fail_processing_window(self, report_date: str, error_summary: str) -> None:
+        """Mark a run retryable while keeping already written candidate records."""
+
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE processing_windows
+                SET status = 'FAILED', error_summary = ?, updated_at_utc = ?
+                WHERE report_date = ? AND status = 'RUNNING'
+                """,
+                (error_summary[:1000], int(time.time()), report_date),
+            )
+
+    def processing_window(self, report_date: str) -> ProcessingWindowRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM processing_windows WHERE report_date = ?",
+                (report_date,),
+            ).fetchone()
+        return _processing_window_from_row(row) if row is not None else None
+
+    def list_question_candidates(
+        self,
+        *,
+        report_date: str | None = None,
+        limit: int | None = 50,
+        offset: int = 0,
+    ) -> tuple[list[QuestionCandidate], int]:
+        """Return all decisions, including excluded and technical-error candidates."""
+
+        if offset < 0 or (limit is not None and limit < 1):
+            raise ValueError("limit/offset 无效")
+        where = ""
+        params: list[object] = []
+        if report_date is not None:
+            where = " WHERE report_date = ?"
+            params.append(report_date)
+        with self._lock:
+            total_row = self._conn.execute(
+                f"SELECT COUNT(*) FROM question_candidates{where}",  # noqa: S608
+                params,
+            ).fetchone()
+            sql = f"SELECT * FROM question_candidates{where} ORDER BY report_date DESC, id ASC"  # noqa: S608
+            query_params = list(params)
+            if limit is not None:
+                sql += " LIMIT ? OFFSET ?"
+                query_params.extend((limit, offset))
+            rows = self._conn.execute(sql, query_params).fetchall()
+        return [_candidate_from_row(row) for row in rows], int(total_row[0])
+
+    def get_question_candidate(self, question_code: str) -> QuestionCandidate | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM question_candidates WHERE question_code = ?",
+                (question_code.strip().upper(),),
+            ).fetchone()
+        return _candidate_from_row(row) if row is not None else None
+
     def upsert_scope_candidate(
         self,
         *,
@@ -212,6 +394,9 @@ class ReportStorage:
         initial: ScopeAssessment,
         final: ScopeAssessment | None = None,
         status: str = "CLASSIFIED",
+        original_question: str = "",
+        group_alias: str = "",
+        sent_at_utc: int = 0,
     ) -> int:
         """Create or update a candidate without creating a human review queue."""
 
@@ -223,6 +408,9 @@ class ReportStorage:
                 initial=initial,
                 final=final or initial,
                 status=status,
+                original_question=original_question,
+                group_alias=group_alias,
+                sent_at_utc=sent_at_utc,
             )
 
     def record_scope_review(
@@ -260,6 +448,9 @@ class ReportStorage:
         report_date: str,
         review_run_id: str,
         resolution: ScopeResolution,
+        original_question: str = "",
+        group_alias: str = "",
+        sent_at_utc: int = 0,
     ) -> int:
         """Atomically save the candidate terminal state and all AI review rounds."""
 
@@ -275,6 +466,9 @@ class ReportStorage:
                 initial=initial,
                 final=resolution.assessment,
                 status=status,
+                original_question=original_question,
+                group_alias=group_alias,
+                sent_at_utc=sent_at_utc,
             )
             for round_no, assessment in enumerate(
                 resolution.review_attempts,
@@ -312,13 +506,27 @@ class ReportStorage:
         initial: ScopeAssessment,
         final: ScopeAssessment,
         status: str,
+        original_question: str,
+        group_alias: str,
+        sent_at_utc: int,
     ) -> int:
         now = int(time.time())
+        existing = connection.execute(
+            "SELECT id, question_code FROM question_candidates WHERE source_key = ?",
+            (source_key,),
+        ).fetchone()
+        question_code = (
+            str(existing["question_code"])
+            if existing is not None
+            else ReportStorage._next_question_code_tx(connection, report_date)
+        )
         connection.execute(
             """
             INSERT INTO question_candidates (
                 source_key,
+                question_code,
                 report_date,
+                original_question,
                 canonical_question,
                 category,
                 initial_decision,
@@ -326,10 +534,13 @@ class ReportStorage:
                 reason,
                 confidence,
                 status,
+                group_alias,
+                sent_at_utc,
                 created_at_utc,
                 updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_key) DO UPDATE SET
+                original_question = excluded.original_question,
                 canonical_question = excluded.canonical_question,
                 category = excluded.category,
                 initial_decision = excluded.initial_decision,
@@ -337,11 +548,15 @@ class ReportStorage:
                 reason = excluded.reason,
                 confidence = excluded.confidence,
                 status = excluded.status,
+                group_alias = excluded.group_alias,
+                sent_at_utc = excluded.sent_at_utc,
                 updated_at_utc = excluded.updated_at_utc
             """,
             (
                 source_key,
+                question_code,
                 report_date,
+                original_question,
                 final.canonical_question,
                 final.category,
                 initial.decision.value,
@@ -349,6 +564,8 @@ class ReportStorage:
                 final.reason,
                 final.confidence,
                 status,
+                group_alias,
+                int(sent_at_utc),
                 now,
                 now,
             ),
@@ -360,6 +577,21 @@ class ReportStorage:
         if row is None:
             raise StorageError("无法保存问题候选记录")
         return int(row[0])
+
+    @staticmethod
+    def _next_question_code_tx(connection: sqlite3.Connection, report_date: str) -> str:
+        date_key = report_date.replace("-", "")
+        prefix = f"{date_key}-Q"
+        rows = connection.execute(
+            "SELECT question_code FROM question_candidates WHERE report_date = ?",
+            (report_date,),
+        ).fetchall()
+        maximum = 0
+        for row in rows:
+            code = str(row[0])
+            if code.startswith(prefix) and code[len(prefix) :].isdigit():
+                maximum = max(maximum, int(code[len(prefix) :]))
+        return f"{prefix}{maximum + 1:03d}"
 
     @staticmethod
     def _record_scope_review_tx(
@@ -454,6 +686,13 @@ class ReportStorage:
                     "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
                     (1, int(time.time())),
                 )
+                version = 1
+            if version < 2:
+                self._migration_v2(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+                    (2, int(time.time())),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -540,3 +779,81 @@ class ReportStorage:
         )
         for statement in statements:
             connection.execute(statement)
+
+    @staticmethod
+    def _migration_v2(connection: sqlite3.Connection) -> None:
+        """Retain every screening result and persist idempotent run summaries."""
+
+        statements = (
+            "ALTER TABLE question_candidates ADD COLUMN question_code TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE question_candidates ADD COLUMN original_question TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE question_candidates ADD COLUMN group_alias TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE question_candidates ADD COLUMN sent_at_utc INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE processing_windows ADD COLUMN run_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE processing_windows ADD COLUMN messages_scanned INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE processing_windows ADD COLUMN candidates_saved INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE processing_windows ADD COLUMN included_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE processing_windows ADD COLUMN dropped_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE processing_windows ADD COLUMN error_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE processing_windows ADD COLUMN error_summary TEXT NOT NULL DEFAULT ''",
+        )
+        for statement in statements:
+            connection.execute(statement)
+
+        counters: dict[str, int] = {}
+        rows = connection.execute(
+            "SELECT id, report_date FROM question_candidates ORDER BY report_date, id"
+        ).fetchall()
+        for row in rows:
+            report_date = str(row["report_date"])
+            counters[report_date] = counters.get(report_date, 0) + 1
+            code = f"{report_date.replace('-', '')}-Q{counters[report_date]:03d}"
+            connection.execute(
+                "UPDATE question_candidates SET question_code = ? WHERE id = ?",
+                (code, int(row["id"])),
+            )
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_question_candidates_code ON question_candidates(question_code)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_question_candidates_date ON question_candidates(report_date, id)"
+        )
+
+
+def _candidate_from_row(row: sqlite3.Row) -> QuestionCandidate:
+    return QuestionCandidate(
+        question_code=str(row["question_code"]),
+        source_key=str(row["source_key"]),
+        report_date=str(row["report_date"]),
+        original_question=str(row["original_question"]),
+        canonical_question=str(row["canonical_question"]),
+        category=str(row["category"]),
+        initial_decision=str(row["initial_decision"]),
+        final_decision=str(row["final_decision"]),
+        reason=str(row["reason"]),
+        confidence=float(row["confidence"]),
+        status=str(row["status"]),
+        group_alias=str(row["group_alias"]),
+        sent_at_utc=int(row["sent_at_utc"]),
+        created_at_utc=int(row["created_at_utc"]),
+        updated_at_utc=int(row["updated_at_utc"]),
+    )
+
+
+def _processing_window_from_row(row: sqlite3.Row) -> ProcessingWindowRecord:
+    return ProcessingWindowRecord(
+        report_date=str(row["report_date"]),
+        timezone=str(row["timezone"]),
+        start_utc=int(row["start_utc"]),
+        end_utc=int(row["end_utc"]),
+        status=str(row["status"]),
+        run_id=str(row["run_id"]),
+        messages_scanned=int(row["messages_scanned"]),
+        candidates_saved=int(row["candidates_saved"]),
+        included_count=int(row["included_count"]),
+        dropped_count=int(row["dropped_count"]),
+        error_count=int(row["error_count"]),
+        error_summary=str(row["error_summary"]),
+        created_at_utc=int(row["created_at_utc"]),
+        updated_at_utc=int(row["updated_at_utc"]),
+    )
