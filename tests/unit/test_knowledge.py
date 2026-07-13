@@ -117,5 +117,9 @@ async def _sync_and_search_case(tmp_path: Path) -> None:
     records = {str(item["namespace"]): item for item in storage.repository_records()}
     assert records["qc19gt/guide"]["status"] == "READY"
     assert records["qc19gt/ogaye8"]["status"] == "EXCLUDED"
+    progress = service.progress()
+    assert progress.syncing is False
+    assert progress.repository_index == progress.repository_total == 1
+    assert progress.document_completed == progress.document_total == 1
     await service.close()
     storage.close()

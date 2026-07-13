@@ -29,7 +29,7 @@ class DailyRunResult:
 
     @property
     def skipped(self) -> bool:
-        return self.status == "SKIPPED_COMPLETED"
+        return self.status in {"SKIPPED_COMPLETED", "SKIPPED_REPORT_COMPLETE"}
 
 
 class DailyQuestionProcessor:
@@ -54,14 +54,26 @@ class DailyQuestionProcessor:
         self._concurrency = concurrency
         self._context_radius = context_radius
         self._run_lock = asyncio.Lock()
+        self._progress_date = ""
+        self._progress_completed = 0
+        self._progress_total = 0
 
     @property
     def running(self) -> bool:
         return self._run_lock.locked()
 
-    async def process_date(self, report_date: date) -> DailyRunResult:
+    @property
+    def progress(self) -> tuple[str, int, int]:
+        return self._progress_date, self._progress_completed, self._progress_total
+
+    async def process_date(
+        self,
+        report_date: date,
+        *,
+        force: bool = False,
+    ) -> DailyRunResult:
         async with self._run_lock:
-            return await self._process_date(report_date)
+            return await self._process_date(report_date, force=force)
 
     async def process_all_history(self, *, before_date: date) -> list[DailyRunResult]:
         """Process every local date before ``before_date`` and skip completed dates."""
@@ -74,13 +86,19 @@ class DailyQuestionProcessor:
             dates = [date.fromisoformat(item) for item in raw_dates]
             return [await self._process_date(item) for item in dates if item < before_date]
 
-    async def _process_date(self, report_date: date) -> DailyRunResult:
+    async def _process_date(
+        self,
+        report_date: date,
+        *,
+        force: bool = False,
+    ) -> DailyRunResult:
         window = natural_day_window(report_date, self._timezone_name)
         run_id = uuid4().hex
         should_run = await asyncio.to_thread(
             self._storage.begin_processing_window,
             window,
             run_id=run_id,
+            force=force,
         )
         if not should_run:
             existing = await asyncio.to_thread(
@@ -114,7 +132,14 @@ class DailyQuestionProcessor:
                         review_run_id=f"{run_id}:{index}",
                     )
 
-            decisions = await asyncio.gather(*(screen(index, item) for index, item in analyzable))
+            tasks = [asyncio.create_task(screen(index, item)) for index, item in analyzable]
+            decisions: list[ScopeDecision] = []
+            self._progress_date = report_date.isoformat()
+            self._progress_total = len(tasks)
+            self._progress_completed = 0
+            for completed, task in enumerate(asyncio.as_completed(tasks), start=1):
+                decisions.append(await task)
+                self._progress_completed = completed
             included_count = sum(item is ScopeDecision.INCLUDE for item in decisions)
             error_count = sum(item is ScopeDecision.AUTO_REVIEW_ERROR for item in decisions)
             dropped_count = len(decisions) - included_count - error_count

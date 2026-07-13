@@ -42,7 +42,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.2.1",
+    "0.2.2",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -455,6 +455,15 @@ class NjuQaReportPlugin(Star):
         records = await asyncio.to_thread(self.storage.repository_records)
         documents, chunks = await asyncio.to_thread(self.storage.knowledge_counts)
         lines = [f"本地知识库：文档 {documents}，分块 {chunks}"]
+        progress = self.knowledge_service.progress()
+        if progress.syncing:
+            lines.append(
+                f"同步进度：仓库 {progress.repository_index}/{progress.repository_total}｜"
+                f"{progress.namespace}｜文档 "
+                f"{progress.document_completed}/{progress.document_total}"
+            )
+        else:
+            lines.append("同步任务：空闲")
         if not records:
             lines.append("尚未运行语雀同步。")
         for item in records:
@@ -574,7 +583,7 @@ class NjuQaReportPlugin(Star):
                 "/nju_collect report run all"
             )
             return
-        if self.workflow.running:
+        if self.workflow.progress().running:
             yield event.plain_result("已有日报批处理正在运行，请稍后查询状态。")
             return
         try:
@@ -582,23 +591,28 @@ class NjuQaReportPlugin(Star):
         except TimeoutError:
             logger.warning("NJU report run started with capture messages still pending")
 
-        try:
-            await self.workflow.sync_knowledge()
-        except KnowledgeError as exc:
-            yield event.plain_result(f"知识库同步失败，日报未开始：{exc}")
-            return
-
         current_date = today_in_timezone(self.runtime_config.timezone)
         normalized = tail.lower()
         try:
             if normalized in {"all", "全部"}:
+                dates = await self.workflow.history_dates(before_date=current_date)
+                pending = [
+                    item for item in dates if not await self.workflow.is_report_complete(item)
+                ]
+                if pending:
+                    await self.workflow.sync_knowledge()
                 results = await self.workflow.run_all_history(before_date=current_date)
             else:
                 requested_date = date.fromisoformat(tail)
                 if requested_date >= current_date:
                     yield event.plain_result("只能处理已经结束的自然日，不能锁定今天或未来日期。")
                     return
+                if not await self.workflow.is_report_complete(requested_date):
+                    await self.workflow.sync_knowledge()
                 results = [await self.workflow.run_date(requested_date)]
+        except KnowledgeError as exc:
+            yield event.plain_result(f"知识库同步失败，日报未开始：{exc}")
+            return
         except ValueError:
             yield event.plain_result("日期必须使用 YYYY-MM-DD，或填写 all/全部。")
             return
@@ -612,6 +626,47 @@ class NjuQaReportPlugin(Star):
             return
         await asyncio.to_thread(self.question_exporter.export_all)
         yield event.plain_result(_format_full_run_results(results))
+
+    @nju_collect_report.command("rerun")
+    async def operator_report_rerun(self, event: AstrMessageEvent):
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.OPERATE,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
+        parts = _command_tail(event.get_message_str(), "nju_collect report rerun").split()
+        if len(parts) != 2 or parts[1].lower() not in {"confirm", "确认"}:
+            yield event.plain_result(
+                "强制重跑会重新执行该日 AI 筛选、聚合和全部知识调查。\n"
+                "确认执行：/nju_collect report rerun YYYY-MM-DD confirm"
+            )
+            return
+        try:
+            requested_date = date.fromisoformat(parts[0])
+        except ValueError:
+            yield event.plain_result("日期必须使用 YYYY-MM-DD。")
+            return
+        current_date = today_in_timezone(self.runtime_config.timezone)
+        if requested_date >= current_date:
+            yield event.plain_result("只能强制重跑已经结束的自然日。")
+            return
+        if self.workflow.progress().running:
+            yield event.plain_result("已有日报任务运行中；可用 report status 查询进度。")
+            return
+        try:
+            await self.capture_writer.flush(timeout_seconds=30)
+            await self.workflow.sync_knowledge()
+            result = await self.workflow.run_date(requested_date, force=True)
+            await asyncio.to_thread(self.question_exporter.export_all)
+        except Exception as exc:
+            logger.exception("NJU forced report rerun failed")
+            yield event.plain_result(f"强制重跑失败：{type(exc).__name__}")
+            return
+        yield event.plain_result("强制重跑完成\n" + _format_full_run_results([result]))
 
     @nju_collect_report.command("preview")
     async def operator_report_preview(self, event: AstrMessageEvent):
@@ -706,6 +761,42 @@ class NjuQaReportPlugin(Star):
             yield event.plain_result(authorization.user_message)
             return
         tail = _command_tail(event.get_message_str(), "nju_collect report status")
+        progress = self.workflow.progress()
+        if not tail:
+            if not progress.running:
+                yield event.plain_result(
+                    "日报任务：空闲\n查看某日：/nju_collect report status YYYY-MM-DD"
+                )
+                return
+            knowledge_progress = self.knowledge_service.progress()
+            if knowledge_progress.syncing:
+                yield event.plain_result(
+                    "日报任务运行中\n"
+                    "当前阶段：同步语雀知识库\n"
+                    f"仓库：{knowledge_progress.repository_index}/"
+                    f"{knowledge_progress.repository_total}｜"
+                    f"{knowledge_progress.namespace}\n"
+                    f"文档：{knowledge_progress.document_completed}/"
+                    f"{knowledge_progress.document_total}"
+                )
+                return
+            screening = ""
+            if progress.screening_total and progress.stage == "AI 筛选与自动复核":
+                screening = f"\n消息筛选：{progress.screening_completed}/{progress.screening_total}"
+            investigation = ""
+            if progress.investigation_total and progress.stage == "知识库调查":
+                investigation = (
+                    f"\n知识调查：{progress.investigation_completed}/{progress.investigation_total}"
+                )
+            yield event.plain_result(
+                "日报任务运行中\n"
+                f"日期进度：{progress.date_index}/{progress.date_total}\n"
+                f"当前日期：{progress.report_date}\n"
+                f"当前阶段：{progress.stage}"
+                f"{screening}"
+                f"{investigation}"
+            )
+            return
         try:
             requested_date = date.fromisoformat(tail)
         except ValueError:
@@ -742,6 +833,11 @@ class NjuQaReportPlugin(Star):
             f"已调查：{len(investigations)}\n"
             f"HTML 日报：{('版本 ' + str(report.version)) if report else '未生成'}\n"
             f"运行中：{'是' if self.workflow.running else '否'}"
+            + (
+                f"\n当前阶段：{progress.stage}"
+                if progress.running and progress.report_date == requested_date.isoformat()
+                else ""
+            )
         )
 
     @nju_collect.command("export")
@@ -932,8 +1028,8 @@ def _format_full_run_results(results: list[FullReportRunResult]) -> str:
         f"需重试日期：{len(retry_pending)}",
         f"扫描消息：{sum(item.screening.messages_scanned for item in processed)}",
         f"本次留档：{sum(item.screening.candidates_saved for item in processed)}",
-        f"聚合问题：{sum(item.cluster_count for item in results)}",
-        f"生成报告：{sum(item.report is not None for item in results)}",
+        f"本次聚合问题：{sum(item.cluster_count for item in processed)}",
+        f"新生成或更新报告：{sum(item.report is not None for item in processed)}",
         f"技术错误：{sum(item.screening.error_count for item in processed)}",
     ]
     if skipped:

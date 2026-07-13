@@ -49,6 +49,16 @@ class KnowledgeSyncResult:
         return sum(len(item.failures) for item in self.repositories)
 
 
+@dataclass(frozen=True, slots=True)
+class KnowledgeSyncProgress:
+    syncing: bool
+    namespace: str = ""
+    repository_index: int = 0
+    repository_total: int = 0
+    document_completed: int = 0
+    document_total: int = 0
+
+
 class YuqueClient:
     """Small async client for the subset of Yuque v2 used by the report."""
 
@@ -228,10 +238,25 @@ class KnowledgeService:
         )
         self._embedding = embedding_client or EmbeddingClient(config)
         self._sync_lock = asyncio.Lock()
+        self._progress_namespace = ""
+        self._progress_repository_index = 0
+        self._progress_repository_total = 0
+        self._progress_document_completed = 0
+        self._progress_document_total = 0
 
     @property
     def syncing(self) -> bool:
         return self._sync_lock.locked()
+
+    def progress(self) -> KnowledgeSyncProgress:
+        return KnowledgeSyncProgress(
+            syncing=self.syncing,
+            namespace=self._progress_namespace,
+            repository_index=self._progress_repository_index,
+            repository_total=self._progress_repository_total,
+            document_completed=self._progress_document_completed,
+            document_total=self._progress_document_total,
+        )
 
     async def close(self) -> None:
         await self._yuque.close()
@@ -253,7 +278,13 @@ class KnowledgeService:
         async with self._sync_lock:
             result = KnowledgeSyncResult()
             await asyncio.to_thread(self._apply_exclusions, result)
-            for namespace in self._allowed_namespaces():
+            namespaces = self._allowed_namespaces()
+            self._progress_repository_total = len(namespaces)
+            for index, namespace in enumerate(namespaces, start=1):
+                self._progress_namespace = namespace
+                self._progress_repository_index = index
+                self._progress_document_completed = 0
+                self._progress_document_total = 0
                 result.repositories.append(await self._sync_repository(namespace))
             return result
 
@@ -354,8 +385,16 @@ class KnowledgeService:
                 status="SYNCING",
             )
             toc = await self._yuque.get_toc(namespace)
+            document_nodes = [
+                node
+                for node in toc
+                if _text(node.get("type")).upper() in {"", "DOC", "SHEET"}
+                and _text(node.get("id"))
+                and (_text(node.get("url")) or _text(node.get("slug")))
+            ]
+            self._progress_document_total = len(document_nodes)
             seen: set[str] = set()
-            for node in toc:
+            for node in document_nodes:
                 node_type = _text(node.get("type")).upper()
                 if node_type and node_type not in {"DOC", "SHEET"}:
                     continue
@@ -413,6 +452,8 @@ class KnowledgeService:
                     raise
                 except Exception as exc:
                     result.failures.append(f"{yuque_id}:{type(exc).__name__}")
+                finally:
+                    self._progress_document_completed += 1
             result.documents_deleted = await asyncio.to_thread(
                 self._storage.delete_missing_knowledge_documents,
                 namespace,

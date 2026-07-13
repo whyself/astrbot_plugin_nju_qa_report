@@ -42,6 +42,8 @@
 /nju_collect report run 2026-07-12
 /nju_collect report run all
 /nju_collect report status 2026-07-12
+/nju_collect report status
+/nju_collect report rerun 2026-07-12 confirm
 /nju_collect test startup
 /nju_collect test startup live
 /nju_collect import inspect
@@ -57,6 +59,11 @@
 `report run` 会先同步允许仓库并生成本地 HTML，但不会发邮件。检查 `report preview`
 后再显式执行 `report send`。只有开启 `daily_report_enabled` 后，定时任务才会自动同步、
 处理前一自然日并发送邮件。
+
+普通 `report run`/`run all` 会跳过已成功生成完整报告的日期；只有管理员显式执行
+带 `confirm` 的 `report rerun` 才会重新调用该日的 AI 筛选和知识调查。长任务不会主动
+刷进度消息，可重复发送不带日期的 `/nju_collect report status` 查询当前阶段和计数；
+语雀同步进度使用 `/nju_collect repo status` 查询。
 
 ## 相关项目
 

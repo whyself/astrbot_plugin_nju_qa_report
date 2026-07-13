@@ -140,15 +140,30 @@ class InvestigationService:
         self._knowledge = knowledge
         self._ai = ai
         self._semaphore = asyncio.Semaphore(config.batch_concurrency)
+        self._progress_date = ""
+        self._progress_completed = 0
+        self._progress_total = 0
+
+    @property
+    def progress(self) -> tuple[str, int, int]:
+        return self._progress_date, self._progress_completed, self._progress_total
 
     async def investigate_date(self, report_date: str) -> list[InvestigationResult]:
         clusters = await asyncio.to_thread(self._storage.list_question_clusters, report_date)
+        self._progress_date = report_date
+        self._progress_completed = 0
+        self._progress_total = len(clusters)
 
         async def one(cluster: QuestionCluster) -> InvestigationResult:
             async with self._semaphore:
                 return await self.investigate(cluster)
 
-        return await asyncio.gather(*(one(cluster) for cluster in clusters))
+        tasks = [asyncio.create_task(one(cluster)) for cluster in clusters]
+        result: list[InvestigationResult] = []
+        for completed, task in enumerate(asyncio.as_completed(tasks), start=1):
+            result.append(await task)
+            self._progress_completed = completed
+        return result
 
     async def investigate(self, cluster: QuestionCluster) -> InvestigationResult:
         queries = _queries_for(cluster)

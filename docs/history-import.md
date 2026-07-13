@@ -88,7 +88,14 @@ Access Token 只用于打开本机 QCE 页面，不要上传到 AstrBot、GitHub
 ```
 
 `report run all` 会执行 AI 筛选、问题聚合、群友回答关联、知识库调查并生成 HTML，
-不会自动发邮件。历史消息很多时会产生较多模型调用，请保持 AstrBot 运行并等待完成。
+不会自动发邮件，并会跳过已经成功生成完整报告的日期。历史消息很多时会产生较多模型调用，
+请保持 AstrBot 运行；另开一条私聊反复发送 `/nju_collect report status` 可查询当前进度。
+
+只有确实需要重新计算某一天时才使用：
+
+```text
+/nju_collect report rerun 2026-07-01 confirm
+```
 
 再按日期查看：
 

@@ -128,6 +128,9 @@ def test_all_history_reports_completed_dates_as_skipped(tmp_path: Path) -> None:
     assert len(results) == 1
     assert results[0].status == "SKIPPED_COMPLETED"
     assert results[0].candidates_saved == 1
+    forced = asyncio.run(processor.process_date(report_date, force=True))
+    assert forced.status == "COMPLETED"
+    assert forced.skipped is False
     storage.close()
 
 

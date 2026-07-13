@@ -27,6 +27,19 @@ class FullReportRunResult:
     delivery: DeliverySummary | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class WorkflowProgress:
+    running: bool
+    stage: str
+    report_date: str
+    date_index: int
+    date_total: int
+    screening_completed: int
+    screening_total: int
+    investigation_completed: int
+    investigation_total: int
+
+
 class DailyReportWorkflow:
     """Run all report stages in order under one process-wide lock."""
 
@@ -49,46 +62,152 @@ class DailyReportWorkflow:
         self._knowledge = knowledge
         self._timezone_name = timezone_name
         self._lock = asyncio.Lock()
+        self._stage = "空闲"
+        self._current_date = ""
+        self._date_index = 0
+        self._date_total = 0
 
     @property
     def running(self) -> bool:
         return self._lock.locked()
 
+    def progress(self) -> WorkflowProgress:
+        screening_date, screening_completed, screening_total = self._question_processor.progress
+        if screening_date != self._current_date:
+            screening_completed = screening_total = 0
+        investigation_date, investigation_completed, investigation_total = (
+            self._investigation.progress
+        )
+        if investigation_date != self._current_date:
+            investigation_completed = investigation_total = 0
+        return WorkflowProgress(
+            running=self.running or self._knowledge.syncing,
+            stage=self._stage,
+            report_date=self._current_date,
+            date_index=self._date_index,
+            date_total=self._date_total,
+            screening_completed=screening_completed,
+            screening_total=screening_total,
+            investigation_completed=investigation_completed,
+            investigation_total=investigation_total,
+        )
+
     async def sync_knowledge(self) -> None:
-        await self._knowledge.sync_all()
+        self._stage = "同步语雀知识库"
+        try:
+            await self._knowledge.sync_all()
+        finally:
+            if not self.running:
+                self._stage = "空闲"
 
     async def run_date(
         self,
         report_date: date,
         *,
         deliver: bool = False,
+        force: bool = False,
     ) -> FullReportRunResult:
         async with self._lock:
-            screening = await self._question_processor.process_date(report_date)
-            if screening.status == "FAILED":
-                return FullReportRunResult(screening, 0, None)
-            clusters = await self._aggregation.aggregate_date(report_date)
-            await self._investigation.investigate_date(report_date.isoformat())
-            report = await self._reports.build(report_date.isoformat())
-            delivery = await self._reports.deliver(report) if deliver else None
-            return FullReportRunResult(screening, len(clusters), report, delivery)
+            self._date_index = 1
+            self._date_total = 1
+            try:
+                return await self._run_date_locked(
+                    report_date,
+                    deliver=deliver,
+                    force=force,
+                )
+            finally:
+                self._stage = "空闲"
 
     async def run_all_history(
         self,
         *,
         before_date: date,
         deliver: bool = False,
+        force: bool = False,
     ) -> list[FullReportRunResult]:
-        dates = await asyncio.to_thread(
+        dates = await self.history_dates(before_date=before_date)
+        async with self._lock:
+            self._date_total = len(dates)
+            result: list[FullReportRunResult] = []
+            try:
+                for index, current in enumerate(dates, start=1):
+                    self._date_index = index
+                    result.append(
+                        await self._run_date_locked(
+                            current,
+                            deliver=deliver,
+                            force=force,
+                        )
+                    )
+                return result
+            finally:
+                self._stage = "空闲"
+
+    async def history_dates(self, *, before_date: date) -> list[date]:
+        raw_dates = await asyncio.to_thread(
             self._storage.message_local_dates,
             self._timezone_name,
         )
-        result: list[FullReportRunResult] = []
-        for raw in dates:
-            current = date.fromisoformat(raw)
-            if current < before_date:
-                result.append(await self.run_date(current, deliver=deliver))
-        return result
+        return [
+            date.fromisoformat(item) for item in raw_dates if date.fromisoformat(item) < before_date
+        ]
+
+    async def is_report_complete(self, report_date: date) -> bool:
+        return await self._completed_result(report_date) is not None
+
+    async def _run_date_locked(
+        self,
+        report_date: date,
+        *,
+        deliver: bool,
+        force: bool,
+    ) -> FullReportRunResult:
+        self._current_date = report_date.isoformat()
+        if not force:
+            completed = await self._completed_result(report_date)
+            if completed is not None:
+                if deliver and completed.report is not None:
+                    self._stage = "发送邮件"
+                    delivery = await self._reports.deliver(completed.report)
+                    return FullReportRunResult(
+                        completed.screening,
+                        completed.cluster_count,
+                        completed.report,
+                        delivery,
+                    )
+                return completed
+        self._stage = "AI 筛选与自动复核"
+        screening = await self._question_processor.process_date(report_date, force=force)
+        if screening.status == "FAILED":
+            return FullReportRunResult(screening, 0, None)
+        self._stage = "问题聚合与群友回答关联"
+        clusters = await self._aggregation.aggregate_date(report_date)
+        self._stage = "知识库调查"
+        await self._investigation.investigate_date(report_date.isoformat())
+        self._stage = "生成 HTML 日报"
+        report = await self._reports.build(report_date.isoformat())
+        self._stage = "发送邮件" if deliver else "完成"
+        delivery = await self._reports.deliver(report) if deliver else None
+        return FullReportRunResult(screening, len(clusters), report, delivery)
+
+    async def _completed_result(self, report_date: date) -> FullReportRunResult | None:
+        raw_date = report_date.isoformat()
+        window = await asyncio.to_thread(self._storage.processing_window, raw_date)
+        report = await asyncio.to_thread(self._storage.latest_report, raw_date)
+        if window is None or window.status != "COMPLETED" or report is None:
+            return None
+        clusters = await asyncio.to_thread(self._storage.list_question_clusters, raw_date)
+        screening = DailyRunResult(
+            report_date=raw_date,
+            status="SKIPPED_REPORT_COMPLETE",
+            messages_scanned=window.messages_scanned,
+            candidates_saved=window.candidates_saved,
+            included_count=window.included_count,
+            dropped_count=window.dropped_count,
+            error_count=window.error_count,
+        )
+        return FullReportRunResult(screening, len(clusters), report)
 
     async def deliver_latest(self, report_date: str) -> DeliverySummary:
         report = await asyncio.to_thread(self._storage.latest_report, report_date)

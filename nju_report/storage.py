@@ -911,7 +911,13 @@ class ReportStorage:
             for row in rows
         ]
 
-    def begin_processing_window(self, window: TimeWindow, *, run_id: str) -> bool:
+    def begin_processing_window(
+        self,
+        window: TimeWindow,
+        *,
+        run_id: str,
+        force: bool = False,
+    ) -> bool:
         """Start or retry a date; return ``False`` only when it already completed."""
 
         if not run_id.strip():
@@ -923,7 +929,7 @@ class ReportStorage:
                 "SELECT status FROM processing_windows WHERE report_date = ?",
                 (report_date,),
             ).fetchone()
-            if existing is not None and existing["status"] == "COMPLETED":
+            if existing is not None and existing["status"] == "COMPLETED" and not force:
                 return False
             if existing is None:
                 connection.execute(
