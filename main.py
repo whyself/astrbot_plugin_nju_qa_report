@@ -53,7 +53,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.5.2",
+    "0.5.3",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -406,26 +406,43 @@ class NjuQaReportPlugin(Star):
     @nju_collect.command("help")
     async def operator_help(self, event: AstrMessageEvent):
         event.stop_event()
-        authorization = self.permissions.authorize(
+        viewer = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.VIEW_REPORT,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        operator = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
             is_private=event.is_private_chat(),
             is_astrbot_admin=event.is_admin(),
         )
-        if not authorization.allowed:
-            yield event.plain_result(authorization.user_message)
+        if not viewer.allowed and not operator.allowed:
+            yield event.plain_result(viewer.user_message or operator.user_message)
             return
-        yield event.plain_result(
-            "NJU 日报指令（以下省略 /nju_collect）\n"
-            "日常：status｜help\n"
-            "历史处理：import inspect｜import run\n"
-            "仓库：repo status｜repo sync｜repo search <关键词>\n"
-            "报告：report run <日期|all>｜report rerun <日期> confirm｜"
-            "report status [日期]｜report preview <日期>｜report send <日期>\n"
-            "诊断：test startup [live]｜test scope <问题>｜investigate <问题编号>｜"
-            "export questions\n"
-            "示例：/nju_collect report status 2026-07-12"
-        )
+        lines = [
+            "日报查看：/南哪日报 列表 [日期|all] [状态] [页码]（浏览问题）｜"
+            "/南哪日报 查看 <问题编号>（查看详情）｜/南哪日报 导出（下载简表）｜"
+            "/南哪日报 关于（插件信息）",
+        ]
+        if operator.allowed:
+            lines.extend(
+                (
+                    "",
+                    "运维指令（以下省略 /nju_collect）：",
+                    "日常：status（插件状态）｜help（本帮助）",
+                    "历史处理：import inspect（检查文件）｜import run（导入记录）",
+                    "仓库：repo status（同步状态）｜repo sync（同步语雀）｜"
+                    "repo search <关键词>（本地检索）",
+                    "报告：report run <日期|all>（正常处理）｜"
+                    "report rerun <日期> confirm（强制重跑）｜report status [日期]（进度）｜"
+                    "report preview <日期>（预览 HTML）｜report send <日期>（发送邮件）",
+                    "诊断：test startup [live]（配置检查）｜test scope <问题>（筛选测试）｜"
+                    "investigate <问题编号>（重新调查）｜export questions（导出总表）",
+                )
+            )
+        yield event.plain_result("\n".join(lines))
 
     @nju_collect.command("status")
     async def operator_status(self, event: AstrMessageEvent):

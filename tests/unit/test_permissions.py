@@ -17,7 +17,7 @@ def _service(**overrides: object) -> PermissionService:
     return PermissionService(PluginConfig.from_mapping(raw))
 
 
-def test_viewer_and_operator_permissions_are_independent() -> None:
+def test_operator_includes_viewer_while_viewer_cannot_operate() -> None:
     service = _service()
 
     assert service.authorize(
@@ -38,7 +38,7 @@ def test_viewer_and_operator_permissions_are_independent() -> None:
         is_private=True,
         is_astrbot_admin=False,
     ).allowed
-    assert not service.authorize(
+    assert service.authorize(
         sender_id="operator",
         action=PermissionAction.VIEW_REPORT,
         is_private=True,
@@ -62,7 +62,7 @@ def test_astrbot_admin_inheritance_is_configurable_per_action() -> None:
         inherit_astrbot_admins_as_viewers=False,
         inherit_astrbot_admins_as_operators=True,
     )
-    assert not service.authorize(
+    assert service.authorize(
         sender_id="admin",
         action=PermissionAction.VIEW_REPORT,
         is_private=True,

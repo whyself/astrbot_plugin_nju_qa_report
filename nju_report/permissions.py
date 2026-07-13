@@ -57,8 +57,16 @@ class PermissionService:
 
         normalized_sender = str(sender_id).strip()
         if action is PermissionAction.VIEW_REPORT:
-            allowed = normalized_sender in self._viewers or (
-                is_astrbot_admin and self._config.inherit_astrbot_admins_as_viewers
+            allowed = (
+                normalized_sender in self._viewers
+                or normalized_sender in self._operators
+                or (
+                    is_astrbot_admin
+                    and (
+                        self._config.inherit_astrbot_admins_as_viewers
+                        or self._config.inherit_astrbot_admins_as_operators
+                    )
+                )
             )
         elif action is PermissionAction.OPERATE:
             allowed = normalized_sender in self._operators or (
