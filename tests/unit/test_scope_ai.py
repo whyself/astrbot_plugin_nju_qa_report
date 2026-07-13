@@ -9,6 +9,7 @@ from nju_report.models import ScopeDecision
 from nju_report.privacy import prepare_scope_input
 from nju_report.scope_ai import (
     AstrBotScopeAiClient,
+    ScopeAiError,
     ScopeAiResponseError,
     parse_scope_assessment,
     parse_scope_batch,
@@ -229,3 +230,61 @@ def test_batch_client_sends_every_target_and_redacts_content() -> None:
     assert "13800138000" not in context.prompt
     assert "[手机号]" in context.prompt
     assert '"conversation_date": "2026-07-12"' in context.prompt
+
+
+def test_batch_client_returns_format_error_to_model_for_repair() -> None:
+    valid = json.dumps({"questions": []}, ensure_ascii=False)
+
+    class Response:
+        def __init__(self, text: str) -> None:
+            self.completion_text = text
+
+    class Context:
+        def __init__(self) -> None:
+            self.responses = [Response("不是 JSON"), Response(valid)]
+            self.prompts: list[str] = []
+
+        async def llm_generate(self, **kwargs):
+            self.prompts.append(kwargs["prompt"])
+            return self.responses.pop(0)
+
+    context = Context()
+    client = AstrBotScopeAiClient(context, provider_id="provider", max_retries=3)
+
+    result = asyncio.run(
+        client.classify_batch([ScopeBatchMessage("m1", "普通消息")], ["m1"])
+    )
+
+    assert result["m1"].decision is ScopeDecision.DROP
+    assert len(context.prompts) == 2
+    assert "具体格式错误：JSON 解析失败" in context.prompts[1]
+    assert "上一次原始响应：\n不是 JSON" in context.prompts[1]
+    assert "修复重试：1/3" in context.prompts[1]
+
+
+def test_batch_format_repair_is_capped_at_three_retries(monkeypatch) -> None:
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("nju_report.scope_ai.asyncio.sleep", no_sleep)
+
+    class Response:
+        completion_text = "仍然不是 JSON"
+
+    class Context:
+        calls = 0
+
+        async def llm_generate(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            return Response()
+
+    context = Context()
+    client = AstrBotScopeAiClient(context, provider_id="provider", max_retries=10)
+
+    with pytest.raises(ScopeAiError):
+        asyncio.run(
+            client.classify_batch([ScopeBatchMessage("m1", "普通消息")], ["m1"])
+        )
+
+    assert context.calls == 4
