@@ -48,6 +48,8 @@ class PluginConfig:
     capture_queue_size: int = 5000
     timezone: str = "Asia/Shanghai"
     raw_message_retention_days: int = 90
+    history_import_files: tuple[str, ...] = ()
+    history_import_bot_qq_ids: tuple[str, ...] = ()
 
     report_viewer_qq_ids: tuple[str, ...] = ()
     operator_qq_ids: tuple[str, ...] = ()
@@ -190,6 +192,11 @@ class PluginConfig:
             capture_queue_size=capture_queue_size,
             timezone=timezone,
             raw_message_retention_days=retention,
+            history_import_files=_file_tuple(raw.get("history_import_files", ())),
+            history_import_bot_qq_ids=_id_tuple(
+                raw.get("history_import_bot_qq_ids", ()),
+                "history_import_bot_qq_ids",
+            ),
             report_viewer_qq_ids=_id_tuple(
                 raw.get("report_viewer_qq_ids", ()), "report_viewer_qq_ids"
             ),
@@ -400,3 +407,31 @@ def _email_tuple(value: Any, field: str) -> tuple[str, ...]:
         if not _EMAIL_RE.fullmatch(address):
             raise ConfigError(f"{field} 包含无效邮箱地址")
     return addresses
+
+
+def _file_tuple(value: Any) -> tuple[str, ...]:
+    """Accept AstrBot file fields across dashboard storage representations."""
+
+    if value in (None, ""):
+        return ()
+    values = value if isinstance(value, (list, tuple)) else (value,)
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if isinstance(item, str):
+            path = item.strip()
+        elif isinstance(item, Mapping):
+            path = ""
+            for key in ("path", "file", "file_path", "local_path"):
+                candidate = item.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    path = candidate.strip()
+                    break
+        else:
+            raise ConfigError("history_import_files 必须是文件路径列表")
+        if not path:
+            raise ConfigError("history_import_files 包含无法识别的文件记录")
+        if path not in seen:
+            seen.add(path)
+            result.append(path)
+    return tuple(result)

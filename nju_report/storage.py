@@ -127,6 +127,59 @@ class ReportStorage:
             )
             return cursor.rowcount == 1
 
+    def insert_messages(self, messages: list[StoredMessage]) -> tuple[int, int]:
+        """Bulk insert prepared messages and return ``(inserted, duplicates)``."""
+
+        if not messages:
+            return 0, 0
+        rows = [
+            (
+                message.platform_id,
+                message.bot_self_id,
+                message.external_message_id,
+                message.message_fingerprint,
+                message.session_id,
+                message.group_id,
+                message.group_alias,
+                message.sender_id,
+                message.sender_name,
+                message.sent_at_utc,
+                message.text,
+                message.outline,
+                message.reply_to_message_id,
+                int(message.analyzable),
+                int(time.time()),
+            )
+            for message in messages
+        ]
+        with self._transaction() as connection:
+            before = connection.total_changes
+            connection.executemany(
+                """
+                INSERT INTO messages (
+                    platform_id,
+                    bot_self_id,
+                    external_message_id,
+                    message_fingerprint,
+                    session_id,
+                    group_id,
+                    group_alias,
+                    sender_id,
+                    sender_name,
+                    sent_at_utc,
+                    text,
+                    outline,
+                    reply_to_message_id,
+                    analyzable,
+                    captured_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform_id, bot_self_id, external_message_id) DO NOTHING
+                """,
+                rows,
+            )
+            inserted = connection.total_changes - before
+        return inserted, len(messages) - inserted
+
     def message_count(self) -> int:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()

@@ -15,7 +15,8 @@
 - 幂等的历史自然日批处理，AI 技术错误单独留档而不误判为排除；
 - 全部筛选结果的私聊查询与脱敏 CSV 累计导出；
 - 本地配置检查及可选的 LLM、语雀、SMTP 实连自检；
-- 51 项自动化测试。
+- QQ Chat Exporter 普通 JSON/分块 JSONL ZIP 历史记录检查与幂等导入；
+- 自动化测试。
 
 语雀同步、问题聚合、群友回答关联、知识调查和邮件日报仍在后续阶段实现，
 当前版本不应作为完整日报系统部署。
@@ -41,6 +42,8 @@
 /nju_collect report status 2026-07-12
 /nju_collect test startup
 /nju_collect test startup live
+/nju_collect import inspect
+/nju_collect import run
 ```
 
 仓库同步、调查重跑、邮件发送和错误诊断等后续功能仅向配置的运维管理员开放。
@@ -52,6 +55,9 @@
 - [AstrBot 插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
 
 后续同步与检索代码将从 `astrbot_plugin_nju_qa` 的设计中独立改造。本仓库采用 AGPL-3.0-or-later，以保持后续代码复用的许可证兼容性。
+
+QQ 历史记录导出与导入步骤见
+[docs/history-import.md](docs/history-import.md)。
 
 ## 开发检查
 

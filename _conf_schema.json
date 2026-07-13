@@ -69,6 +69,19 @@
     "type": "int",
     "default": 90
   },
+  "history_import_files": {
+    "description": "QQ Chat Exporter 历史记录文件",
+    "type": "file",
+    "default": [],
+    "file_types": ["json", "jsonl", "zip"],
+    "hint": "上传 QCE 的 JSON 导出或分块 JSONL ZIP；导入完成后可从配置中移除文件。"
+  },
+  "history_import_bot_qq_ids": {
+    "description": "历史记录中需要排除的机器人 QQ 号",
+    "type": "list",
+    "default": [],
+    "hint": "只填当时确实作为机器人发言的 QQ 号；普通导出账号不要填写。"
+  },
   "report_viewer_qq_ids": {
     "description": "允许私聊查看脱敏日报的 QQ 号列表",
     "type": "list",

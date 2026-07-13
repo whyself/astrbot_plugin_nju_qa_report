@@ -161,6 +161,13 @@ def test_reference_plugin_embedding_configuration_is_accepted() -> None:
         PluginConfig.from_mapping({"embedding_base_url": "not-a-url"})
 
 
+def test_astrbot_file_field_shapes_are_accepted() -> None:
+    direct = PluginConfig.from_mapping({"history_import_files": ["/tmp/history.json"]})
+    mapped = PluginConfig.from_mapping({"history_import_files": [{"path": "/tmp/history.zip"}]})
+    assert direct.history_import_files == ("/tmp/history.json",)
+    assert mapped.history_import_files == ("/tmp/history.zip",)
+
+
 def test_group_alias_falls_back_to_masked_group_id() -> None:
     config = PluginConfig.from_mapping({"group_aliases": {"12345678": "迎新一群"}})
     assert config.group_alias("12345678") == "迎新一群"

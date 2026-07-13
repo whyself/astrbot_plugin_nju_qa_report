@@ -17,62 +17,74 @@ class MessageCaptureService:
     def __init__(self, config: PluginConfig, storage: ReportStorage) -> None:
         self._config = config
         self._storage = storage
-        self._target_groups = frozenset(config.target_group_ids)
 
     def capture(self, message: MessageEnvelope) -> CaptureOutcome:
-        if not self._config.capture_enabled:
-            return CaptureOutcome.DISABLED
-        if not message.is_group_message:
-            return CaptureOutcome.PRIVATE_MESSAGE
-
-        group_id = str(message.group_id).strip()
-        if self._config.capture_mode == "selected_groups" and group_id not in self._target_groups:
-            return CaptureOutcome.OUT_OF_SCOPE_GROUP
-
-        sender_id = str(message.sender_id).strip()
-        bot_self_id = str(message.bot_self_id).strip()
-        if message.is_self_message or (sender_id and bot_self_id and sender_id == bot_self_id):
-            return CaptureOutcome.BOT_MESSAGE
-        if message.is_system_message:
-            return CaptureOutcome.SYSTEM_MESSAGE
-
-        text = message.text.strip()
-        outline = message.outline.strip()
-        if text and any(
-            text.lstrip().startswith(prefix) for prefix in self._config.command_prefixes
-        ):
-            return CaptureOutcome.COMMAND_MESSAGE
-        if not text and not outline:
-            return CaptureOutcome.EMPTY_MESSAGE
-
-        external_message_id = str(message.external_message_id).strip()
-        fingerprint = _message_fingerprint(message)
-        if not external_message_id:
-            # Without an adapter ID, true duplicate delivery cannot be
-            # distinguished from two identical messages in the same second.
-            # Preserve both occurrences and retain a fingerprint for auditing.
-            external_message_id = f"occurrence:{uuid.uuid4().hex}"
-
-        stored = StoredMessage(
-            platform_id=str(message.platform_id).strip(),
-            bot_self_id=bot_self_id,
-            external_message_id=external_message_id,
-            message_fingerprint=fingerprint,
-            session_id=str(message.session_id).strip(),
-            group_id=group_id,
-            group_alias=self._config.group_alias(group_id),
-            sender_id=sender_id,
-            sender_name=str(message.sender_name).strip(),
-            sent_at_utc=(
-                int(message.sent_at_utc) if int(message.sent_at_utc) > 0 else int(time.time())
-            ),
-            text=text,
-            outline=outline,
-            reply_to_message_id=str(message.reply_to_message_id).strip(),
-            analyzable=bool(text),
-        )
+        outcome, stored = prepare_message(self._config, message)
+        if stored is None:
+            return outcome
         inserted = self._storage.insert_message(stored)
         return CaptureOutcome.CAPTURED if inserted else CaptureOutcome.DUPLICATE
+
+
+def prepare_message(
+    config: PluginConfig,
+    message: MessageEnvelope,
+    *,
+    respect_capture_enabled: bool = True,
+) -> tuple[CaptureOutcome, StoredMessage | None]:
+    """Apply the same filtering rules to live and imported messages."""
+
+    if respect_capture_enabled and not config.capture_enabled:
+        return CaptureOutcome.DISABLED, None
+    if not message.is_group_message:
+        return CaptureOutcome.PRIVATE_MESSAGE, None
+
+    group_id = str(message.group_id).strip()
+    target_groups = frozenset(config.target_group_ids)
+    if config.capture_mode == "selected_groups" and group_id not in target_groups:
+        return CaptureOutcome.OUT_OF_SCOPE_GROUP, None
+
+    sender_id = str(message.sender_id).strip()
+    bot_self_id = str(message.bot_self_id).strip()
+    if message.is_self_message or (sender_id and bot_self_id and sender_id == bot_self_id):
+        return CaptureOutcome.BOT_MESSAGE, None
+    if message.is_system_message:
+        return CaptureOutcome.SYSTEM_MESSAGE, None
+
+    text = message.text.strip()
+    outline = message.outline.strip()
+    if text and any(text.lstrip().startswith(prefix) for prefix in config.command_prefixes):
+        return CaptureOutcome.COMMAND_MESSAGE, None
+    if not text and not outline:
+        return CaptureOutcome.EMPTY_MESSAGE, None
+
+    external_message_id = str(message.external_message_id).strip()
+    fingerprint = _message_fingerprint(message)
+    if not external_message_id:
+        # Without an adapter ID, true duplicate delivery cannot be
+        # distinguished from two identical messages in the same second.
+        # Preserve both occurrences and retain a fingerprint for auditing.
+        external_message_id = f"occurrence:{uuid.uuid4().hex}"
+
+    stored = StoredMessage(
+        platform_id=str(message.platform_id).strip(),
+        bot_self_id=bot_self_id,
+        external_message_id=external_message_id,
+        message_fingerprint=fingerprint,
+        session_id=str(message.session_id).strip(),
+        group_id=group_id,
+        group_alias=config.group_alias(group_id),
+        sender_id=sender_id,
+        sender_name=str(message.sender_name).strip(),
+        sent_at_utc=(
+            int(message.sent_at_utc) if int(message.sent_at_utc) > 0 else int(time.time())
+        ),
+        text=text,
+        outline=outline,
+        reply_to_message_id=str(message.reply_to_message_id).strip(),
+        analyzable=bool(text),
+    )
+    return CaptureOutcome.CAPTURED, stored
 
 
 def _message_fingerprint(message: MessageEnvelope) -> str:

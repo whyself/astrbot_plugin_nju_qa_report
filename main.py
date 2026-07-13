@@ -18,6 +18,7 @@ from .nju_report.config import PluginConfig
 from .nju_report.message_capture import MessageCaptureService
 from .nju_report.models import MessageEnvelope
 from .nju_report.permissions import PermissionAction, PermissionService
+from .nju_report.qce_import import QceHistoryImporter, QceImportError
 from .nju_report.question_export import DECISION_LABELS, QuestionCsvExporter
 from .nju_report.question_processor import (
     DailyQuestionProcessor,
@@ -37,7 +38,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.1.0",
+    "0.1.1",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -82,6 +83,7 @@ class NjuQaReportPlugin(Star):
             self._data_dir / "exports",
             timezone_name=self.runtime_config.timezone,
         )
+        self.history_importer = QceHistoryImporter(self.runtime_config, self.storage)
         self.startup_checks = StartupCheckService(
             config=self.runtime_config,
             storage=self.storage,
@@ -307,6 +309,71 @@ class NjuQaReportPlugin(Star):
             f"最后消息：{latest_text}\n"
             f"AI 自动复核：{auto_review_state}"
         )
+
+    @nju_collect.group("import")
+    def nju_collect_import(self):
+        """Import QQ Chat Exporter history files."""
+
+    @nju_collect_import.command("inspect")
+    async def operator_import_inspect(self, event: AstrMessageEvent):
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.OPERATE,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
+        try:
+            sources = await asyncio.to_thread(self.history_importer.inspect_all)
+        except QceImportError as exc:
+            yield event.plain_result(f"历史记录检查失败：{exc}")
+            return
+        lines = [f"QCE 历史记录检查通过，共 {len(sources)} 个文件"]
+        for source in sources:
+            date_range = _timestamp_range(
+                source.first_sent_at_utc,
+                source.last_sent_at_utc,
+                self.runtime_config.timezone,
+            )
+            lines.append(
+                f"{Path(source.path).name}\n"
+                f"群聊：{source.chat_name}（{source.group_id}）\n"
+                f"消息：{source.message_count} 条；范围：{date_range}"
+            )
+        lines.append("确认无误后运行：/nju_collect import run")
+        yield event.plain_result("\n\n".join(lines))
+
+    @nju_collect_import.command("run")
+    async def operator_import_run(self, event: AstrMessageEvent):
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.OPERATE,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
+        try:
+            await self.capture_writer.flush(timeout_seconds=30)
+            results = await asyncio.to_thread(self.history_importer.import_all)
+        except (QceImportError, TimeoutError) as exc:
+            yield event.plain_result(f"历史记录导入失败：{exc}")
+            return
+        lines = [f"QCE 历史记录导入完成，共 {len(results)} 个文件"]
+        for result in results:
+            skipped = sum(result.skipped.values())
+            skip_text = "、".join(f"{key} {count}" for key, count in sorted(result.skipped.items()))
+            lines.append(
+                f"{Path(result.path).name}\n"
+                f"扫描 {result.scanned}；新增 {result.imported}；"
+                f"重复 {result.duplicates}；跳过 {skipped}"
+                + (f"（{skip_text}）" if skip_text else "")
+            )
+        lines.append("下一步：/nju_collect report run all")
+        yield event.plain_result("\n\n".join(lines))
 
     @nju_collect.group("report")
     def nju_collect_report(self):
@@ -597,3 +664,12 @@ def _compact_dates(values: list[str], limit: int = 20) -> str:
     shown = values[:limit]
     suffix = f" 等共 {len(values)} 天" if len(values) > limit else ""
     return "、".join(shown) + suffix
+
+
+def _timestamp_range(start: int | None, end: int | None, timezone_name: str) -> str:
+    if start is None or end is None:
+        return "无有效时间"
+    timezone = ZoneInfo(timezone_name)
+    start_text = datetime.fromtimestamp(start, tz=timezone).strftime("%Y-%m-%d %H:%M:%S")
+    end_text = datetime.fromtimestamp(end, tz=timezone).strftime("%Y-%m-%d %H:%M:%S")
+    return f"{start_text} ～ {end_text}"
