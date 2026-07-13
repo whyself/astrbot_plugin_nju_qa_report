@@ -338,8 +338,10 @@ def test_final_gate_sends_only_concise_candidate_questions() -> None:
     assert "优先保留、规范化和去重" in context.system_prompt
     assert "陶二宿舍条件如何" in context.system_prompt
     assert "鼓楼宿舍是否配备马桶" in context.system_prompt
-    assert "南京大学小百合是什么" in context.system_prompt
-    assert "南京大学课程体系中的专业选修课是什么" in context.system_prompt
+    assert "陶二、南二、仙林巴士、小百合" in context.system_prompt
+    assert "小百合是什么”必须保留" in context.system_prompt
+    assert "专业选修课是什么”必须保留" in context.system_prompt
+    assert "标题不需要重复添加“南京大学”" in context.system_prompt
     assert "已有资料可能明确回答的问题仍应保留" in context.system_prompt
     assert "宁可少收" not in context.system_prompt
 
