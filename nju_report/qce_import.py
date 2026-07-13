@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import zipfile
 from collections import Counter
 from collections.abc import Iterable, Iterator
@@ -73,7 +74,7 @@ class QceHistoryImporter:
 
     def _inspect_one(self, path: Path) -> QceSourceInfo:
         with _open_qce_source(path) as (chat_info, messages):
-            group_id = self._validated_group_id(chat_info)
+            group_id = self._validated_group_id(chat_info, path)
             count = 0
             first: int | None = None
             last: int | None = None
@@ -96,7 +97,7 @@ class QceHistoryImporter:
 
     def _import_one(self, path: Path) -> QceImportResult:
         with _open_qce_source(path) as (chat_info, messages):
-            group_id = self._validated_group_id(chat_info)
+            group_id = self._validated_group_id(chat_info, path)
             result = QceImportResult(
                 path=str(path),
                 chat_name=_string(chat_info.get("name")) or "未命名群聊",
@@ -145,7 +146,7 @@ class QceHistoryImporter:
         result.duplicates += duplicates
         batch.clear()
 
-    def _validated_group_id(self, chat_info: dict[str, Any]) -> str:
+    def _validated_group_id(self, chat_info: dict[str, Any], source_path: Path) -> str:
         chat_type = _string(chat_info.get("type")).lower()
         if chat_type not in {"group", "group_chat", "2"}:
             raise QceImportError("导出文件不是 QQ 群聊记录")
@@ -153,11 +154,15 @@ class QceHistoryImporter:
             _string(chat_info.get(key)) for key in ("peerUin", "peerUid", "groupCode", "groupId")
         }
         candidates.discard("")
+        candidates.update(_group_ids_from_qce_filename(source_path.name))
         matches = sorted(candidates & set(self._config.target_group_ids))
         if len(matches) == 1:
             return matches[0]
         if not matches:
-            raise QceImportError("导出文件群号与 target_group_ids 不匹配；请确认只上传目标群的导出")
+            raise QceImportError(
+                "导出文件群号与 target_group_ids 不匹配；请保留 QCE 原始的 "
+                "group_<群号>_*.json 文件名，并确认只上传目标群导出"
+            )
         raise QceImportError("导出文件同时匹配多个目标群，无法确定归属")
 
     def _to_envelope(
@@ -401,7 +406,7 @@ def _prefixed_reply_id(elements: list[Any], group_id: str) -> str:
         data = item.get("data")
         if not isinstance(data, dict):
             continue
-        for key in ("replyMsgId", "sourceMsgId", "msgId"):
+        for key in ("referencedMessageId", "replyMsgId", "sourceMsgId", "msgId"):
             reply_id = _string(data.get(key))
             if reply_id:
                 return f"{group_id}:{reply_id}"
@@ -417,6 +422,12 @@ def _fallback_message_id(
 ) -> str:
     payload = f"{group_id}\x1f{sender_id}\x1f{timestamp}\x1f{text}\x1f{index}"
     return "generated:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _group_ids_from_qce_filename(filename: str) -> set[str]:
+    """Extract group IDs from QCE's canonical ``group_<id>_...`` filename."""
+
+    return set(re.findall(r"(?:^|[_-])group[_-](\d+)(?=[_.-]|$)", filename, flags=re.IGNORECASE))
 
 
 def _string(value: Any) -> str:

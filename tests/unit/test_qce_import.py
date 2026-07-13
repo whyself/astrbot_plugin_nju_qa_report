@@ -166,3 +166,37 @@ def test_chunked_jsonl_zip_is_supported(tmp_path: Path) -> None:
     assert result.imported == 2
     assert storage.message_count() == 2
     storage.close()
+
+
+def test_qce_5579_filename_group_id_and_reply_field_are_supported(tmp_path: Path) -> None:
+    export_path = tmp_path / "group_826811581_20260713_164457.json"
+    payload = _single_export(
+        [
+            _message("original", "校园卡在哪里补办？", 1_782_386_895_000),
+            _message(
+                "reply",
+                "在信息门户挂失后补办",
+                1_782_386_896_000,
+                elements=[
+                    {
+                        "type": "reply",
+                        "data": {"messageId": "0", "referencedMessageId": "original"},
+                    },
+                    {"type": "text", "data": {"text": "在信息门户挂失后补办"}},
+                ],
+            ),
+        ]
+    )
+    payload["chatInfo"].pop("peerUid")
+    export_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+
+    result = QceHistoryImporter(_config(export_path), storage).import_all()[0]
+
+    assert result.group_id == "826811581"
+    assert result.imported == 2
+    window = natural_day_window(date(2026, 6, 25), "Asia/Shanghai")
+    stored = storage.messages_in_window(window)
+    assert stored[1].reply_to_message_id == "826811581:original"
+    storage.close()

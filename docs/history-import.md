@@ -43,6 +43,8 @@ Access Token 只用于打开本机 QCE 页面，不要上传到 AstrBot、GitHub
 5. 保存并重载插件。
 
 导出文件包含真实聊天内容，只应上传到你自己控制的 AstrBot。不要提交到 GitHub。
+请保留 QCE 生成的 `group_<群号>_<时间>.json` 原始文件名；QCE 5.5.79 的普通 JSON
+可能不在 `chatInfo` 内重复保存群号，插件会从这个标准文件名校验群号。
 
 ## 4. 检查并导入
 
