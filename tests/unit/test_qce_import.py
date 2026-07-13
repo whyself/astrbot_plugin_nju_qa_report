@@ -114,7 +114,7 @@ def test_single_json_import_is_filtered_and_idempotent(tmp_path: Path) -> None:
     stored = storage.messages_in_window(window)
     assert len(stored) == 3
     assert stored[1].outline == "[图片]"
-    assert stored[1].analyzable is False
+    assert stored[1].analyzable is True
     assert stored[2].reply_to_message_id == "826811581:m1"
     storage.close()
 

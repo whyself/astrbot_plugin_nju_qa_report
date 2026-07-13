@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -11,14 +12,18 @@ from nju_report.models import (
     StoredMessage,
 )
 from nju_report.question_export import QuestionCsvExporter
-from nju_report.question_processor import DailyQuestionProcessor, appears_to_seek_help
+from nju_report.question_processor import DailyQuestionProcessor
 from nju_report.storage import ReportStorage
 from nju_report.time_windows import natural_day_window
 
 
 class FakeScopeService:
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
     async def resolve(self, message: str, context: str = "") -> ScopeResolution:
         del context
+        self.seen.append(message)
         if "纳入" in message:
             assessment = ScopeAssessment(
                 decision=ScopeDecision.INCLUDE,
@@ -164,9 +169,29 @@ def test_cumulative_csv_contains_every_decision(tmp_path: Path) -> None:
     storage.close()
 
 
-def test_deterministic_prefilter_keeps_implicit_help_and_drops_obvious_chat() -> None:
-    assert appears_to_seek_help("校园卡丢了") is True
-    assert appears_to_seek_help("统一认证进不去") is True
-    assert appears_to_seek_help("有人知道图书馆几点关门吗") is True
-    assert appears_to_seek_help("哈哈哈") is False
-    assert appears_to_seek_help("收到") is False
+def test_every_nonempty_message_reaches_ai_without_keyword_prefilter(tmp_path: Path) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    report_date = date(2026, 7, 12)
+    window = natural_day_window(report_date, "Asia/Shanghai")
+    storage.insert_message(_stored("m-1", "哈哈哈", window.start_timestamp + 1))
+    storage.insert_message(
+        replace(
+            _stored("m-2", "", window.start_timestamp + 2),
+            outline="[图片]",
+            analyzable=False,
+        )
+    )
+    scope = FakeScopeService()
+    processor = DailyQuestionProcessor(
+        storage,
+        scope,  # type: ignore[arg-type]
+        timezone_name="Asia/Shanghai",
+        concurrency=1,
+    )
+
+    result = asyncio.run(processor.process_date(report_date))
+
+    assert result.candidates_saved == 2
+    assert scope.seen == ["哈哈哈", "[图片]"]
+    storage.close()

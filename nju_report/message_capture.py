@@ -82,7 +82,7 @@ def prepare_message(
         text=text,
         outline=outline,
         reply_to_message_id=str(message.reply_to_message_id).strip(),
-        analyzable=bool(text),
+        analyzable=bool(text or outline),
     )
     return CaptureOutcome.CAPTURED, stored
 

@@ -167,14 +167,14 @@ def test_capture_filters_group_bot_system_command_and_empty_messages(
     storage.close()
 
 
-def test_attachment_only_message_is_stored_but_not_analyzable(tmp_path: Path) -> None:
+def test_attachment_only_message_is_stored_and_sent_to_ai_screening(tmp_path: Path) -> None:
     storage, capture = _capture_service(tmp_path)
 
     assert capture.capture(_message(text="", outline="[图片]")) is CaptureOutcome.CAPTURED
     window = natural_day_window(date(2026, 7, 12), "Asia/Shanghai")
     assert len(storage.messages_in_window(window)) == 1
-    assert storage.messages_in_window(window)[0].analyzable is False
-    assert storage.messages_in_window(window, analyzable_only=True) == []
+    assert storage.messages_in_window(window)[0].analyzable is True
+    assert len(storage.messages_in_window(window, analyzable_only=True)) == 1
     storage.close()
 
 
