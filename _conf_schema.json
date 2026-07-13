@@ -1,0 +1,37 @@
+{
+  "report_viewer_qq_ids": {
+    "description": "允许私聊查看脱敏日报的 QQ 号列表",
+    "type": "list",
+    "default": []
+  },
+  "operator_qq_ids": {
+    "description": "允许运行同步、调查、发信等运维命令的 QQ 号列表",
+    "type": "list",
+    "default": []
+  },
+  "inherit_astrbot_admins_as_viewers": {
+    "description": "AstrBot 管理员自动获得日报查看权限",
+    "type": "bool",
+    "default": true
+  },
+  "inherit_astrbot_admins_as_operators": {
+    "description": "AstrBot 管理员自动获得运维权限",
+    "type": "bool",
+    "default": true
+  },
+  "report_commands_private_only": {
+    "description": "日报查看和敏感管理命令仅允许私聊调用",
+    "type": "bool",
+    "default": true
+  },
+  "scope_auto_review_enabled": {
+    "description": "对范围判断不确定的问题执行独立 AI 自动审核",
+    "type": "bool",
+    "default": true
+  },
+  "scope_auto_review_max_rounds": {
+    "description": "AI 自动审核的最大轮数",
+    "type": "int",
+    "default": 2
+  }
+}
