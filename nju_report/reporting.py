@@ -144,7 +144,7 @@ class ReportService:
             report.report_date,
         )
         mail_text = _render_mail_text(report.report_date, clusters, investigations)
-        mail_html = _render_mail_html(mail_text)
+        mail_html = _render_mail_html(report.report_date, clusters, investigations)
         sent = skipped = failed = 0
         for recipient in self._config.mail_recipients:
             recipient_hash = hashlib.sha256(recipient.casefold().encode("utf-8")).hexdigest()
@@ -317,37 +317,114 @@ def _render_mail_text(
     lines = [
         f"南大知识缺口日报 {report_date}",
         (
-            f"问题 {len(clusters)}｜明确回答 {counts[CoverageStatus.ANSWERABLE]}｜"
-            f"部分覆盖 {counts[CoverageStatus.PARTIAL]}｜"
+            f"问题 {len(clusters)}｜"
             f"未找到 {counts[CoverageStatus.NO_USABLE_EVIDENCE]}｜"
-            f"异常 {counts[CoverageStatus.ERROR]}"
+            f"异常 {counts[CoverageStatus.ERROR]}｜"
+            f"部分覆盖 {counts[CoverageStatus.PARTIAL]}｜"
+            f"明确回答 {counts[CoverageStatus.ANSWERABLE]}"
         ),
         "",
     ]
-    for cluster in clusters:
-        result = investigations.get(cluster.question_code)
-        status = public_coverage_status(
-            result.status if result is not None else CoverageStatus.ERROR
+    for cluster, status in _ordered_mail_items(clusters, investigations):
+        answer = _mail_answer(cluster)
+        lines.extend(
+            (
+                f"问题：{cluster.question_code}｜{_mail_shorten(cluster.canonical_question, 100)}",
+                f"状态：{coverage_label(status)}",
+                f"回答：{_mail_shorten(answer, 180)}",
+                "",
+            )
         )
-        answer = (
-            cluster.answers[0].redacted_text
-            if cluster.answers
-            else "未发现明确回答"
-        )
-        lines.append(
-            f"{cluster.question_code}｜{_mail_shorten(cluster.canonical_question, 80)}｜"
-            f"群答：{_mail_shorten(answer, 140)}｜知识库：{coverage_label(status)}"
-        )
-    lines.extend(("", "完整调查、维护建议和引用见附件 HTML。"))
+    lines.append("完整调查、维护建议和引用见附件 HTML。")
     return "\n".join(lines)
 
 
-def _render_mail_html(text: str) -> str:
+_MAIL_STATUS_COLORS = {
+    CoverageStatus.ANSWERABLE: ("#166534", "#dcfce7", "#86efac"),
+    CoverageStatus.PARTIAL: ("#854d0e", "#fef9c3", "#fde047"),
+    CoverageStatus.NO_USABLE_EVIDENCE: ("#991b1b", "#fee2e2", "#fca5a5"),
+    CoverageStatus.ERROR: ("#991b1b", "#fee2e2", "#fca5a5"),
+}
+
+_MAIL_STATUS_ORDER = {
+    CoverageStatus.NO_USABLE_EVIDENCE: 0,
+    CoverageStatus.ERROR: 1,
+    CoverageStatus.PARTIAL: 2,
+    CoverageStatus.ANSWERABLE: 3,
+}
+
+
+def _render_mail_html(
+    report_date: str,
+    clusters: list[QuestionCluster],
+    investigations: dict[str, InvestigationResult],
+) -> str:
+    counts = coverage_counts(clusters, investigations)
+    rows: list[str] = []
+    for cluster, status in _ordered_mail_items(clusters, investigations):
+        foreground, background, border = _MAIL_STATUS_COLORS[status]
+        rows.append(
+            '<div style="padding:12px 0;border-bottom:1px solid #e5e7eb">'
+            '<div style="margin:0 0 6px"><strong>问题：</strong>'
+            f'{html.escape(cluster.question_code)}｜'
+            f'{html.escape(_mail_shorten(cluster.canonical_question, 100))}</div>'
+            '<div style="margin:0 0 6px"><strong>状态：</strong>'
+            f'<span style="display:inline-block;padding:1px 8px;border-radius:999px;'
+            f'color:{foreground};background:{background};border:1px solid {border};'
+            f'font-weight:600">{html.escape(coverage_label(status))}</span></div>'
+            '<div style="margin:0"><strong>回答：</strong>'
+            f'{html.escape(_mail_shorten(_mail_answer(cluster), 180))}</div>'
+            '</div>'
+        )
+    summary = (
+        f"问题 {len(clusters)}｜"
+        f"未找到 {counts[CoverageStatus.NO_USABLE_EVIDENCE]}｜"
+        f"异常 {counts[CoverageStatus.ERROR]}｜"
+        f"部分覆盖 {counts[CoverageStatus.PARTIAL]}｜"
+        f"明确回答 {counts[CoverageStatus.ANSWERABLE]}"
+    )
     return (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"></head>'
-        '<body><pre style="font:14px/1.55 -apple-system,BlinkMacSystemFont,'
-        'Segoe UI,Microsoft YaHei,sans-serif;white-space:pre-wrap;margin:16px">'
-        f"{html.escape(text)}</pre></body></html>"
+        '<body style="margin:0;background:#ffffff;color:#20242a">'
+        '<div style="max-width:760px;margin:0 auto;padding:18px;'
+        'font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Microsoft YaHei,sans-serif">'
+        f'<div style="font-size:18px;font-weight:700;margin-bottom:4px">南大知识缺口日报 '
+        f'{html.escape(report_date)}</div>'
+        f'<div style="color:#4b5563;margin-bottom:8px">{html.escape(summary)}</div>'
+        f'{"".join(rows)}'
+        '<div style="margin-top:12px;color:#6b7280">完整调查、维护建议和引用见附件 HTML。</div>'
+        '</div></body></html>'
+    )
+
+
+def _mail_answer(cluster: QuestionCluster) -> str:
+    if not cluster.answers:
+        return "未发现明确回答"
+    return "；".join(item.redacted_text for item in cluster.answers[:3])
+
+
+def _ordered_mail_items(
+    clusters: list[QuestionCluster],
+    investigations: dict[str, InvestigationResult],
+) -> list[tuple[QuestionCluster, CoverageStatus]]:
+    items = [
+        (
+            cluster,
+            public_coverage_status(
+                investigations[cluster.question_code].status
+                if cluster.question_code in investigations
+                else CoverageStatus.ERROR
+            ),
+        )
+        for cluster in clusters
+    ]
+    return sorted(
+        items,
+        key=lambda item: (
+            _MAIL_STATUS_ORDER[item[1]],
+            item[0].report_date,
+            item[0].question_code,
+        ),
     )
 
 

@@ -26,6 +26,8 @@ from nju_report.models import (
 from nju_report.reporting import (
     ReportService,
     _display_excerpt,
+    _render_mail_html,
+    _render_mail_text,
     _visible_evidence,
     coverage_counts,
     format_coverage_counts,
@@ -264,10 +266,17 @@ def test_report_versions_and_mail_delivery_are_idempotent(
         ) -> None:
             del subject, path
             sent.append(recipient)
-            assert "问题 1｜明确回答 0｜部分覆盖 0｜未找到 1｜异常 0" in text_body
-            assert "群答：未发现明确回答" in text_body
-            assert "知识库：知识库未找到可用信息" in text_body
+            assert "问题 1｜未找到 1｜异常 0｜部分覆盖 0｜明确回答 0" in text_body
+            assert "问题：20260712-Q001｜校园卡丢失后如何补办？" in text_body
+            assert "状态：知识库未找到可用信息" in text_body
+            assert "回答：未发现明确回答" in text_body
+            assert text_body.index("状态：") < text_body.index("回答：")
             assert "知识库调查" not in html_body
+            assert "问题：</strong>20260712-Q001" in html_body
+            assert "状态：</strong>" in html_body
+            assert "回答：</strong>未发现明确回答" in html_body
+            assert "color:#991b1b" in html_body
+            assert html_body.index("状态：</strong>") < html_body.index("回答：</strong>")
             assert "知识库调查" in full_html
 
         monkeypatch.setattr(
@@ -322,6 +331,60 @@ def test_public_counts_fold_legacy_incomplete_into_execution_error(tmp_path: Pat
     assert "程序执行异常 1" in format_coverage_counts(counts)
     assert [item.question_code for item in clusters] == [cluster.question_code]
     storage.close()
+
+
+def test_mail_groups_questions_in_red_yellow_green_order() -> None:
+    def cluster(code: str, question: str) -> QuestionCluster:
+        return QuestionCluster(
+            question_code=code,
+            report_date="2026-07-12",
+            canonical_question=question,
+            category="测试",
+            candidate_source_keys=(),
+            representative_questions=(question,),
+            group_aliases=("测试群",),
+            first_sent_at_utc=1,
+            last_sent_at_utc=1,
+        )
+
+    green = cluster("20260712-Q001", "已有答案的问题")
+    red = cluster("20260712-Q002", "没有资料的问题")
+    yellow = cluster("20260712-Q003", "部分覆盖的问题")
+    clusters = [green, red, yellow]
+    investigations = {
+        green.question_code: InvestigationResult(
+            question_code=green.question_code,
+            status=CoverageStatus.ANSWERABLE,
+            summary="可回答",
+            missing_information="无",
+            recommendation="无",
+        ),
+        red.question_code: InvestigationResult(
+            question_code=red.question_code,
+            status=CoverageStatus.NO_USABLE_EVIDENCE,
+            summary="未找到",
+            missing_information="全部",
+            recommendation="补充",
+        ),
+        yellow.question_code: InvestigationResult(
+            question_code=yellow.question_code,
+            status=CoverageStatus.PARTIAL,
+            summary="部分资料",
+            missing_information="一部分",
+            recommendation="补充",
+        ),
+    }
+
+    text = _render_mail_text("2026-07-12", clusters, investigations)
+    rendered = _render_mail_html("2026-07-12", clusters, investigations)
+
+    assert text.index(red.question_code) < text.index(yellow.question_code)
+    assert text.index(yellow.question_code) < text.index(green.question_code)
+    assert rendered.index(red.question_code) < rendered.index(yellow.question_code)
+    assert rendered.index(yellow.question_code) < rendered.index(green.question_code)
+    assert "color:#991b1b" in rendered
+    assert "color:#854d0e" in rendered
+    assert "color:#166534" in rendered
 
 
 def _prepared_case(
