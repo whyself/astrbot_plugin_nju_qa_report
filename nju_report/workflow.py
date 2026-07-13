@@ -15,6 +15,7 @@ from .models import ReportArtifact
 from .question_processor import DailyQuestionProcessor, DailyRunResult
 from .reporting import DeliverySummary, ReportService
 from .storage import ReportStorage
+from .token_usage import TokenUsage, TokenUsageTracker
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class FullReportRunResult:
     cluster_count: int
     report: ReportArtifact | None
     delivery: DeliverySummary | None = None
+    token_usage: TokenUsage = TokenUsage()
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,8 +38,11 @@ class WorkflowProgress:
     date_total: int
     screening_completed: int
     screening_total: int
+    aggregation_completed: int
+    aggregation_total: int
     investigation_completed: int
     investigation_total: int
+    token_usage: TokenUsage
 
 
 class DailyReportWorkflow:
@@ -53,6 +58,7 @@ class DailyReportWorkflow:
         knowledge: KnowledgeService,
         *,
         timezone_name: str,
+        token_usage: TokenUsageTracker | None = None,
     ) -> None:
         self._storage = storage
         self._question_processor = question_processor
@@ -61,6 +67,8 @@ class DailyReportWorkflow:
         self._reports = reports
         self._knowledge = knowledge
         self._timezone_name = timezone_name
+        self._token_usage = token_usage or TokenUsageTracker()
+        self._usage_baseline = self._token_usage.snapshot()
         self._lock = asyncio.Lock()
         self._stage = "空闲"
         self._current_date = ""
@@ -75,6 +83,9 @@ class DailyReportWorkflow:
         screening_date, screening_completed, screening_total = self._question_processor.progress
         if screening_date != self._current_date:
             screening_completed = screening_total = 0
+        aggregation_date, aggregation_completed, aggregation_total = self._aggregation.progress
+        if aggregation_date != self._current_date:
+            aggregation_completed = aggregation_total = 0
         investigation_date, investigation_completed, investigation_total = (
             self._investigation.progress
         )
@@ -88,8 +99,11 @@ class DailyReportWorkflow:
             date_total=self._date_total,
             screening_completed=screening_completed,
             screening_total=screening_total,
+            aggregation_completed=aggregation_completed,
+            aggregation_total=aggregation_total,
             investigation_completed=investigation_completed,
             investigation_total=investigation_total,
+            token_usage=self._token_usage.snapshot().since(self._usage_baseline),
         )
 
     async def sync_knowledge(self) -> None:
@@ -108,6 +122,7 @@ class DailyReportWorkflow:
         force: bool = False,
     ) -> FullReportRunResult:
         async with self._lock:
+            self._usage_baseline = self._token_usage.snapshot()
             self._date_index = 1
             self._date_total = 1
             try:
@@ -128,6 +143,7 @@ class DailyReportWorkflow:
     ) -> list[FullReportRunResult]:
         dates = await self.history_dates(before_date=before_date)
         async with self._lock:
+            self._usage_baseline = self._token_usage.snapshot()
             self._date_total = len(dates)
             result: list[FullReportRunResult] = []
             try:
@@ -163,6 +179,7 @@ class DailyReportWorkflow:
         deliver: bool,
         force: bool,
     ) -> FullReportRunResult:
+        usage_before = self._token_usage.snapshot()
         self._current_date = report_date.isoformat()
         if not force:
             completed = await self._completed_result(report_date)
@@ -175,12 +192,18 @@ class DailyReportWorkflow:
                         completed.cluster_count,
                         completed.report,
                         delivery,
+                        self._token_usage.snapshot().since(usage_before),
                     )
                 return completed
         self._stage = "AI 筛选与自动复核"
         screening = await self._question_processor.process_date(report_date, force=force)
         if screening.status == "FAILED":
-            return FullReportRunResult(screening, 0, None)
+            return FullReportRunResult(
+                screening,
+                0,
+                None,
+                token_usage=self._token_usage.snapshot().since(usage_before),
+            )
         self._stage = "问题聚合与 Agent 上下文回答查找"
         clusters = await self._aggregation.aggregate_date(report_date)
         self._stage = "知识库调查"
@@ -189,7 +212,13 @@ class DailyReportWorkflow:
         report = await self._reports.build(report_date.isoformat())
         self._stage = "发送邮件" if deliver else "完成"
         delivery = await self._reports.deliver(report) if deliver else None
-        return FullReportRunResult(screening, len(clusters), report, delivery)
+        return FullReportRunResult(
+            screening,
+            len(clusters),
+            report,
+            delivery,
+            self._token_usage.snapshot().since(usage_before),
+        )
 
     async def _completed_result(self, report_date: date) -> FullReportRunResult | None:
         raw_date = report_date.isoformat()

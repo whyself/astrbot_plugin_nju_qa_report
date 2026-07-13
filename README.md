@@ -73,7 +73,9 @@
 
 普通 `report run`/`run all` 会跳过已成功生成完整报告的日期；只有管理员显式执行
 带 `confirm` 的 `report rerun` 才会重新调用该日的 AI 筛选和知识调查。长任务不会主动
-刷进度消息，可重复发送不带日期的 `/nju_collect report status` 查询当前阶段和计数；
+刷进度消息，可重复发送不带日期的 `/nju_collect report status` 查询当前阶段、消息筛选、
+Agent 回答查找和知识调查计数。任务完成后会返回 Provider 实际报告的对话模型 Token；
+若部分响应未提供 usage，会明确显示统计覆盖率。Token 统计不包含 Embedding；
 语雀同步进度使用 `/nju_collect repo status` 查询。
 
 ## 相关项目

@@ -18,6 +18,7 @@ from .models import (
     QuestionCluster,
 )
 from .storage import ReportStorage
+from .token_usage import TokenUsageTracker
 
 _SYSTEM_PROMPT = """
 你是南京大学知识库维护调查员。你只能判断给定的“允许仓库证据”是否足以覆盖问题，
@@ -68,11 +69,13 @@ class AstrBotInvestigationAiClient:
         provider_id: str = "",
         timeout_seconds: int = 120,
         max_retries: int = 3,
+        token_usage: TokenUsageTracker | None = None,
     ) -> None:
         self._context = context
         self._provider_id = provider_id.strip()
         self._timeout = timeout_seconds
         self._max_retries = max_retries
+        self._token_usage = token_usage
 
     async def assess(
         self,
@@ -108,6 +111,8 @@ class AstrBotInvestigationAiClient:
                     ),
                     timeout=self._timeout,
                 )
+                if self._token_usage is not None:
+                    self._token_usage.record(response)
                 return _json_object(str(getattr(response, "completion_text", "") or ""))
             except asyncio.CancelledError:
                 raise

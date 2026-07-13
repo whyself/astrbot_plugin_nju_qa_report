@@ -1,7 +1,18 @@
 from __future__ import annotations
 
-from nju_report.aggregation import _aggregate
-from nju_report.models import QuestionCandidate, StoredMessage
+import asyncio
+from datetime import date
+from pathlib import Path
+
+from nju_report.aggregation import QuestionAggregationService, _aggregate
+from nju_report.models import (
+    QuestionCandidate,
+    QuestionCluster,
+    ScopeAssessment,
+    ScopeDecision,
+    StoredMessage,
+)
+from nju_report.storage import ReportStorage
 
 
 def test_conservative_aggregation_merges_duplicates_before_agent_answer_search() -> None:
@@ -70,6 +81,112 @@ def test_different_categories_do_not_merge_even_with_similar_text() -> None:
     assert len(_aggregate(candidates, [])) == 2
 
 
+def test_answer_lookup_progress_counts_completed_clusters() -> None:
+    class Storage:
+        def list_question_candidates(self, *, report_date: str, limit):
+            del report_date, limit
+            return (
+                [
+                    _candidate(
+                        "20260712-Q001",
+                        "message:qq:bot:q1",
+                        "校园卡怎么补办？",
+                        "南京大学校园卡如何补办？",
+                        "校园卡",
+                        100,
+                    ),
+                    _candidate(
+                        "20260712-Q002",
+                        "message:qq:bot:q2",
+                        "转专业怎么考？",
+                        "南京大学转专业需要哪些考核？",
+                        "转专业",
+                        120,
+                    ),
+                ],
+                2,
+            )
+
+        def messages_in_window(self, window):
+            del window
+            return [
+                _message("q1", 100, "u1", "校园卡怎么补办？"),
+                _message("q2", 120, "u2", "转专业怎么考？"),
+            ]
+
+        def save_question_clusters(self, report_date: str, clusters):
+            del report_date, clusters
+
+    class Agent:
+        async def collect(self, cluster, messages, *, excluded_message_ids):
+            del cluster, messages, excluded_message_ids
+            await asyncio.sleep(0)
+            return ()
+
+    async def run() -> None:
+        service = QuestionAggregationService(  # type: ignore[arg-type]
+            Storage(),
+            Agent(),
+            timezone_name="Asia/Shanghai",
+            concurrency=1,
+        )
+        result = await service.aggregate_date(date(2026, 7, 12))
+        assert len(result) == 2
+        assert service.progress == ("2026-07-12", 2, 2)
+
+    asyncio.run(run())
+
+
+def test_reaggregation_can_move_candidate_between_existing_clusters(tmp_path: Path) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    assessment = ScopeAssessment(
+        decision=ScopeDecision.INCLUDE,
+        reason="校园公共问题",
+        confidence=0.95,
+        canonical_question="南京大学校园卡如何补办？",
+        category="校园卡",
+    )
+    for index in (1, 2):
+        storage.upsert_scope_candidate(
+            source_key=f"message:qq:bot:q{index}",
+            report_date="2026-07-12",
+            initial=assessment,
+            original_question=f"问题 {index}",
+            group_alias="南京大学迎新群",
+            sent_at_utc=100 + index,
+        )
+    candidates, _ = storage.list_question_candidates(
+        report_date="2026-07-12",
+        limit=None,
+    )
+    first, second = candidates
+    storage.save_question_clusters(
+        "2026-07-12",
+        [
+            _cluster(first.question_code, (first.source_key,), 101, "问题一"),
+            _cluster(second.question_code, (second.source_key,), 102, "问题二"),
+        ],
+    )
+
+    storage.save_question_clusters(
+        "2026-07-12",
+        [
+            _cluster(
+                first.question_code,
+                (first.source_key, second.source_key),
+                101,
+                "合并后的问题",
+            )
+        ],
+    )
+
+    clusters = storage.list_question_clusters("2026-07-12")
+    assert len(clusters) == 1
+    assert clusters[0].candidate_source_keys == (first.source_key, second.source_key)
+    storage.close()
+
+
 def _candidate(
     code: str,
     source_key: str,
@@ -94,6 +211,25 @@ def _candidate(
         sent_at_utc=sent_at,
         created_at_utc=sent_at,
         updated_at_utc=sent_at,
+    )
+
+
+def _cluster(
+    code: str,
+    source_keys: tuple[str, ...],
+    sent_at: int,
+    question: str,
+) -> QuestionCluster:
+    return QuestionCluster(
+        question_code=code,
+        report_date="2026-07-12",
+        canonical_question=question,
+        category="校园卡",
+        candidate_source_keys=source_keys,
+        representative_questions=(question,),
+        group_aliases=("南京大学迎新群",),
+        first_sent_at_utc=sent_at,
+        last_sent_at_utc=sent_at,
     )
 
 

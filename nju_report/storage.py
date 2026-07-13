@@ -489,6 +489,18 @@ class ReportStorage:
         now = int(time.time())
         active_codes = {item.question_code for item in clusters}
         with self._transaction() as connection:
+            # A forced rerun may merge or split clusters. Clear every old link for
+            # this date first so a candidate can move to a different cluster without
+            # violating cluster_candidates.candidate_id's UNIQUE constraint.
+            connection.execute(
+                """
+                DELETE FROM cluster_candidates
+                WHERE cluster_id IN (
+                    SELECT id FROM question_clusters WHERE report_date = ?
+                )
+                """,
+                (report_date,),
+            )
             for cluster in clusters:
                 connection.execute(
                     """
@@ -529,10 +541,6 @@ class ReportStorage:
                 if row is None:
                     raise StorageError("无法保存聚合问题")
                 cluster_id = int(row[0])
-                connection.execute(
-                    "DELETE FROM cluster_candidates WHERE cluster_id = ?",
-                    (cluster_id,),
-                )
                 for source_key in cluster.candidate_source_keys:
                     candidate = connection.execute(
                         "SELECT id FROM question_candidates WHERE source_key = ?",

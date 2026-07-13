@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from .models import CommunityAnswer, QuestionCluster, StoredMessage
 from .privacy import redact_for_report
+from .token_usage import TokenUsageTracker
 
 _TOOL_NAME = "nju_read_chat_context"
 _SYSTEM_PROMPT = f"""
@@ -183,12 +184,14 @@ class AstrBotContextAnswerAgent:
         timeout_seconds: int = 120,
         max_retries: int = 3,
         max_steps: int = 16,
+        token_usage: TokenUsageTracker | None = None,
     ) -> None:
         self._context = context
         self._provider_id = provider_id.strip()
         self._timeout = timeout_seconds
         self._max_retries = max_retries
         self._max_steps = max_steps
+        self._token_usage = token_usage
 
     async def collect(
         self,
@@ -270,6 +273,8 @@ class AstrBotContextAnswerAgent:
                 ),
                 timeout=self._timeout,
             )
+            if self._token_usage is not None:
+                self._token_usage.record(response)
             names = list(getattr(response, "tools_call_name", []) or [])
             if not names:
                 if not used_tool:

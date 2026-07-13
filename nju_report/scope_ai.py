@@ -16,6 +16,7 @@ from .models import (
 )
 from .privacy import prepare_scope_input
 from .scope_classifier import ScopeBatchMessage
+from .token_usage import TokenUsageTracker
 
 _OUTPUT_CONTRACT = """
 只输出一个 JSON 对象，不要 Markdown，不要附加解释。字段：
@@ -154,11 +155,13 @@ class AstrBotScopeAiClient:
         provider_id: str = "",
         timeout_seconds: int = 120,
         max_retries: int = 3,
+        token_usage: TokenUsageTracker | None = None,
     ) -> None:
         self._context = context
         self._configured_provider_id = provider_id.strip()
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
+        self._token_usage = token_usage
 
     async def classify(self, message: str, context: str) -> ScopeAssessment:
         prepared = prepare_scope_input(message, context)
@@ -219,6 +222,8 @@ class AstrBotScopeAiClient:
                     ),
                     timeout=self._timeout_seconds,
                 )
+                if self._token_usage is not None:
+                    self._token_usage.record(response)
                 completion = str(getattr(response, "completion_text", "") or "")
                 return parse_scope_assessment(completion)
             except asyncio.CancelledError:
@@ -250,6 +255,8 @@ class AstrBotScopeAiClient:
                     ),
                     timeout=self._timeout_seconds,
                 )
+                if self._token_usage is not None:
+                    self._token_usage.record(response)
                 completion = str(getattr(response, "completion_text", "") or "")
                 return parse_scope_batch(completion, target_ids)
             except asyncio.CancelledError:

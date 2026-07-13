@@ -43,6 +43,13 @@ class QuestionAggregationService:
         self._answer_agent = answer_agent
         self._timezone_name = timezone_name
         self._semaphore = asyncio.Semaphore(max(1, concurrency))
+        self._progress_date = ""
+        self._progress_completed = 0
+        self._progress_total = 0
+
+    @property
+    def progress(self) -> tuple[str, int, int]:
+        return self._progress_date, self._progress_completed, self._progress_total
 
     async def aggregate_date(self, report_date: date) -> list[QuestionCluster]:
         candidates, _ = await asyncio.to_thread(
@@ -54,6 +61,9 @@ class QuestionAggregationService:
         window = natural_day_window(report_date, self._timezone_name)
         messages = await asyncio.to_thread(self._storage.messages_in_window, window)
         clusters = _aggregate(included)
+        self._progress_date = report_date.isoformat()
+        self._progress_completed = 0
+        self._progress_total = len(clusters)
         excluded_message_ids = {
             external_id
             for item in included
@@ -76,7 +86,9 @@ class QuestionAggregationService:
                         cluster.question_code,
                     )
                     answers = ()
-                return replace(cluster, answers=answers)
+                result = replace(cluster, answers=answers)
+            self._progress_completed += 1
+            return result
 
         clusters = list(await asyncio.gather(*(attach(item) for item in clusters)))
         await asyncio.to_thread(

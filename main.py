@@ -41,6 +41,7 @@ from .nju_report.scope_ai import AstrBotScopeAiClient
 from .nju_report.scope_classifier import AutoScopeReviewService
 from .nju_report.startup_checks import StartupCheckService, format_startup_checks
 from .nju_report.storage import ReportStorage
+from .nju_report.token_usage import TokenUsage, TokenUsageTracker
 from .nju_report.workflow import DailyReportWorkflow, DailyScheduler, FullReportRunResult
 
 PLUGIN_NAME = "astrbot_plugin_nju_qa_report"
@@ -51,7 +52,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.2.8",
+    "0.2.9",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -73,11 +74,13 @@ class NjuQaReportPlugin(Star):
             max_queue_size=self.runtime_config.capture_queue_size,
             on_error=self._log_capture_write_error,
         )
+        self.token_usage = TokenUsageTracker()
         scope_ai = AstrBotScopeAiClient(
             context,
             provider_id=self.runtime_config.llm_provider_id,
             timeout_seconds=self.runtime_config.request_timeout_seconds,
             max_retries=self.runtime_config.max_retries,
+            token_usage=self.token_usage,
         )
         self.scope_review_service = AutoScopeReviewService(
             scope_ai,
@@ -107,6 +110,7 @@ class NjuQaReportPlugin(Star):
             provider_id=self.runtime_config.llm_provider_id,
             timeout_seconds=self.runtime_config.request_timeout_seconds,
             max_retries=self.runtime_config.max_retries,
+            token_usage=self.token_usage,
         )
         self.aggregation_service = QuestionAggregationService(
             self.storage,
@@ -119,6 +123,7 @@ class NjuQaReportPlugin(Star):
             provider_id=self.runtime_config.llm_provider_id,
             timeout_seconds=self.runtime_config.request_timeout_seconds,
             max_retries=self.runtime_config.max_retries,
+            token_usage=self.token_usage,
         )
         self.investigation_service = InvestigationService(
             self.runtime_config,
@@ -139,6 +144,7 @@ class NjuQaReportPlugin(Star):
             self.report_service,
             self.knowledge_service,
             timezone_name=self.runtime_config.timezone,
+            token_usage=self.token_usage,
         )
         self.scheduler = DailyScheduler(
             self.workflow,
@@ -823,6 +829,15 @@ class NjuQaReportPlugin(Star):
             screening = ""
             if progress.screening_total and progress.stage == "AI 筛选与自动复核":
                 screening = f"\n消息筛选：{progress.screening_completed}/{progress.screening_total}"
+            aggregation = ""
+            if (
+                progress.aggregation_total
+                and progress.stage == "问题聚合与 Agent 上下文回答查找"
+            ):
+                aggregation = (
+                    "\n回答查找："
+                    f"{progress.aggregation_completed}/{progress.aggregation_total}"
+                )
             investigation = ""
             if progress.investigation_total and progress.stage == "知识库调查":
                 investigation = (
@@ -834,7 +849,13 @@ class NjuQaReportPlugin(Star):
                 f"当前日期：{progress.report_date}\n"
                 f"当前阶段：{progress.stage}"
                 f"{screening}"
+                f"{aggregation}"
                 f"{investigation}"
+                + (
+                    "\n" + _format_token_usage(progress.token_usage)
+                    if progress.token_usage.calls
+                    else ""
+                )
             )
             return
         try:
@@ -861,6 +882,15 @@ class NjuQaReportPlugin(Star):
             self.storage.latest_report,
             requested_date.isoformat(),
         )
+        running_details = ""
+        if progress.running and progress.report_date == requested_date.isoformat():
+            if progress.stage == "问题聚合与 Agent 上下文回答查找":
+                running_details += (
+                    "\n回答查找："
+                    f"{progress.aggregation_completed}/{progress.aggregation_total}"
+                )
+            if progress.token_usage.calls:
+                running_details += "\n" + _format_token_usage(progress.token_usage)
         yield event.plain_result(
             f"{window.report_date} 处理状态\n"
             f"状态：{window.status}\n"
@@ -878,6 +908,7 @@ class NjuQaReportPlugin(Star):
                 if progress.running and progress.report_date == requested_date.isoformat()
                 else ""
             )
+            + running_details
         )
 
     @nju_collect.command("export")
@@ -1054,6 +1085,14 @@ def _format_full_run_results(results: list[FullReportRunResult]) -> str:
         f"新生成或更新报告：{sum(item.report is not None for item in processed)}",
         f"技术错误：{sum(item.screening.error_count for item in processed)}",
     ]
+    token_usage = TokenUsage(
+        input_tokens=sum(item.token_usage.input_tokens for item in results),
+        output_tokens=sum(item.token_usage.output_tokens for item in results),
+        total_tokens=sum(item.token_usage.total_tokens for item in results),
+        calls=sum(item.token_usage.calls for item in results),
+        reported_calls=sum(item.token_usage.reported_calls for item in results),
+    )
+    lines.append(_format_token_usage(token_usage))
     if skipped:
         lines.append(
             "筛选跳过日期：" + _compact_dates([item.screening.report_date for item in skipped])
@@ -1075,6 +1114,19 @@ def _format_full_run_results(results: list[FullReportRunResult]) -> str:
         )
     lines.append("先用 report preview 检查 HTML；确认后再用 report send 发送邮件。")
     return "\n".join(lines)
+
+
+def _format_token_usage(usage: TokenUsage) -> str:
+    if usage.calls == 0:
+        return "对话模型 Token：本次未调用模型"
+    if usage.reported_calls == 0:
+        return f"对话模型 Token：Provider 未返回 usage，无法统计（模型响应 {usage.calls} 次）"
+    coverage = f"统计覆盖 {usage.reported_calls}/{usage.calls} 次模型响应"
+    return (
+        "对话模型 Token："
+        f"输入 {usage.input_tokens:,}｜输出 {usage.output_tokens:,}｜"
+        f"合计 {usage.total_tokens:,}（{coverage}；不含 Embedding）"
+    )
 
 
 def _compact_dates(values: list[str], limit: int = 20) -> str:

@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 from nju_report.models import ReportArtifact, StoredMessage
 from nju_report.question_processor import DailyRunResult
 from nju_report.storage import ReportStorage
 from nju_report.time_windows import natural_day_window
+from nju_report.token_usage import TokenUsageTracker
 from nju_report.workflow import DailyReportWorkflow
 
 
@@ -22,6 +24,8 @@ class FakeProcessor:
 
 
 class FakeAggregation:
+    progress = ("", 0, 0)
+
     async def aggregate_date(self, report_date: date):
         return []
 
@@ -75,6 +79,55 @@ def test_normal_history_run_skips_complete_report_but_force_recomputes(tmp_path:
         forced = await workflow.run_date(report_date, force=True)
         assert forced.screening.status == "COMPLETED"
         assert processor.calls == [(report_date, True)]
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_workflow_returns_only_this_run_provider_token_usage(tmp_path: Path) -> None:
+    class UsageProcessor(FakeProcessor):
+        def __init__(self, tracker: TokenUsageTracker) -> None:
+            super().__init__()
+            self.tracker = tracker
+
+        async def process_date(self, report_date: date, *, force: bool = False):
+            self.tracker.record(
+                SimpleNamespace(
+                    raw_completion=SimpleNamespace(
+                        usage={
+                            "prompt_tokens": 100,
+                            "completion_tokens": 20,
+                            "total_tokens": 120,
+                        }
+                    )
+                )
+            )
+            return await super().process_date(report_date, force=force)
+
+    async def run() -> None:
+        report_date = date(2026, 7, 12)
+        storage = _complete_report_storage(tmp_path, report_date)
+        existing = storage.latest_report(report_date.isoformat())
+        assert existing is not None
+        tracker = TokenUsageTracker()
+        tracker.record({"usage": {"prompt_tokens": 999, "completion_tokens": 1}})
+        workflow = DailyReportWorkflow(  # type: ignore[arg-type]
+            storage,
+            UsageProcessor(tracker),
+            FakeAggregation(),
+            FakeInvestigation(),
+            FakeReports(existing),
+            FakeKnowledge(),
+            timezone_name="Asia/Shanghai",
+            token_usage=tracker,
+        )
+
+        result = await workflow.run_date(report_date, force=True)
+
+        assert result.token_usage.input_tokens == 100
+        assert result.token_usage.output_tokens == 20
+        assert result.token_usage.total_tokens == 120
+        assert result.token_usage.calls == result.token_usage.reported_calls == 1
         storage.close()
 
     asyncio.run(run())
