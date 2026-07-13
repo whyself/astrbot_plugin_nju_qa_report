@@ -18,6 +18,7 @@ from .nju_report.aggregation import QuestionAggregationService
 from .nju_report.answer_agent import AstrBotContextAnswerAgent
 from .nju_report.capture_writer import AsyncCaptureWriter
 from .nju_report.config import PluginConfig
+from .nju_report.file_echo import OutgoingFileEchoGuard
 from .nju_report.help_text import COVERAGE_STATUS_HELP, available_help_topics, detailed_help
 from .nju_report.investigation import AstrBotInvestigationAiClient, InvestigationService
 from .nju_report.knowledge import KnowledgeError, KnowledgeService
@@ -54,7 +55,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.5.8",
+    "0.5.9",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -76,6 +77,7 @@ class NjuQaReportPlugin(Star):
             max_queue_size=self.runtime_config.capture_queue_size,
             on_error=self._log_capture_write_error,
         )
+        self._file_echo_guard = OutgoingFileEchoGuard(ttl_seconds=60)
         self.token_usage = TokenUsageTracker()
         scope_ai = AstrBotScopeAiClient(
             context,
@@ -178,6 +180,25 @@ class NjuQaReportPlugin(Star):
         self.scheduler.start()
         capture_state = "已启用" if self.runtime_config.capture_enabled else "未启用"
         logger.info("NJU QA report plugin loaded; message capture %s", capture_state)
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=10_000)
+    async def suppress_outgoing_file_echo(self, event: AstrMessageEvent) -> None:
+        """Stop only this plugin's recently sent files from waking the default Agent."""
+
+        sender_id = str(event.get_sender_id() or "").strip()
+        self_id = str(event.get_self_id() or "").strip()
+        if not sender_id or sender_id != self_id:
+            return
+        filenames = [
+            str(getattr(component, "name", "") or "").strip()
+            for component in event.get_messages()
+            if isinstance(component, Comp.File)
+        ]
+        if not self._file_echo_guard.matches(filenames):
+            return
+        event.should_call_llm(True)
+        event.stop_event()
+        logger.info("NJU report suppressed outgoing file echo: %s", filenames[0])
 
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE,
@@ -390,7 +411,7 @@ class NjuQaReportPlugin(Star):
         if not tail:
             path, total = await asyncio.to_thread(self.question_exporter.export_all)
             try:
-                await _send_local_file(event, path)
+                await _send_local_file(event, path, self._file_echo_guard)
             except Exception as exc:
                 logger.exception("NJU public question export file delivery failed")
                 yield event.plain_result(f"问题简表已生成，但文件发送失败：{_file_error(exc)}")
@@ -408,7 +429,7 @@ class NjuQaReportPlugin(Star):
             status=status_filter,
         )
         try:
-            await _send_local_file(event, path)
+            await _send_local_file(event, path, self._file_echo_guard)
         except Exception as exc:
             logger.exception("NJU public question export file delivery failed")
             yield event.plain_result(f"问题简表已生成，但文件发送失败：{_file_error(exc)}")
@@ -842,7 +863,7 @@ class NjuQaReportPlugin(Star):
             yield event.plain_result("该日报的本地 HTML 文件已丢失，请重新运行日报处理。")
             return
         try:
-            await _send_local_file(event, path)
+            await _send_local_file(event, path, self._file_echo_guard)
         except Exception as exc:
             logger.exception("NJU HTML report file delivery failed")
             yield event.plain_result(f"HTML 已生成，但文件发送失败：{_file_error(exc)}")
@@ -1046,7 +1067,7 @@ class NjuQaReportPlugin(Star):
         if not tail:
             path, total = await asyncio.to_thread(self.question_exporter.export_all)
             try:
-                await _send_local_file(event, path)
+                await _send_local_file(event, path, self._file_echo_guard)
             except Exception as exc:
                 logger.exception("NJU operator question export file delivery failed")
                 yield event.plain_result(
@@ -1068,7 +1089,7 @@ class NjuQaReportPlugin(Star):
             status=status_filter,
         )
         try:
-            await _send_local_file(event, path)
+            await _send_local_file(event, path, self._file_echo_guard)
         except Exception as exc:
             logger.exception("NJU operator question export file delivery failed")
             yield event.plain_result(f"累计问题总表已刷新，但文件发送失败：{_file_error(exc)}")
@@ -1223,12 +1244,22 @@ def _operator_error(exc: Exception) -> str:
     return type(exc).__name__
 
 
-async def _send_local_file(event: AstrMessageEvent, path: Path) -> None:
+async def _send_local_file(
+    event: AstrMessageEvent,
+    path: Path,
+    echo_guard: OutgoingFileEchoGuard,
+) -> None:
     """Send a local file, using OneBot's native upload action when available."""
 
     resolved = path.resolve()
     if not resolved.is_file():
         raise FileNotFoundError(str(resolved))
+
+    # Native OneBot actions bypass AstrBot's event.send() bookkeeping. Explicitly
+    # prevent this command event from falling through to the default Agent, and
+    # remember the filename before upload so a concurrent self-message echo is caught.
+    event.should_call_llm(True)
+    echo_token = echo_guard.remember(resolved.name)
 
     native_error: Exception | None = None
     if event.get_platform_name() == "aiocqhttp":
@@ -1262,6 +1293,7 @@ async def _send_local_file(event: AstrMessageEvent, path: Path) -> None:
     try:
         await event.send(MessageChain([Comp.File(name=resolved.name, file=str(resolved))]))
     except Exception as exc:
+        echo_guard.cancel(echo_token)
         if native_error is not None:
             raise RuntimeError(
                 f"OneBot upload failed ({type(native_error).__name__}); "
