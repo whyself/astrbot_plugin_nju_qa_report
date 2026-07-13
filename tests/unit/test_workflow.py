@@ -158,6 +158,7 @@ def _complete_report_storage(tmp_path: Path, report_date: date) -> ReportStorage
     assert storage.begin_processing_window(window, run_id="first") is True
     storage.complete_processing_window(
         report_date.isoformat(),
+        run_id="first",
         messages_scanned=1,
         candidates_saved=1,
         included_count=1,

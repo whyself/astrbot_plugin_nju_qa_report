@@ -997,6 +997,7 @@ class ReportStorage:
         self,
         report_date: str,
         *,
+        run_id: str,
         messages_scanned: int,
         candidates_saved: int,
         included_count: int,
@@ -1013,7 +1014,7 @@ class ReportStorage:
                 SET status = ?, messages_scanned = ?, candidates_saved = ?,
                     included_count = ?, dropped_count = ?, error_count = ?,
                     error_summary = '', updated_at_utc = ?
-                WHERE report_date = ? AND status = 'RUNNING'
+                WHERE report_date = ? AND status = 'RUNNING' AND run_id = ?
                 """,
                 (
                     final_status,
@@ -1024,12 +1025,19 @@ class ReportStorage:
                     error_count,
                     int(time.time()),
                     report_date,
+                    run_id,
                 ),
             )
             if cursor.rowcount != 1:
-                raise StorageError("日报处理窗口不是可完成的 RUNNING 状态")
+                raise StorageError("本次日报运行已被更新的任务替代，不能写入完成状态")
 
-    def fail_processing_window(self, report_date: str, error_summary: str) -> None:
+    def fail_processing_window(
+        self,
+        report_date: str,
+        error_summary: str,
+        *,
+        run_id: str,
+    ) -> None:
         """Mark a run retryable while keeping already written candidate records."""
 
         with self._transaction() as connection:
@@ -1037,9 +1045,9 @@ class ReportStorage:
                 """
                 UPDATE processing_windows
                 SET status = 'FAILED', error_summary = ?, updated_at_utc = ?
-                WHERE report_date = ? AND status = 'RUNNING'
+                WHERE report_date = ? AND status = 'RUNNING' AND run_id = ?
                 """,
-                (error_summary[:1000], int(time.time()), report_date),
+                (error_summary[:1000], int(time.time()), report_date, run_id),
             )
 
     def processing_window(self, report_date: str) -> ProcessingWindowRecord | None:

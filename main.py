@@ -40,7 +40,7 @@ from .nju_report.reporting import (
 from .nju_report.scope_ai import AstrBotScopeAiClient
 from .nju_report.scope_classifier import AutoScopeReviewService
 from .nju_report.startup_checks import StartupCheckService, format_startup_checks
-from .nju_report.storage import ReportStorage
+from .nju_report.storage import ReportStorage, StorageError
 from .nju_report.token_usage import TokenUsage, TokenUsageTracker
 from .nju_report.workflow import DailyReportWorkflow, DailyScheduler, FullReportRunResult
 
@@ -52,7 +52,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.3.0",
+    "0.3.1",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -658,7 +658,7 @@ class NjuQaReportPlugin(Star):
             return
         except Exception as exc:
             logger.exception("NJU full report processing failed")
-            yield event.plain_result(f"完整日报处理失败：{type(exc).__name__}")
+            yield event.plain_result(f"完整日报处理失败：{_operator_error(exc)}")
             return
 
         if not results:
@@ -705,7 +705,7 @@ class NjuQaReportPlugin(Star):
             await asyncio.to_thread(self.question_exporter.export_all)
         except Exception as exc:
             logger.exception("NJU forced report rerun failed")
-            yield event.plain_result(f"强制重跑失败：{type(exc).__name__}")
+            yield event.plain_result(f"强制重跑失败：{_operator_error(exc)}")
             return
         yield event.plain_result("强制重跑完成\n" + _format_full_run_results([result]))
 
@@ -1064,6 +1064,13 @@ def _shorten(value: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 1] + "…"
+
+
+def _operator_error(exc: Exception) -> str:
+    if isinstance(exc, StorageError):
+        detail = _shorten(str(exc), 160)
+        return f"StorageError：{detail or '本地数据库操作失败'}"
+    return type(exc).__name__
 
 
 def _format_full_run_results(results: list[FullReportRunResult]) -> str:

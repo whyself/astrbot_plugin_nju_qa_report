@@ -88,6 +88,46 @@ def test_storage_initialization_is_idempotent_and_uses_safety_pragmas(
     storage.close()
 
 
+def test_superseded_run_cannot_complete_or_fail_newer_window(tmp_path: Path) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    window = natural_day_window(date(2026, 7, 12), "Asia/Shanghai")
+    assert storage.begin_processing_window(window, run_id="old") is True
+    assert storage.begin_processing_window(window, run_id="new", force=True) is True
+
+    with pytest.raises(StorageError, match="更新的任务替代"):
+        storage.complete_processing_window(
+            window.report_date.isoformat(),
+            run_id="old",
+            messages_scanned=1,
+            candidates_saved=1,
+            included_count=1,
+            dropped_count=0,
+            error_count=0,
+        )
+    storage.fail_processing_window(
+        window.report_date.isoformat(),
+        "old failed",
+        run_id="old",
+    )
+    current = storage.processing_window(window.report_date.isoformat())
+    assert current is not None
+    assert current.status == "RUNNING"
+    assert current.run_id == "new"
+
+    storage.complete_processing_window(
+        window.report_date.isoformat(),
+        run_id="new",
+        messages_scanned=1,
+        candidates_saved=1,
+        included_count=1,
+        dropped_count=0,
+        error_count=0,
+    )
+    assert storage.processing_window(window.report_date.isoformat()).status == "COMPLETED"
+    storage.close()
+
+
 def test_migrations_tolerate_indexes_left_by_an_older_partial_run(tmp_path: Path) -> None:
     """A reload must recover when schema rows lag behind already-created indexes."""
 

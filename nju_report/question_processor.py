@@ -155,6 +155,7 @@ class DailyQuestionProcessor:
             await asyncio.to_thread(
                 self._storage.complete_processing_window,
                 report_date.isoformat(),
+                run_id=run_id,
                 messages_scanned=len(messages),
                 candidates_saved=len(decisions),
                 included_count=included_count,
@@ -176,6 +177,7 @@ class DailyQuestionProcessor:
                 self._storage.fail_processing_window,
                 report_date.isoformat(),
                 "CancelledError",
+                run_id=run_id,
             )
             raise
         except Exception as exc:
@@ -184,6 +186,7 @@ class DailyQuestionProcessor:
                 self._storage.fail_processing_window,
                 report_date.isoformat(),
                 error_name,
+                run_id=run_id,
             )
             return DailyRunResult(
                 report_date=report_date.isoformat(),
