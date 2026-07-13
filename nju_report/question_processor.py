@@ -52,6 +52,7 @@ class DailyQuestionProcessor:
         timezone_name: str,
         concurrency: int = 2,
         context_radius: int = 30,
+        ignored_sender_ids: tuple[str, ...] = (),
     ) -> None:
         if concurrency < 1:
             raise ValueError("concurrency 必须大于 0")
@@ -62,6 +63,9 @@ class DailyQuestionProcessor:
         self._timezone_name = timezone_name
         self._concurrency = concurrency
         self._context_radius = context_radius
+        self._ignored_sender_ids = frozenset(
+            str(item).strip() for item in ignored_sender_ids if str(item).strip()
+        )
         self._run_lock = asyncio.Lock()
         self._progress_date = ""
         self._progress_completed = 0
@@ -133,6 +137,7 @@ class DailyQuestionProcessor:
                 messages,
                 context_radius=self._context_radius,
                 conversation_date=report_date.isoformat(),
+                ignored_sender_ids=self._ignored_sender_ids,
             )
             semaphore = asyncio.Semaphore(self._concurrency)
 
@@ -275,9 +280,14 @@ def _screening_chunks(
     *,
     context_radius: int,
     conversation_date: str = "",
+    ignored_sender_ids: frozenset[str] | None = None,
 ) -> list[_ScreeningChunk]:
     groups: dict[str, list[tuple[int, StoredMessage]]] = {}
     for index, item in enumerate(messages):
+        if item.sender_id in (ignored_sender_ids or ()) or (
+            item.sender_id and item.sender_id == item.bot_self_id
+        ):
+            continue
         if not (item.text.strip() or item.outline.strip()):
             continue
         group_key = item.group_id or item.session_id

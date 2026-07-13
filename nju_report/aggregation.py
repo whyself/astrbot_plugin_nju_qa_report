@@ -61,11 +61,12 @@ class QuestionAggregationService:
         window = natural_day_window(report_date, self._timezone_name)
         messages = await asyncio.to_thread(self._storage.messages_in_window, window)
         message_by_external_id = {item.external_message_id: item for item in messages}
+        candidate_by_source_key = {item.source_key: item for item in included}
         clusters = _aggregate(included)
         self._progress_date = report_date.isoformat()
         self._progress_completed = 0
         self._progress_total = len(clusters)
-        async def attach(cluster: QuestionCluster) -> QuestionCluster:
+        async def attach(cluster: QuestionCluster) -> tuple[QuestionCluster, ...]:
             async with self._semaphore:
                 try:
                     discovery = await self._answer_agent.collect(cluster, messages)
@@ -77,11 +78,13 @@ class QuestionAggregationService:
                         cluster.question_code,
                     )
                     discovery = None
-                if discovery is None or not discovery.question_message_ids:
-                    result = replace(
-                        cluster,
-                        representative_questions=(cluster.canonical_question,),
-                        answers=(),
+                if discovery is None or not discovery.questions:
+                    results = (
+                        replace(
+                            cluster,
+                            representative_questions=(cluster.canonical_question,),
+                            answers=(),
+                        ),
                     )
                 else:
                     source_by_external_id = {
@@ -89,37 +92,63 @@ class QuestionAggregationService:
                         for source_key in cluster.candidate_source_keys
                         if (external_id := _external_id_from_source_key(source_key))
                     }
-                    refined_source_keys = tuple(
-                        source_by_external_id[item]
-                        for item in discovery.question_message_ids
-                        if item in source_by_external_id
-                    )
-                    refined_messages = [
-                        message_by_external_id[item]
-                        for item in discovery.question_message_ids
-                        if item in message_by_external_id
-                    ]
-                    result = replace(
-                        cluster,
-                        candidate_source_keys=refined_source_keys
-                        or cluster.candidate_source_keys,
-                        representative_questions=(cluster.canonical_question,),
-                        first_sent_at_utc=(
-                            min(item.sent_at_utc for item in refined_messages)
-                            if refined_messages
-                            else cluster.first_sent_at_utc
-                        ),
-                        last_sent_at_utc=(
-                            max(item.sent_at_utc for item in refined_messages)
-                            if refined_messages
-                            else cluster.last_sent_at_utc
-                        ),
-                        answers=discovery.answers,
-                    )
+                    split_results: list[QuestionCluster] = []
+                    for question in discovery.questions:
+                        refined_source_keys = tuple(
+                            source_by_external_id[item]
+                            for item in question.question_message_ids
+                            if item in source_by_external_id
+                        )
+                        refined_messages = [
+                            message_by_external_id[item]
+                            for item in question.question_message_ids
+                            if item in message_by_external_id
+                        ]
+                        question_candidates = [
+                            candidate_by_source_key[item]
+                            for item in refined_source_keys
+                            if item in candidate_by_source_key
+                        ]
+                        question_code = (
+                            min(item.question_code for item in question_candidates)
+                            if question_candidates
+                            else cluster.question_code
+                        )
+                        canonical_question = (
+                            question.canonical_question or cluster.canonical_question
+                        )
+                        split_results.append(
+                            replace(
+                                cluster,
+                                question_code=question_code,
+                                canonical_question=canonical_question,
+                                category=question.category or cluster.category,
+                                candidate_source_keys=(
+                                    refined_source_keys or cluster.candidate_source_keys
+                                ),
+                                representative_questions=(canonical_question,),
+                                first_sent_at_utc=(
+                                    min(item.sent_at_utc for item in refined_messages)
+                                    if refined_messages
+                                    else cluster.first_sent_at_utc
+                                ),
+                                last_sent_at_utc=(
+                                    max(item.sent_at_utc for item in refined_messages)
+                                    if refined_messages
+                                    else cluster.last_sent_at_utc
+                                ),
+                                answers=question.answers,
+                            )
+                        )
+                    results = tuple(split_results)
             self._progress_completed += 1
-            return result
+            return results
 
-        clusters = list(await asyncio.gather(*(attach(item) for item in clusters)))
+        attached = await asyncio.gather(*(attach(item) for item in clusters))
+        clusters = sorted(
+            (item for group in attached for item in group),
+            key=lambda item: item.question_code,
+        )
         await asyncio.to_thread(
             self._storage.save_question_clusters,
             report_date.isoformat(),

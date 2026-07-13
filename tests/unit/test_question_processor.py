@@ -12,7 +12,7 @@ from nju_report.models import (
     StoredMessage,
 )
 from nju_report.question_export import QuestionCsvExporter
-from nju_report.question_processor import DailyQuestionProcessor
+from nju_report.question_processor import DailyQuestionProcessor, _screening_chunks
 from nju_report.scope_classifier import ScopeBatchMessage
 from nju_report.storage import ReportStorage
 from nju_report.time_windows import natural_day_window
@@ -88,6 +88,20 @@ def _stored(message_id: str, text: str, timestamp: int) -> StoredMessage:
         reply_to_message_id="",
         analyzable=True,
     )
+
+
+def test_screening_chunks_exclude_configured_bot_before_ai() -> None:
+    user = _stored("user", "校园卡怎么补办？", 100)
+    bot = replace(_stored("bot", "机器人自动回答", 101), sender_id="bot-qq")
+
+    chunks = _screening_chunks(
+        [user, bot],
+        context_radius=30,
+        ignored_sender_ids=frozenset({"bot-qq"}),
+    )
+
+    assert [item[2].external_message_id for item in chunks[0].targets] == ["user"]
+    assert [item.message_id for item in chunks[0].messages] == ["m0"]
 
 
 def test_daily_processor_retains_include_drop_and_error_and_skips_rerun(

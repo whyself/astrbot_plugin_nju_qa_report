@@ -5,7 +5,7 @@ from datetime import date
 from pathlib import Path
 
 from nju_report.aggregation import QuestionAggregationService, _aggregate
-from nju_report.answer_agent import AnswerDiscoveryResult
+from nju_report.answer_agent import AnswerDiscoveryResult, DiscoveredQuestion
 from nju_report.models import (
     CommunityAnswer,
     QuestionCandidate,
@@ -222,6 +222,87 @@ def test_answer_agent_repairs_overinclusive_question_sources_and_uses_summary() 
         assert clusters[0].answers[0].redacted_text == "应先挂失，再前往服务点办理。"
         assert "王思喆" not in clusters[0].representative_questions[0]
         assert "陶子秋" not in clusters[0].answers[0].redacted_text
+        assert storage.saved == clusters
+
+    asyncio.run(run())
+
+
+def test_answer_agent_can_split_one_overmerged_cluster_into_two_questions() -> None:
+    class Storage:
+        saved: list[QuestionCluster] = []
+
+        def list_question_candidates(self, *, report_date: str, limit):
+            del report_date, limit
+            return (
+                [
+                    _candidate(
+                        "20260712-Q001",
+                        "message:qq:bot:q1",
+                        "陶二条件怎么样？",
+                        "陶二条件如何，大二能否住上翻新宿舍？",
+                        "住宿食堂",
+                        100,
+                    ),
+                    _candidate(
+                        "20260712-Q002",
+                        "message:qq:bot:q2",
+                        "大二能住上翻新的宿舍吗？",
+                        "陶二条件如何，大二能否住上翻新宿舍？",
+                        "住宿食堂",
+                        101,
+                    ),
+                ],
+                2,
+            )
+
+        def messages_in_window(self, window):
+            del window
+            return [
+                _message("q1", 100, "u1", "陶二条件怎么样？"),
+                _message("q2", 101, "u1", "大二能住上翻新的宿舍吗？"),
+            ]
+
+        def save_question_clusters(self, report_date: str, clusters):
+            del report_date
+            self.saved = list(clusters)
+
+    class Agent:
+        async def collect(self, cluster, messages):
+            del cluster, messages
+            return AnswerDiscoveryResult(
+                ("q1",),
+                (),
+                "陶二宿舍有哪些设施",
+                "住宿食堂",
+                (
+                    DiscoveredQuestion(
+                        ("q2",),
+                        (),
+                        "大二学生能否住上翻新后的宿舍",
+                        "住宿食堂",
+                    ),
+                ),
+            )
+
+    async def run() -> None:
+        storage = Storage()
+        service = QuestionAggregationService(  # type: ignore[arg-type]
+            storage,
+            Agent(),
+            timezone_name="Asia/Shanghai",
+            concurrency=1,
+        )
+
+        clusters = await service.aggregate_date(date(2026, 7, 12))
+
+        assert [item.question_code for item in clusters] == [
+            "20260712-Q001",
+            "20260712-Q002",
+        ]
+        assert [item.canonical_question for item in clusters] == [
+            "陶二宿舍有哪些设施",
+            "大二学生能否住上翻新后的宿舍",
+        ]
         assert storage.saved == clusters
 
     asyncio.run(run())

@@ -51,6 +51,7 @@
 主要运维命令：
 
 ```text
+/nju_collect help
 /nju_collect report run 2026-07-12
 /nju_collect report run all
 /nju_collect report status 2026-07-12
@@ -70,7 +71,8 @@
 
 `report run` 会先同步允许仓库并生成本地 HTML，但不会发邮件。检查 `report preview`
 后再显式执行 `report send`。只有开启 `daily_report_enabled` 后，定时任务才会自动同步、
-处理前一自然日并发送邮件。
+处理前一自然日并发送邮件。邮件正文只展示状态统计及逐行的“问题、群答摘要、知识库状态”，
+完整调查、维护建议和引用保留在随邮件附加的 HTML 中。
 
 普通 `report run`/`run all` 会跳过已成功生成完整报告的日期；只有管理员显式执行
 带 `confirm` 的 `report rerun` 才会重新调用该日的 AI 筛选和知识调查。长任务不会主动

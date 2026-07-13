@@ -53,7 +53,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.5.1",
+    "0.5.2",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -94,6 +94,7 @@ class NjuQaReportPlugin(Star):
             self.scope_review_service,
             timezone_name=self.runtime_config.timezone,
             concurrency=self.runtime_config.batch_concurrency,
+            ignored_sender_ids=self.runtime_config.history_import_bot_qq_ids,
         )
         self.question_exporter = QuestionCsvExporter(
             self.storage,
@@ -111,6 +112,7 @@ class NjuQaReportPlugin(Star):
             provider_id=self.runtime_config.llm_provider_id,
             timeout_seconds=self.runtime_config.request_timeout_seconds,
             token_usage=self.token_usage,
+            ignored_sender_ids=self.runtime_config.history_import_bot_qq_ids,
         )
         self.aggregation_service = QuestionAggregationService(
             self.storage,
@@ -400,6 +402,30 @@ class NjuQaReportPlugin(Star):
     @filter.command_group("nju_collect")
     def nju_collect(self):
         """Technical operator commands."""
+
+    @nju_collect.command("help")
+    async def operator_help(self, event: AstrMessageEvent):
+        event.stop_event()
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.OPERATE,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
+        yield event.plain_result(
+            "NJU 日报指令（以下省略 /nju_collect）\n"
+            "日常：status｜help\n"
+            "历史处理：import inspect｜import run\n"
+            "仓库：repo status｜repo sync｜repo search <关键词>\n"
+            "报告：report run <日期|all>｜report rerun <日期> confirm｜"
+            "report status [日期]｜report preview <日期>｜report send <日期>\n"
+            "诊断：test startup [live]｜test scope <问题>｜investigate <问题编号>｜"
+            "export questions\n"
+            "示例：/nju_collect report status 2026-07-12"
+        )
 
     @nju_collect.command("status")
     async def operator_status(self, event: AstrMessageEvent):

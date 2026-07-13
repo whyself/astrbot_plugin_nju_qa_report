@@ -33,6 +33,12 @@ _SYSTEM_PROMPT = """
 2025 年资料在 2026 年默认仍可使用，除非证据明确显示后来有改造、调整或冲突。
 不得仅因资料不是当年发布就返回 NO_USABLE_EVIDENCE；有轻微时效风险可使用 STALE_RISK。
 
+输出前必须逐项核对问题中的对象和证据原文：如果证据已经明确给出实体对应关系，
+例如分别说明“2号楼属于第一组团、4号楼属于第二组团”，就不得再声称“未明确区分2号楼和4号楼”。
+summary、missing_information、status 和 evidence_indices 必须彼此一致。
+若证据直接回答全部核心问题，应使用 ANSWERABLE；只有确实还缺少问题要求的关键部分时才使用 PARTIAL。
+不要因为检索结果里同时出现无关证据，就忽略其中已经直接回答问题的证据。
+
 只输出一个 JSON 对象，不要 Markdown：
 {
   "status": "ANSWERABLE | PARTIAL | NO_USABLE_EVIDENCE",
@@ -114,7 +120,7 @@ class AstrBotInvestigationAiClient:
                         chat_provider_id=self._resolve_provider_id(),
                         prompt=prompt,
                         system_prompt=_SYSTEM_PROMPT,
-                        temperature=0.1,
+                        temperature=0.0,
                         request_max_retries=1,
                     ),
                     timeout=self._timeout,
@@ -349,7 +355,7 @@ def _domain_query_variants(question: str) -> tuple[str, ...]:
 def _evidence_from_hits(hits: Sequence[KnowledgeSearchHit]) -> tuple[EvidenceItem, ...]:
     grouped: dict[tuple[str, str], list[KnowledgeSearchHit]] = {}
     for hit in hits:
-        key = (hit.chunk.namespace, hit.chunk.document_id)
+        key = _evidence_document_key(hit)
         if key not in grouped and len(grouped) >= 8:
             continue
         document_hits = grouped.setdefault(key, [])
@@ -378,6 +384,15 @@ def _evidence_from_hits(hits: Sequence[KnowledgeSearchHit]) -> tuple[EvidenceIte
             )
         )
     return tuple(result)
+
+
+def _evidence_document_key(hit: KnowledgeSearchHit) -> tuple[str, str]:
+    title = "".join(hit.chunk.title.split()).casefold()
+    title = re.sub(r"(?:[（(]?副本[）)]?)$", "", title).strip()
+    return (
+        hit.chunk.namespace.casefold(),
+        title or hit.chunk.document_id.casefold(),
+    )
 
 
 def _parse_assessment(

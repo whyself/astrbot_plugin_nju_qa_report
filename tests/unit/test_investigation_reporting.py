@@ -170,6 +170,25 @@ def test_evidence_combines_multiple_relevant_chunks_from_same_document(tmp_path:
     storage.close()
 
 
+def test_evidence_deduplicates_document_titles_marked_as_copy(tmp_path: Path) -> None:
+    storage, _, _, first_hit = _prepared_case(tmp_path, repository_status="READY")
+    copied_chunk = replace(
+        first_hit.chunk,
+        chunk_id="qc19gt/guide:copy:0",
+        document_id="copy",
+        title="校园卡补办 副本",
+        content="校园卡丢失后应当先挂失。",
+        content_hash="copy",
+    )
+
+    evidence = _evidence_from_hits(
+        [first_hit, replace(first_hit, chunk=copied_chunk, score=0.85)]
+    )
+
+    assert len(evidence) == 1
+    storage.close()
+
+
 def test_public_report_evidence_is_deduplicated_and_excerpt_is_bounded() -> None:
     first = EvidenceItem(
         namespace="qc19gt/guide",
@@ -182,6 +201,7 @@ def test_public_report_evidence_is_deduplicated_and_excerpt_is_bounded() -> None
     duplicate_copy = replace(
         first,
         document_id="two",
+        title="宿舍总览 副本",
         source_url="https://example.test/two",
     )
 
@@ -233,10 +253,27 @@ def test_report_versions_and_mail_delivery_are_idempotent(
         )
         reports = ReportService(config, storage, tmp_path / "reports")
         sent: list[str] = []
+
+        def fake_send(
+            recipient: str,
+            subject: str,
+            text_body: str,
+            html_body: str,
+            full_html: str,
+            path: Path,
+        ) -> None:
+            del subject, path
+            sent.append(recipient)
+            assert "问题 1｜明确回答 0｜部分覆盖 0｜未找到 1｜异常 0" in text_body
+            assert "群答：未发现明确回答" in text_body
+            assert "知识库：知识库未找到可用信息" in text_body
+            assert "知识库调查" not in html_body
+            assert "知识库调查" in full_html
+
         monkeypatch.setattr(
             reports,
             "_send_one",
-            lambda recipient, subject, body, path: sent.append(recipient),
+            fake_send,
         )
 
         first = await reports.build(cluster.report_date)

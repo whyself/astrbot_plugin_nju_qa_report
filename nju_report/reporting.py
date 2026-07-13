@@ -129,12 +129,22 @@ class ReportService:
         if not self._mail_configured():
             raise RuntimeError("邮件配置不完整")
         try:
-            html_body = await asyncio.to_thread(
+            full_html = await asyncio.to_thread(
                 Path(report.html_path).read_text,
                 encoding="utf-8",
             )
         except OSError as exc:
             raise RuntimeError("本地日报 HTML 不存在或无法读取") from exc
+        clusters = await asyncio.to_thread(
+            self._storage.list_question_clusters,
+            report.report_date,
+        )
+        investigations = await asyncio.to_thread(
+            self._storage.investigations_for_date,
+            report.report_date,
+        )
+        mail_text = _render_mail_text(report.report_date, clusters, investigations)
+        mail_html = _render_mail_html(mail_text)
         sent = skipped = failed = 0
         for recipient in self._config.mail_recipients:
             recipient_hash = hashlib.sha256(recipient.casefold().encode("utf-8")).hexdigest()
@@ -151,7 +161,9 @@ class ReportService:
                     self._send_one,
                     recipient,
                     report.subject,
-                    html_body,
+                    mail_text,
+                    mail_html,
+                    full_html,
                     Path(report.html_path),
                 )
             except Exception as exc:
@@ -180,16 +192,24 @@ class ReportService:
             and self._config.mail_recipients
         )
 
-    def _send_one(self, recipient: str, subject: str, html_body: str, path: Path) -> None:
+    def _send_one(
+        self,
+        recipient: str,
+        subject: str,
+        text_body: str,
+        html_body: str,
+        full_html: str,
+        path: Path,
+    ) -> None:
         message = EmailMessage()
         message["Subject"] = subject
         message["From"] = self._config.mail_from
         message["To"] = recipient
-        message.set_content("本邮件包含 HTML 格式的南京大学知识库维护日报。")
+        message.set_content(text_body)
         message.add_alternative(html_body, subtype="html")
         if self._config.attach_full_html:
             message.add_attachment(
-                html_body.encode("utf-8"),
+                full_html.encode("utf-8"),
                 maintype="text",
                 subtype="html",
                 filename=path.name,
@@ -288,6 +308,56 @@ def _subject(prefix: str, report_date: str, summary: dict[str, object]) -> str:
     )
 
 
+def _render_mail_text(
+    report_date: str,
+    clusters: list[QuestionCluster],
+    investigations: dict[str, InvestigationResult],
+) -> str:
+    counts = coverage_counts(clusters, investigations)
+    lines = [
+        f"南大知识缺口日报 {report_date}",
+        (
+            f"问题 {len(clusters)}｜明确回答 {counts[CoverageStatus.ANSWERABLE]}｜"
+            f"部分覆盖 {counts[CoverageStatus.PARTIAL]}｜"
+            f"未找到 {counts[CoverageStatus.NO_USABLE_EVIDENCE]}｜"
+            f"异常 {counts[CoverageStatus.ERROR]}"
+        ),
+        "",
+    ]
+    for cluster in clusters:
+        result = investigations.get(cluster.question_code)
+        status = public_coverage_status(
+            result.status if result is not None else CoverageStatus.ERROR
+        )
+        answer = (
+            cluster.answers[0].redacted_text
+            if cluster.answers
+            else "未发现明确回答"
+        )
+        lines.append(
+            f"{cluster.question_code}｜{_mail_shorten(cluster.canonical_question, 80)}｜"
+            f"群答：{_mail_shorten(answer, 140)}｜知识库：{coverage_label(status)}"
+        )
+    lines.extend(("", "完整调查、维护建议和引用见附件 HTML。"))
+    return "\n".join(lines)
+
+
+def _render_mail_html(text: str) -> str:
+    return (
+        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"></head>'
+        '<body><pre style="font:14px/1.55 -apple-system,BlinkMacSystemFont,'
+        'Segoe UI,Microsoft YaHei,sans-serif;white-space:pre-wrap;margin:16px">'
+        f"{html.escape(text)}</pre></body></html>"
+    )
+
+
+def _mail_shorten(value: str, maximum: int) -> str:
+    compact = " ".join(value.split()).strip()
+    if len(compact) <= maximum:
+        return compact
+    return compact[: maximum - 1].rstrip() + "…"
+
+
 def _render_html(
     report_date: str,
     clusters: list[QuestionCluster],
@@ -367,7 +437,7 @@ def _visible_evidence(
     result: list[EvidenceItem] = []
     seen: set[tuple[str, str]] = set()
     for item in evidence:
-        normalized_title = "".join(item.title.split()).casefold()
+        normalized_title = _canonical_evidence_title(item.title)
         key = (item.namespace.casefold(), normalized_title or item.document_id.casefold())
         if key in seen:
             continue
@@ -376,6 +446,14 @@ def _visible_evidence(
         if len(result) >= maximum:
             break
     return tuple(result)
+
+
+def _canonical_evidence_title(value: str) -> str:
+    normalized = "".join(value.split()).casefold()
+    for suffix in ("（副本）", "(副本)", "副本"):
+        if normalized.endswith(suffix):
+            return normalized[: -len(suffix)]
+    return normalized
 
 
 def _display_excerpt(value: str, *, maximum: int = 420) -> str:
