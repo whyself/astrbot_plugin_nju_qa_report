@@ -239,6 +239,10 @@ class DailyReportWorkflow:
         return FullReportRunResult(screening, len(clusters), report)
 
     async def deliver_latest(self, report_date: str) -> DeliverySummary:
+        window = await asyncio.to_thread(self._storage.processing_window, report_date)
+        if window is None or window.status != "COMPLETED":
+            status = window.status if window is not None else "NOT_RUN"
+            raise RuntimeError(f"该日期筛选状态为 {status}，不能发送旧的或不完整的日报")
         report = await asyncio.to_thread(self._storage.latest_report, report_date)
         if report is None:
             raise RuntimeError("该日期尚未生成日报")

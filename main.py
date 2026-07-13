@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import date, datetime
 from pathlib import Path
 from time import time
@@ -10,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from astrbot.api import logger
 from astrbot.api import message_components as Comp
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .nju_report.aggregation import QuestionAggregationService
@@ -52,7 +53,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.4.0",
+    "0.4.1",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -381,8 +382,13 @@ class NjuQaReportPlugin(Star):
             yield event.plain_result(authorization.user_message)
             return
         path, total = await asyncio.to_thread(self.question_exporter.export_all)
-        yield event.plain_result(f"已导出全部 {total} 条问题简表。")
-        yield event.chain_result([Comp.File(name=path.name, file=str(path))])
+        try:
+            await _send_local_file(event, path)
+        except Exception as exc:
+            logger.exception("NJU public question export file delivery failed")
+            yield event.plain_result(f"问题简表已生成，但文件发送失败：{_file_error(exc)}")
+            return
+        yield event.plain_result(f"已导出并发送全部 {total} 条问题简表。")
 
     @nju_report.command("关于")
     async def report_about(self, event: AstrMessageEvent):
@@ -731,12 +737,27 @@ class NjuQaReportPlugin(Star):
         if report is None:
             yield event.plain_result("该日期尚未生成完整日报。")
             return
+        window = await asyncio.to_thread(
+            self.storage.processing_window,
+            requested_date.isoformat(),
+        )
+        if window is not None and window.status != "COMPLETED":
+            yield event.plain_result(
+                f"该日期筛选状态为 {window.status}，现有 HTML 版本 {report.version} "
+                "不是可用的完整报告。请先成功重跑该日期。"
+            )
+            return
         path = Path(report.html_path)
         if not path.is_file():
             yield event.plain_result("该日报的本地 HTML 文件已丢失，请重新运行日报处理。")
             return
-        yield event.plain_result(f"日报预览：{report.report_date} / 版本 {report.version}")
-        yield event.chain_result([Comp.File(name=path.name, file=str(path))])
+        try:
+            await _send_local_file(event, path)
+        except Exception as exc:
+            logger.exception("NJU HTML report file delivery failed")
+            yield event.plain_result(f"HTML 已生成，但文件发送失败：{_file_error(exc)}")
+            return
+        yield event.plain_result(f"日报 HTML 已发送：{report.report_date} / 版本 {report.version}")
 
     @nju_collect_report.command("send")
     async def operator_report_send(self, event: AstrMessageEvent):
@@ -927,8 +948,13 @@ class NjuQaReportPlugin(Star):
             yield event.plain_result("用法：/nju_collect export questions")
             return
         path, total = await asyncio.to_thread(self.question_exporter.export_all)
-        yield event.plain_result(f"累计问题总表已刷新，共 {total} 条。")
-        yield event.chain_result([Comp.File(name=path.name, file=str(path))])
+        try:
+            await _send_local_file(event, path)
+        except Exception as exc:
+            logger.exception("NJU operator question export file delivery failed")
+            yield event.plain_result(f"累计问题总表已刷新，但文件发送失败：{_file_error(exc)}")
+            return
+        yield event.plain_result(f"累计问题总表已刷新并发送，共 {total} 条。")
 
     @nju_collect.group("test")
     def nju_collect_test(self):
@@ -1071,6 +1097,58 @@ def _operator_error(exc: Exception) -> str:
         detail = _shorten(str(exc), 160)
         return f"StorageError：{detail or '本地数据库操作失败'}"
     return type(exc).__name__
+
+
+async def _send_local_file(event: AstrMessageEvent, path: Path) -> None:
+    """Send a local file, using OneBot's native upload action when available."""
+
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(str(resolved))
+
+    native_error: Exception | None = None
+    if event.get_platform_name() == "aiocqhttp":
+        bot = getattr(event, "bot", None)
+        if bot is not None and hasattr(bot, "call_action"):
+            try:
+                encoded = await asyncio.to_thread(resolved.read_bytes)
+                parameters: dict[str, object] = {
+                    "file": "base64://" + base64.b64encode(encoded).decode("ascii"),
+                    "name": resolved.name,
+                }
+                group_id = str(event.get_group_id()).strip()
+                if group_id:
+                    action = "upload_group_file"
+                    parameters["group_id"] = group_id
+                else:
+                    action = "upload_private_file"
+                    parameters["user_id"] = str(event.get_sender_id())
+                self_id = str(event.get_self_id()).strip()
+                if self_id:
+                    parameters["self_id"] = self_id
+                await bot.call_action(action, **parameters)
+                return
+            except Exception as exc:
+                native_error = exc
+                logger.warning(
+                    "OneBot native file upload failed; trying File component",
+                    exc_info=True,
+                )
+
+    try:
+        await event.send(MessageChain([Comp.File(name=resolved.name, file=str(resolved))]))
+    except Exception as exc:
+        if native_error is not None:
+            raise RuntimeError(
+                f"OneBot upload failed ({type(native_error).__name__}); "
+                f"File component failed ({type(exc).__name__})"
+            ) from exc
+        raise
+
+
+def _file_error(exc: Exception) -> str:
+    detail = _shorten(str(exc), 180)
+    return f"{type(exc).__name__}：{detail}" if detail else type(exc).__name__
 
 
 def _format_full_run_results(results: list[FullReportRunResult]) -> str:
