@@ -99,8 +99,8 @@ def test_parse_scope_batch_accepts_selected_questions_only() -> None:
     assert result["m3"].decision is ScopeDecision.DROP
     assert "未将该消息提取" in result["m3"].reason
 
-    with pytest.raises(ScopeAiResponseError):
-        parse_scope_batch(payload, ["m1"])
+    unknown_result = parse_scope_batch(payload, ["m1"])
+    assert unknown_result["m1"].decision is ScopeDecision.INCLUDE
 
     duplicate_payload = json.dumps(
         {
@@ -109,8 +109,35 @@ def test_parse_scope_batch_accepts_selected_questions_only() -> None:
         },
         ensure_ascii=False,
     )
+    duplicate_result = parse_scope_batch(duplicate_payload, ["m1", "m2"])
+    assert duplicate_result["m1"].decision is ScopeDecision.INCLUDE
+    assert duplicate_result["m2"].decision is ScopeDecision.INCLUDE
+
+
+def test_parse_scope_batch_ignores_bad_items_and_accepts_plain_question_array() -> None:
+    valid = {
+        "question_message_ids": ["m1", "not-a-target"],
+        "reason": "明确的校园问题",
+        "confidence": 0.9,
+        "canonical_question": "南京大学校园卡如何补办？",
+        "category": "校园卡",
+        "clarity": "CLEAR",
+        "knowledge_value": "HIGH",
+        "time_sensitive": False,
+    }
+    result = parse_scope_batch(
+        json.dumps([{"question_message_ids": ["m2"]}, valid], ensure_ascii=False),
+        ["m1", "m2", "m3"],
+    )
+
+    assert result["m1"].decision is ScopeDecision.INCLUDE
+    assert result["m2"].decision is ScopeDecision.DROP
+    assert result["m3"].decision is ScopeDecision.DROP
+
+
+def test_parse_scope_batch_still_rejects_non_json_response() -> None:
     with pytest.raises(ScopeAiResponseError):
-        parse_scope_batch(duplicate_payload, ["m1", "m2"])
+        parse_scope_batch("不是 JSON", ["m1"])
 
 
 def test_scope_input_is_redacted_and_bounded() -> None:
