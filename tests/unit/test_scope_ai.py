@@ -335,6 +335,13 @@ def test_final_gate_sends_only_concise_candidate_questions() -> None:
     assert "最终问题编辑" in context.system_prompt
     assert "保留、改写、删除和合并" not in context.prompt
     assert "绝不搜索、生成或评价答案" in context.system_prompt
+    assert "优先保留、规范化和去重" in context.system_prompt
+    assert "陶二宿舍条件如何" in context.system_prompt
+    assert "鼓楼宿舍是否配备马桶" in context.system_prompt
+    assert "南京大学小百合是什么" in context.system_prompt
+    assert "南京大学课程体系中的专业选修课是什么" in context.system_prompt
+    assert "已有资料可能明确回答的问题仍应保留" in context.system_prompt
+    assert "宁可少收" not in context.system_prompt
 
 
 def test_final_gate_returns_format_error_to_model_for_repair() -> None:
