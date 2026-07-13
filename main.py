@@ -42,7 +42,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.2.2",
+    "0.2.3",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -203,6 +203,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_report.command("帮助")
     async def report_help(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.VIEW_REPORT,
@@ -223,6 +224,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_report.command("列表")
     async def report_list(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.VIEW_REPORT,
@@ -288,6 +290,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_report.command("查看")
     async def report_show(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.VIEW_REPORT,
@@ -339,6 +342,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_report.command("导出")
     async def report_export(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.VIEW_REPORT,
@@ -354,6 +358,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_report.command("关于")
     async def report_about(self, event: AstrMessageEvent):
+        event.stop_event()
         yield event.plain_result(
             f"南大知识缺口日报插件（非官方）\n源代码：{REPOSITORY_URL}\n许可证：AGPL-3.0-or-later"
         )
@@ -364,6 +369,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect.command("status")
     async def operator_status(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -405,6 +411,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_repo.command("sync")
     async def operator_repo_sync(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -443,6 +450,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_repo.command("status")
     async def operator_repo_status(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -474,6 +482,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_repo.command("search")
     async def operator_repo_search(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -501,6 +510,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_import.command("inspect")
     async def operator_import_inspect(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -532,6 +542,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_import.command("run")
     async def operator_import_run(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -566,6 +577,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_report.command("run")
     async def operator_report_run(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -629,6 +641,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_report.command("rerun")
     async def operator_report_rerun(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -670,6 +683,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_report.command("preview")
     async def operator_report_preview(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -698,6 +712,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_report.command("send")
     async def operator_report_send(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -724,6 +739,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect.command("investigate")
     async def operator_investigate(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -751,6 +767,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_report.command("status")
     async def operator_report_status(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -842,6 +859,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect.command("export")
     async def operator_export(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -865,6 +883,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_test.command("scope")
     async def test_scope(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
@@ -900,6 +919,7 @@ class NjuQaReportPlugin(Star):
 
     @nju_collect_test.command("startup")
     async def test_startup(self, event: AstrMessageEvent):
+        event.stop_event()
         authorization = self.permissions.authorize(
             sender_id=event.get_sender_id(),
             action=PermissionAction.OPERATE,
