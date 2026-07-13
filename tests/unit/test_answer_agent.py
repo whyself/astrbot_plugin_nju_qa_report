@@ -1,26 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
-from nju_report import answer_agent as answer_agent_module
 from nju_report.answer_agent import AstrBotContextAnswerAgent, ChatContextLookup
 from nju_report.models import QuestionCluster, StoredMessage
-
-
-class _FakeMessage:
-    def __init__(self, **kwargs) -> None:
-        self.__dict__.update(kwargs)
-
-
-class _FakeFunctionTool:
-    def __init__(self, **kwargs) -> None:
-        self.__dict__.update(kwargs)
-
-
-class _FakeToolSet:
-    def __init__(self, *, tools) -> None:
-        self.tools = tools
 
 
 class _FakeContext:
@@ -33,63 +18,92 @@ class _FakeContext:
         return self.responses.pop(0)
 
 
-def test_context_lookup_pages_around_only_the_question_group() -> None:
+def test_context_window_contains_only_the_question_group() -> None:
     cluster, messages = _case()
     lookup = ChatContextLookup(cluster, messages, excluded_message_ids={"q1"})
 
-    result = lookup.read(cursor_message_id="q1", before=0, after=2)
+    result = lookup.context_payload(cluster, limit=50)
+    message_ids = [item["message_id"] for item in result["messages"]]
 
-    assert '"message_id": "q1"' in result
-    assert '"message_id": "water"' in result
-    assert '"message_id": "a1"' in result
-    assert '"message_id": "other-group"' not in result
+    assert message_ids == ["q1", "water", "a1"]
+    assert "before" not in message_ids
+    assert "other-group" not in message_ids
     answers = lookup.answers_from_ids(["a1"])
     assert [item.external_message_id for item in answers] == ["a1"]
     assert answers[0].direct_reply is True
 
 
-def test_agent_calls_context_tool_and_keeps_only_selected_answer(monkeypatch) -> None:
+def test_agent_finds_answer_in_first_50_messages_with_one_call() -> None:
     async def run() -> None:
         cluster, messages = _case()
         context = _FakeContext(
             [
                 SimpleNamespace(
-                    completion_text="",
-                    tools_call_name=["nju_read_chat_context"],
-                    tools_call_args=[
-                        {"cursor_message_id": "q1", "before": 0, "after": 2}
-                    ],
-                    tools_call_ids=["call-1"],
-                ),
-                SimpleNamespace(
                     completion_text=(
-                        '{"answer_message_ids":["a1"],"reason":"a1明确回答，water是闲聊"}'
+                        '{"found":true,"answer_message_ids":["a1"],'
+                        '"reason":"a1明确回答，water是闲聊"}'
                     ),
-                    tools_call_name=[],
-                    tools_call_args=[],
-                    tools_call_ids=[],
                 ),
             ]
-        )
-        monkeypatch.setattr(
-            answer_agent_module,
-            "_astrbot_agent_types",
-            lambda: (_FakeMessage, _FakeFunctionTool, _FakeToolSet),
         )
         agent = AstrBotContextAnswerAgent(
             context,
             provider_id="provider",
-            max_retries=0,
         )
 
         answers = await agent.collect(cluster, messages, excluded_message_ids={"q1"})
 
         assert [item.external_message_id for item in answers] == ["a1"]
-        assert len(context.calls) == 2
-        second_context = context.calls[1]["contexts"]
-        assert any(getattr(item, "role", "") == "tool" for item in second_context)
+        assert len(context.calls) == 1
+        assert "tools" not in context.calls[0]
+        assert _prompt_payload(context.calls[0])["message_limit"] == 50
 
     asyncio.run(run())
+
+
+def test_agent_expands_once_to_100_messages_then_stops() -> None:
+    async def run() -> None:
+        cluster, _ = _case()
+        messages = [_message("q1", 0, "u0", "校园卡丢了怎么办？")]
+        messages.extend(
+            _message(
+                f"m{index}",
+                index,
+                f"u{index}",
+                "先去信息门户挂失" if index == 70 else f"普通消息 {index}",
+                reply="q1" if index == 70 else "",
+            )
+            for index in range(1, 120)
+        )
+        context = _FakeContext(
+            [
+                SimpleNamespace(
+                    completion_text=(
+                        '{"found":false,"answer_message_ids":[],"reason":"前50条未找到"}'
+                    )
+                ),
+                SimpleNamespace(
+                    completion_text=(
+                        '{"found":true,"answer_message_ids":["m70"],'
+                        '"reason":"扩展后找到明确回答"}'
+                    )
+                ),
+            ]
+        )
+        agent = AstrBotContextAnswerAgent(context, provider_id="provider")
+
+        answers = await agent.collect(cluster, messages, excluded_message_ids={"q1"})
+
+        assert [item.external_message_id for item in answers] == ["m70"]
+        assert len(context.calls) == 2
+        assert [_prompt_payload(item)["message_limit"] for item in context.calls] == [50, 100]
+        assert [len(_prompt_payload(item)["messages"]) for item in context.calls] == [50, 100]
+
+    asyncio.run(run())
+
+
+def _prompt_payload(call: dict) -> dict:
+    return json.loads(call["prompt"].split("\n", 1)[1])
 
 
 def _case() -> tuple[QuestionCluster, list[StoredMessage]]:

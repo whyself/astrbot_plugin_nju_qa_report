@@ -52,7 +52,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.2.9",
+    "0.3.0",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -109,7 +109,6 @@ class NjuQaReportPlugin(Star):
             context,
             provider_id=self.runtime_config.llm_provider_id,
             timeout_seconds=self.runtime_config.request_timeout_seconds,
-            max_retries=self.runtime_config.max_retries,
             token_usage=self.token_usage,
         )
         self.aggregation_service = QuestionAggregationService(
@@ -832,7 +831,7 @@ class NjuQaReportPlugin(Star):
             aggregation = ""
             if (
                 progress.aggregation_total
-                and progress.stage == "问题聚合与 Agent 上下文回答查找"
+                and progress.stage == "问题聚合与群友回答上下文判断"
             ):
                 aggregation = (
                     "\n回答查找："
@@ -884,7 +883,7 @@ class NjuQaReportPlugin(Star):
         )
         running_details = ""
         if progress.running and progress.report_date == requested_date.isoformat():
-            if progress.stage == "问题聚合与 Agent 上下文回答查找":
+            if progress.stage == "问题聚合与群友回答上下文判断":
                 running_details += (
                     "\n回答查找："
                     f"{progress.aggregation_completed}/{progress.aggregation_total}"

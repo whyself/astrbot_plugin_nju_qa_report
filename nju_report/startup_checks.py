@@ -240,10 +240,10 @@ class StartupCheckService:
                 excluded_message_ids={"startup-q"},
             )
         except Exception as exc:
-            return StartupCheck("FAIL", "实连：群答上下文 Agent", type(exc).__name__)
+            return StartupCheck("FAIL", "实连：群答上下文判断", type(exc).__name__)
         if not any(item.external_message_id == "startup-a" for item in answers):
-            return StartupCheck("FAIL", "实连：群答上下文 Agent", "工具调用完成但未识别测试回答")
-        return StartupCheck("PASS", "实连：群答上下文 Agent", "工具调用、上下翻查和结果解析正常")
+            return StartupCheck("FAIL", "实连：群答上下文判断", "未识别测试回答")
+        return StartupCheck("PASS", "实连：群答上下文判断", "定长上下文和结果解析正常")
 
     async def _check_embedding_live(self) -> StartupCheck:
         if not self._config.enable_vector_search:

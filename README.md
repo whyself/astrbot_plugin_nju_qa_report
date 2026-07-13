@@ -19,15 +19,16 @@
 - 本地配置检查及可选的 LLM、语雀、SMTP 实连自检；
 - QQ Chat Exporter 普通 JSON/分块 JSONL ZIP 历史记录检查与幂等导入；
 - 语雀批准/排除策略、正文增量同步、分块及关键词/向量混合检索；
-- 保守问题聚合、由 AI Agent 主动向上/向下翻查聊天上下文的群友回答关联；
+- 保守问题聚合、由 AI 在定长聊天上下文中判断群友回答关联；
 - 证据约束的知识库调查，失败或不完整时绝不误报“没有知识”；
 - 脱敏 HTML 日报、QQ 私聊详情、SMTP 逐收件人幂等投递；
 - 前一自然日定时处理、手动预览和失败重试；
 - 自动化测试。
 
-群友回答关联要求所选对话模型支持 Function Calling。Agent 只获得问题锚点，必须通过
-`nju_read_chat_context` 工具自行向上或向下翻查当天同群消息；只有 Agent 明确选中的
-已查看消息才进入报告。`/nju_collect test startup live` 会实测这条工具调用链。
+群友回答关联不再使用 Function Calling 或反复翻页。每个问题先由 AI 在锚点之后最多
+50 条同群消息中判断；未找到时只再扩大到最多 100 条判断一次，仍未找到即返回空回答。
+因此每个问题最多调用对话模型两次。只有 AI 明确选中的输入消息才进入报告；
+`/nju_collect test startup live` 会实测这条定长上下文判断链。
 
 完整计划见 [docs/plans/2026-07-13-astrbot-nju-qa-report-plugin-plan.md](docs/plans/2026-07-13-astrbot-nju-qa-report-plugin-plan.md)。
 部署前需要准备的参数见 [docs/configuration.md](docs/configuration.md)。
