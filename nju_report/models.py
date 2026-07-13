@@ -145,6 +145,25 @@ class ProcessingWindowRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ScreeningVersion:
+    """One immutable full-date AI screening snapshot."""
+
+    report_date: str
+    version: int
+    run_id: str
+    status: str
+    is_active: bool
+    messages_scanned: int
+    candidates_saved: int
+    included_count: int
+    dropped_count: int
+    error_count: int
+    error_summary: str
+    created_at_utc: int
+    completed_at_utc: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class KnowledgeDocument:
     """One approved Yuque document stored locally for report investigation."""
 

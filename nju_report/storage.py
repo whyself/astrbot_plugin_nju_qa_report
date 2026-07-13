@@ -26,11 +26,12 @@ from .models import (
     ReportArtifact,
     ScopeAssessment,
     ScopeResolution,
+    ScreeningVersion,
     StoredMessage,
 )
 from .time_windows import TimeWindow
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 
 class StorageError(RuntimeError):
@@ -991,6 +992,44 @@ class ReportStorage:
                         report_date,
                     ),
                 )
+            active = connection.execute(
+                """
+                SELECT snapshot_json FROM screening_versions
+                WHERE report_date = ? AND is_active = 1
+                ORDER BY version DESC LIMIT 1
+                """,
+                (report_date,),
+            ).fetchone()
+            if active is not None:
+                _restore_candidate_snapshot_tx(
+                    connection,
+                    report_date,
+                    str(active["snapshot_json"]),
+                )
+            version_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) + 1
+                FROM screening_versions WHERE report_date = ?
+                """,
+                (report_date,),
+            ).fetchone()
+            connection.execute(
+                """
+                UPDATE screening_versions
+                SET status = 'SUPERSEDED', completed_at_utc = ?
+                WHERE report_date = ? AND status = 'RUNNING'
+                """,
+                (now, report_date),
+            )
+            connection.execute(
+                """
+                INSERT INTO screening_versions (
+                    report_date, version, run_id, status, is_active,
+                    snapshot_json, created_at_utc
+                ) VALUES (?, ?, ?, 'RUNNING', 0, '[]', ?)
+                """,
+                (report_date, int(version_row[0]), run_id, now),
+            )
             return True
 
     def complete_processing_window(
@@ -1008,6 +1047,7 @@ class ReportStorage:
 
         final_status = "COMPLETED" if error_count == 0 else "RETRY_PENDING"
         with self._transaction() as connection:
+            now = int(time.time())
             cursor = connection.execute(
                 """
                 UPDATE processing_windows
@@ -1023,13 +1063,61 @@ class ReportStorage:
                     included_count,
                     dropped_count,
                     error_count,
-                    int(time.time()),
+                    now,
                     report_date,
                     run_id,
                 ),
             )
             if cursor.rowcount != 1:
                 raise StorageError("本次日报运行已被更新的任务替代，不能写入完成状态")
+            snapshot_json = _candidate_snapshot_json_tx(connection, report_date)
+            version_cursor = connection.execute(
+                """
+                UPDATE screening_versions
+                SET status = ?, snapshot_json = ?, messages_scanned = ?,
+                    candidates_saved = ?, included_count = ?, dropped_count = ?,
+                    error_count = ?, error_summary = '', completed_at_utc = ?
+                WHERE report_date = ? AND run_id = ? AND status = 'RUNNING'
+                """,
+                (
+                    final_status,
+                    snapshot_json,
+                    messages_scanned,
+                    candidates_saved,
+                    included_count,
+                    dropped_count,
+                    error_count,
+                    now,
+                    report_date,
+                    run_id,
+                ),
+            )
+            if version_cursor.rowcount != 1:
+                raise StorageError("找不到本次筛选运行对应的版本记录")
+            if error_count == 0:
+                connection.execute(
+                    "UPDATE screening_versions SET is_active = 0 WHERE report_date = ?",
+                    (report_date,),
+                )
+                connection.execute(
+                    "UPDATE screening_versions SET is_active = 1 WHERE run_id = ?",
+                    (run_id,),
+                )
+            else:
+                active = connection.execute(
+                    """
+                    SELECT snapshot_json FROM screening_versions
+                    WHERE report_date = ? AND is_active = 1
+                    ORDER BY version DESC LIMIT 1
+                    """,
+                    (report_date,),
+                ).fetchone()
+                if active is not None:
+                    _restore_candidate_snapshot_tx(
+                        connection,
+                        report_date,
+                        str(active["snapshot_json"]),
+                    )
 
     def fail_processing_window(
         self,
@@ -1038,17 +1126,57 @@ class ReportStorage:
         *,
         run_id: str,
     ) -> None:
-        """Mark a run retryable while keeping already written candidate records."""
+        """Mark a run failed and restore the last completed screening snapshot."""
 
         with self._transaction() as connection:
-            connection.execute(
+            now = int(time.time())
+            snapshot_json = _candidate_snapshot_json_tx(connection, report_date)
+            cursor = connection.execute(
                 """
                 UPDATE processing_windows
                 SET status = 'FAILED', error_summary = ?, updated_at_utc = ?
                 WHERE report_date = ? AND status = 'RUNNING' AND run_id = ?
                 """,
-                (error_summary[:1000], int(time.time()), report_date, run_id),
+                (error_summary[:1000], now, report_date, run_id),
             )
+            if cursor.rowcount != 1:
+                return
+            connection.execute(
+                """
+                UPDATE screening_versions
+                SET status = 'FAILED', snapshot_json = ?, error_summary = ?,
+                    completed_at_utc = ?
+                WHERE report_date = ? AND run_id = ? AND status = 'RUNNING'
+                """,
+                (snapshot_json, error_summary[:1000], now, report_date, run_id),
+            )
+            active = connection.execute(
+                """
+                SELECT snapshot_json FROM screening_versions
+                WHERE report_date = ? AND is_active = 1
+                ORDER BY version DESC LIMIT 1
+                """,
+                (report_date,),
+            ).fetchone()
+            if active is not None:
+                _restore_candidate_snapshot_tx(
+                    connection,
+                    report_date,
+                    str(active["snapshot_json"]),
+                )
+
+    def list_screening_versions(self, report_date: str) -> list[ScreeningVersion]:
+        """List immutable AI screening attempts for one date, newest first."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM screening_versions
+                WHERE report_date = ? ORDER BY version DESC
+                """,
+                (report_date,),
+            ).fetchall()
+        return [_screening_version_from_row(row) for row in rows]
 
     def processing_window(self, report_date: str) -> ProcessingWindowRecord | None:
         with self._lock:
@@ -1423,6 +1551,13 @@ class ReportStorage:
                     "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
                     (5, int(time.time())),
                 )
+                version = 5
+            if version < 6:
+                self._migration_v6(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+                    (6, int(time.time())),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1714,6 +1849,82 @@ class ReportStorage:
         for statement in statements:
             connection.execute(statement)
 
+    @staticmethod
+    def _migration_v6(connection: sqlite3.Connection) -> None:
+        """Add immutable full-date screening snapshots with one active version."""
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS screening_versions (
+                id INTEGER PRIMARY KEY,
+                report_date TEXT NOT NULL,
+                version INTEGER NOT NULL CHECK(version >= 1),
+                run_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 0 CHECK(is_active IN (0, 1)),
+                snapshot_json TEXT NOT NULL DEFAULT '[]',
+                messages_scanned INTEGER NOT NULL DEFAULT 0,
+                candidates_saved INTEGER NOT NULL DEFAULT 0,
+                included_count INTEGER NOT NULL DEFAULT 0,
+                dropped_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                error_summary TEXT NOT NULL DEFAULT '',
+                created_at_utc INTEGER NOT NULL,
+                completed_at_utc INTEGER,
+                UNIQUE(report_date, version)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_screening_versions_date
+            ON screening_versions(report_date, version DESC)
+            """
+        )
+        dates = connection.execute(
+            "SELECT DISTINCT report_date FROM question_candidates ORDER BY report_date"
+        ).fetchall()
+        now = int(time.time())
+        for row in dates:
+            report_date = str(row[0])
+            existing = connection.execute(
+                "SELECT 1 FROM screening_versions WHERE report_date = ?",
+                (report_date,),
+            ).fetchone()
+            if existing is not None:
+                continue
+            window = connection.execute(
+                "SELECT * FROM processing_windows WHERE report_date = ?",
+                (report_date,),
+            ).fetchone()
+            status = str(window["status"]) if window is not None else "LEGACY"
+            is_active = int(status == "COMPLETED")
+            connection.execute(
+                """
+                INSERT INTO screening_versions (
+                    report_date, version, run_id, status, is_active, snapshot_json,
+                    messages_scanned, candidates_saved, included_count,
+                    dropped_count, error_count, error_summary,
+                    created_at_utc, completed_at_utc
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report_date,
+                    f"legacy:{report_date}",
+                    status,
+                    is_active,
+                    _candidate_snapshot_json_tx(connection, report_date),
+                    int(window["messages_scanned"]) if window is not None else 0,
+                    int(window["candidates_saved"]) if window is not None else 0,
+                    int(window["included_count"]) if window is not None else 0,
+                    int(window["dropped_count"]) if window is not None else 0,
+                    int(window["error_count"]) if window is not None else 0,
+                    str(window["error_summary"]) if window is not None else "",
+                    int(window["created_at_utc"]) if window is not None else now,
+                    int(window["updated_at_utc"]) if window is not None else now,
+                ),
+            )
+
 
 def _candidate_from_row(row: sqlite3.Row) -> QuestionCandidate:
     return QuestionCandidate(
@@ -1732,6 +1943,110 @@ def _candidate_from_row(row: sqlite3.Row) -> QuestionCandidate:
         sent_at_utc=int(row["sent_at_utc"]),
         created_at_utc=int(row["created_at_utc"]),
         updated_at_utc=int(row["updated_at_utc"]),
+    )
+
+
+_CANDIDATE_SNAPSHOT_COLUMNS = (
+    "source_key",
+    "question_code",
+    "report_date",
+    "original_question",
+    "canonical_question",
+    "category",
+    "initial_decision",
+    "final_decision",
+    "reason",
+    "confidence",
+    "status",
+    "group_alias",
+    "sent_at_utc",
+    "created_at_utc",
+    "updated_at_utc",
+)
+
+
+def _candidate_snapshot_json_tx(
+    connection: sqlite3.Connection,
+    report_date: str,
+) -> str:
+    rows = connection.execute(
+        "SELECT * FROM question_candidates WHERE report_date = ? ORDER BY id",
+        (report_date,),
+    ).fetchall()
+    return json.dumps(
+        [
+            {column: row[column] for column in _CANDIDATE_SNAPSHOT_COLUMNS}
+            for row in rows
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _restore_candidate_snapshot_tx(
+    connection: sqlite3.Connection,
+    report_date: str,
+    snapshot_json: str,
+) -> None:
+    try:
+        raw_items = json.loads(snapshot_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise StorageError("筛选版本快照损坏，无法恢复") from exc
+    if not isinstance(raw_items, list) or any(not isinstance(item, dict) for item in raw_items):
+        raise StorageError("筛选版本快照格式无效")
+    items: list[dict[str, object]] = []
+    source_keys: set[str] = set()
+    for raw in raw_items:
+        if any(column not in raw for column in _CANDIDATE_SNAPSHOT_COLUMNS):
+            raise StorageError("筛选版本快照字段不完整")
+        if str(raw["report_date"]) != report_date:
+            raise StorageError("筛选版本快照日期不匹配")
+        source_key = str(raw["source_key"])
+        if not source_key or source_key in source_keys:
+            raise StorageError("筛选版本快照来源键无效")
+        source_keys.add(source_key)
+        items.append(raw)
+
+    current = connection.execute(
+        "SELECT id, source_key FROM question_candidates WHERE report_date = ?",
+        (report_date,),
+    ).fetchall()
+    connection.executemany(
+        "DELETE FROM question_candidates WHERE id = ?",
+        [(int(row["id"]),) for row in current if str(row["source_key"]) not in source_keys],
+    )
+    placeholders = ", ".join("?" for _ in _CANDIDATE_SNAPSHOT_COLUMNS)
+    update_columns = tuple(
+        column for column in _CANDIDATE_SNAPSHOT_COLUMNS if column != "source_key"
+    )
+    update_sql = ", ".join(f"{column} = excluded.{column}" for column in update_columns)
+    connection.executemany(
+        f"""
+        INSERT INTO question_candidates ({', '.join(_CANDIDATE_SNAPSHOT_COLUMNS)})
+        VALUES ({placeholders})
+        ON CONFLICT(source_key) DO UPDATE SET {update_sql}
+        """,  # noqa: S608 -- identifiers are fixed module constants
+        [tuple(item[column] for column in _CANDIDATE_SNAPSHOT_COLUMNS) for item in items],
+    )
+
+
+def _screening_version_from_row(row: sqlite3.Row) -> ScreeningVersion:
+    return ScreeningVersion(
+        report_date=str(row["report_date"]),
+        version=int(row["version"]),
+        run_id=str(row["run_id"]),
+        status=str(row["status"]),
+        is_active=bool(row["is_active"]),
+        messages_scanned=int(row["messages_scanned"]),
+        candidates_saved=int(row["candidates_saved"]),
+        included_count=int(row["included_count"]),
+        dropped_count=int(row["dropped_count"]),
+        error_count=int(row["error_count"]),
+        error_summary=str(row["error_summary"]),
+        created_at_utc=int(row["created_at_utc"]),
+        completed_at_utc=(
+            int(row["completed_at_utc"]) if row["completed_at_utc"] is not None else None
+        ),
     )
 
 

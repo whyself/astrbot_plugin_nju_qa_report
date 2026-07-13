@@ -75,7 +75,7 @@ def test_multiple_or_prefixed_json_objects_are_rejected() -> None:
         parse_scope_assessment("模型回答：" + valid)
 
 
-def test_parse_scope_batch_requires_exact_ordered_id_coverage() -> None:
+def test_parse_scope_batch_accepts_selected_questions_only() -> None:
     question = {
         "source_message_ids": ["m1", "m2"],
         "reason": "两条消息共同表达一个校园问题",
@@ -90,13 +90,14 @@ def test_parse_scope_batch_requires_exact_ordered_id_coverage() -> None:
         {
             "questions": [question],
             "uncertain_questions": [],
-            "dropped_message_ids": [],
         },
         ensure_ascii=False,
     )
-    result = parse_scope_batch(payload, ["m1", "m2"])
-    assert list(result) == ["m1", "m2"]
+    result = parse_scope_batch(payload, ["m1", "m2", "m3"])
+    assert list(result) == ["m1", "m2", "m3"]
     assert result["m1"].canonical_question == result["m2"].canonical_question
+    assert result["m3"].decision is ScopeDecision.DROP
+    assert "未将该消息提取" in result["m3"].reason
 
     with pytest.raises(ScopeAiResponseError):
         parse_scope_batch(payload, ["m1"])
@@ -104,8 +105,7 @@ def test_parse_scope_batch_requires_exact_ordered_id_coverage() -> None:
     duplicate_payload = json.dumps(
         {
             "questions": [question],
-            "uncertain_questions": [],
-            "dropped_message_ids": ["m2"],
+            "uncertain_questions": [question],
         },
         ensure_ascii=False,
     )
@@ -170,7 +170,6 @@ def test_batch_client_sends_every_target_and_redacts_content() -> None:
         {
             "questions": [],
             "uncertain_questions": [],
-            "dropped_message_ids": ["m1"],
         },
         ensure_ascii=False,
     )

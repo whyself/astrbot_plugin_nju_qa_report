@@ -84,6 +84,7 @@ def test_storage_initialization_is_idempotent_and_uses_safety_pragmas(
         "investigations",
         "reports",
         "mail_deliveries",
+        "screening_versions",
     }
     storage.close()
 
@@ -144,8 +145,79 @@ def test_migrations_tolerate_indexes_left_by_an_older_partial_run(tmp_path: Path
     recovered.initialize()
     with sqlite3.connect(path) as connection:
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-    assert version == 5
+    assert version == 6
     recovered.close()
+
+
+def test_failed_screening_version_restores_last_completed_snapshot(tmp_path: Path) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    report_date = "2026-07-12"
+    window = natural_day_window(date(2026, 7, 12), "Asia/Shanghai")
+    include = ScopeAssessment(
+        decision=ScopeDecision.INCLUDE,
+        reason="是可沉淀问题",
+        confidence=0.9,
+        canonical_question="南京大学校园卡如何补办？",
+        category="校园卡",
+    )
+    drop = ScopeAssessment(
+        decision=ScopeDecision.DROP,
+        reason="未入选",
+        confidence=0.8,
+    )
+
+    assert storage.begin_processing_window(window, run_id="good") is True
+    storage.upsert_scope_candidate(
+        source_key="m1",
+        report_date=report_date,
+        initial=include,
+        original_question="校园卡怎么补办",
+    )
+    storage.complete_processing_window(
+        report_date,
+        run_id="good",
+        messages_scanned=1,
+        candidates_saved=1,
+        included_count=1,
+        dropped_count=0,
+        error_count=0,
+    )
+
+    assert storage.begin_processing_window(window, run_id="bad", force=True) is True
+    storage.upsert_scope_candidate(
+        source_key="m1",
+        report_date=report_date,
+        initial=drop,
+        original_question="校园卡怎么补办",
+    )
+    storage.upsert_scope_candidate(
+        source_key="m2",
+        report_date=report_date,
+        initial=drop,
+        original_question="闲聊",
+    )
+    storage.complete_processing_window(
+        report_date,
+        run_id="bad",
+        messages_scanned=2,
+        candidates_saved=2,
+        included_count=0,
+        dropped_count=1,
+        error_count=1,
+    )
+
+    candidates, total = storage.list_question_candidates(report_date=report_date, limit=None)
+    assert total == 1
+    assert candidates[0].source_key == "m1"
+    assert candidates[0].final_decision == "INCLUDE"
+    versions = storage.list_screening_versions(report_date)
+    assert [(item.version, item.status, item.is_active) for item in versions] == [
+        (2, "RETRY_PENDING", False),
+        (1, "COMPLETED", True),
+    ]
+    assert versions[0].error_count == 1
+    storage.close()
 
 
 def test_failed_migration_rolls_back_partial_schema(

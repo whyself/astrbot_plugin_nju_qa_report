@@ -318,6 +318,8 @@ def _error_resolution(
     review_attempts: tuple[ScopeAssessment, ...] = (),
 ) -> ScopeResolution:
     error_type = type(exc).__name__
+    error_detail = " ".join(str(exc).split()).strip()
+    error_summary = f"{error_type}: {error_detail}" if error_detail else error_type
     return ScopeResolution(
         ScopeAssessment(
             decision=ScopeDecision.AUTO_REVIEW_ERROR,
@@ -328,5 +330,5 @@ def _error_resolution(
         initial_assessment=initial,
         review_attempts=review_attempts,
         retryable=True,
-        error_summary=error_type,
+        error_summary=error_summary[:1000],
     )

@@ -141,7 +141,7 @@ def test_technical_failure_is_not_disguised_as_low_quality() -> None:
     result = asyncio.run(AutoScopeReviewService(ai, ai).resolve("问题"))
     assert result.assessment.decision is ScopeDecision.AUTO_REVIEW_ERROR
     assert result.retryable is True
-    assert result.error_summary == "TimeoutError"
+    assert result.error_summary == "TimeoutError: provider timeout"
     assert "自动重试" in result.assessment.reason
 
 

@@ -197,7 +197,7 @@ class DailyReportWorkflow:
                 return completed
         self._stage = "AI 筛选与自动复核"
         screening = await self._question_processor.process_date(report_date, force=force)
-        if screening.status == "FAILED":
+        if screening.status != "COMPLETED":
             return FullReportRunResult(
                 screening,
                 0,

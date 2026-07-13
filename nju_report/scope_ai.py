@@ -47,16 +47,15 @@ _BATCH_OUTPUT_CONTRACT = """
       "time_sensitive": false
     }
   ],
-  "uncertain_questions": [],
-  "dropped_message_ids": ["不是待收录问题的目标消息 ID"]
+  "uncertain_questions": []
 }
 一个问题若由连续多条消息共同表达，必须合并成一个问题，
 并把这些目标消息 ID 都放进同一个 source_message_ids。
-只把真正参与表达问题的消息放进 source_message_ids；回答、旁聊和补充答案放进 dropped_message_ids。
-questions、uncertain_questions 的所有 source_message_ids 与 dropped_message_ids 合计必须且只能覆盖
-target_message_ids 中的每个 ID 一次：不得遗漏、重复归属或增加 ID。
+只返回真正参与表达问题的消息；回答、旁聊、补充答案和其他未入选消息不要输出。
+questions、uncertain_questions 中的 source_message_ids 只能取自 target_message_ids，且不得重复归属。
+不要求逐条返回所有 target_message_ids；没有返回的目标消息自动视为未入选。
 uncertain_questions 中每一项的对象结构与 questions 完全相同，仅放仍需独立复核的候选问题。
-context_only=true 的消息只用于理解上下文，不得出现在任何输出 ID 列表中。
+context_only=true 的消息只用于理解上下文，不得出现在输出中。
 """.strip()
 
 _BATCH_PRIMARY_SYSTEM_PROMPT = f"""
@@ -88,7 +87,7 @@ _BATCH_REVIEW_SYSTEM_PROMPT = f"""
 你是南京大学迎新问题范围的独立复核员。输入是同一个群按时间排序的连续聊天片段，
 请结合整个片段，从 target_message_ids 中重新提取可能的问题。一个问题可由多条目标消息共同表达，
 应合并成一个规范化问题。不要假定初筛结论正确，不要搜索或判断知识库是否已有答案。
-不得遗漏、重复归属或增加 ID，不得判断 context_only 消息。
+只返回识别出的候选问题，不得重复归属、增加 ID或判断 context_only 消息。
 
 问题若与南京大学学生学习、生活、办事、校园服务或新生适应有关，结合上下文后清楚，
 且未来其他学生可能重复遇到，才值得沉淀。临时交易、闲聊、私人事务、无关内容、普通回答或补充陈述、
@@ -217,7 +216,7 @@ class AstrBotScopeAiClient:
                         chat_provider_id=provider_id,
                         prompt=prompt,
                         system_prompt=system_prompt,
-                        temperature=0.1,
+                        temperature=0.0,
                         request_max_retries=1,
                     ),
                     timeout=self._timeout_seconds,
@@ -250,7 +249,7 @@ class AstrBotScopeAiClient:
                         chat_provider_id=provider_id,
                         prompt=prompt,
                         system_prompt=system_prompt,
-                        temperature=0.1,
+                        temperature=0.0,
                         request_max_retries=1,
                     ),
                     timeout=self._timeout_seconds,
@@ -290,13 +289,13 @@ def parse_scope_batch(
     raw_text: str,
     expected_ids: Sequence[str],
 ) -> dict[str, ScopeAssessment]:
-    """Parse a batch response and require exact target-ID coverage."""
+    """Parse selected questions; omitted target IDs are treated as not selected."""
 
     expected = tuple(str(item) for item in expected_ids)
     if not expected or len(set(expected)) != len(expected):
         raise ScopeAiResponseError("expected_ids 必须非空且不能重复")
     data = _first_json_object(raw_text)
-    parsed: dict[str, ScopeAssessment] = {}
+    selected: dict[str, ScopeAssessment] = {}
     for field, decision in (
         ("questions", ScopeDecision.INCLUDE),
         ("uncertain_questions", ScopeDecision.AUTO_REVIEW),
@@ -310,25 +309,20 @@ def parse_scope_batch(
             source_ids = _required_string_list(item, "source_message_ids")
             assessment = _scope_assessment_from_data({**item, "decision": decision.value})
             for message_id in source_ids:
-                if message_id in parsed:
+                if message_id not in expected:
+                    raise ScopeAiResponseError("模型返回了不属于 target_message_ids 的消息 ID")
+                if message_id in selected:
                     raise ScopeAiResponseError("目标消息 ID 被重复归属")
-                parsed[message_id] = assessment
+                selected[message_id] = assessment
 
-    dropped_ids = _required_string_list(data, "dropped_message_ids", allow_empty=True)
-    for message_id in dropped_ids:
-        if message_id in parsed:
-            raise ScopeAiResponseError("目标消息 ID 被重复归属")
-        parsed[message_id] = ScopeAssessment(
+    dropped = ScopeAssessment(
             decision=ScopeDecision.DROP,
-            reason="AI 结合完整聊天片段判断该消息不是待收录问题",
-            confidence=1.0,
+            reason="AI 未将该消息提取为待收录问题",
+            confidence=0.8,
             clarity=Clarity.CLEAR,
             knowledge_value=KnowledgeValue.LOW,
         )
-
-    if set(parsed) != set(expected) or len(parsed) != len(expected):
-        raise ScopeAiResponseError("批量结果未精确覆盖全部目标消息 ID")
-    return {message_id: parsed[message_id] for message_id in expected}
+    return {message_id: selected.get(message_id, dropped) for message_id in expected}
 
 
 def _scope_assessment_from_data(data: dict[str, Any]) -> ScopeAssessment:
