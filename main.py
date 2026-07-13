@@ -19,7 +19,7 @@ from .nju_report.config import PluginConfig
 from .nju_report.investigation import AstrBotInvestigationAiClient, InvestigationService
 from .nju_report.knowledge import KnowledgeError, KnowledgeService
 from .nju_report.message_capture import MessageCaptureService
-from .nju_report.models import MessageEnvelope
+from .nju_report.models import CoverageStatus, MessageEnvelope
 from .nju_report.permissions import PermissionAction, PermissionService
 from .nju_report.qce_import import QceHistoryImporter, QceImportError
 from .nju_report.question_export import DECISION_LABELS, QuestionCsvExporter
@@ -27,7 +27,15 @@ from .nju_report.question_processor import (
     DailyQuestionProcessor,
     today_in_timezone,
 )
-from .nju_report.reporting import ReportService, coverage_label, format_question_detail
+from .nju_report.report_query import parse_list_arguments
+from .nju_report.reporting import (
+    ReportService,
+    coverage_counts,
+    coverage_label,
+    format_coverage_counts,
+    format_question_detail,
+    public_coverage_status,
+)
 from .nju_report.scope_ai import AstrBotScopeAiClient
 from .nju_report.scope_classifier import AutoScopeReviewService
 from .nju_report.startup_checks import StartupCheckService, format_startup_checks
@@ -42,7 +50,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.2.3",
+    "0.2.4",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -215,11 +223,11 @@ class NjuQaReportPlugin(Star):
             return
         yield event.plain_result(
             "南哪日报查询指令：\n"
-            "/南哪日报 列表 [YYYY-MM-DD|全部] [页码]\n"
+            "/南哪日报 列表 [YYYY-MM-DD|all] [状态] [页码]\n"
             "/南哪日报 查看 YYYYMMDD-QNNN\n"
             "/南哪日报 导出\n"
             "/南哪日报 关于\n\n"
-            "列表包含已纳入、已排除和技术错误的全部筛选记录；请私聊机器人使用。"
+            "状态可填 answerable、partial、missing、error 或 all；请私聊机器人使用。"
         )
 
     @nju_report.command("列表")
@@ -236,56 +244,61 @@ class NjuQaReportPlugin(Star):
             return
         tail = _command_tail(event.get_message_str(), "南哪日报 列表")
         try:
-            report_date, page = _parse_list_arguments(tail)
+            report_date, status_filter, page = parse_list_arguments(tail)
         except ValueError as exc:
             yield event.plain_result(str(exc))
             return
         page_size = 20
-        if report_date is not None:
-            clusters = await asyncio.to_thread(
-                self.storage.list_question_clusters,
-                report_date,
-            )
-            if clusters:
-                start = (page - 1) * page_size
-                shown = clusters[start : start + page_size]
-                if not shown:
-                    yield event.plain_result("没有符合该日期和页码的聚合问题。")
-                    return
-                investigations = await asyncio.to_thread(
-                    self.storage.investigations_for_date,
-                    report_date,
-                )
-                total_pages = max(1, (len(clusters) + page_size - 1) // page_size)
-                lines = [f"日报问题（第 {page}/{total_pages} 页，共 {len(clusters)} 条）"]
-                for cluster in shown:
-                    result = investigations.get(cluster.question_code)
-                    label = coverage_label(result.status) if result else "尚未调查"
-                    lines.append(
-                        f"{cluster.question_code}｜{label}｜出现 {cluster.occurrence_count} 次\n"
-                        f"{_shorten(cluster.canonical_question, 80)}"
-                    )
-                lines.append("私聊发送 /南哪日报 查看 <问题编号> 可看详细报告。")
-                yield event.plain_result("\n\n".join(lines))
-                return
-        candidates, total = await asyncio.to_thread(
-            self.storage.list_question_candidates,
-            report_date=report_date,
-            limit=page_size,
-            offset=(page - 1) * page_size,
+        clusters = await asyncio.to_thread(
+            self.storage.list_question_clusters,
+            report_date,
         )
-        if not candidates:
-            yield event.plain_result("没有符合该日期和页码的本地问题记录。")
-            return
-        total_pages = max(1, (total + page_size - 1) // page_size)
-        lines = [f"问题列表（第 {page}/{total_pages} 页，共 {total} 条）"]
-        for candidate in candidates:
-            question = (
-                candidate.canonical_question or candidate.original_question or "未形成明确问题"
+        investigations = await asyncio.to_thread(
+            self.storage.investigations_for_date,
+            report_date,
+        )
+        counts = coverage_counts(clusters, investigations)
+        filtered = [
+            cluster
+            for cluster in clusters
+            if status_filter is None
+            or public_coverage_status(
+                investigations[cluster.question_code].status
+                if cluster.question_code in investigations
+                else CoverageStatus.ERROR
             )
-            label = DECISION_LABELS.get(candidate.final_decision, candidate.final_decision)
-            lines.append(f"{candidate.question_code}｜{label}\n{_shorten(question, 80)}")
-        lines.append("私聊发送 /南哪日报 查看 <问题编号> 可看详细记录。")
+            is status_filter
+        ]
+        start = (page - 1) * page_size
+        shown = filtered[start : start + page_size]
+        if not shown:
+            scope = report_date or "全部日期"
+            status_name = coverage_label(status_filter) if status_filter else "全部状态"
+            yield event.plain_result(
+                f"{format_coverage_counts(counts)}\n\n"
+                f"没有符合范围“{scope}”、状态“{status_name}”和页码 {page} 的日报问题。"
+            )
+            return
+        total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
+        scope = report_date or "全部日期"
+        status_name = coverage_label(status_filter) if status_filter else "全部状态"
+        lines = [
+            format_coverage_counts(counts),
+            (
+                f"日报问题（范围：{scope}｜状态：{status_name}｜"
+                f"第 {page}/{total_pages} 页，共 {len(filtered)} 条）"
+            ),
+        ]
+        for cluster in shown:
+            result = investigations.get(cluster.question_code)
+            status = public_coverage_status(
+                result.status if result else CoverageStatus.ERROR
+            )
+            lines.append(
+                f"{cluster.question_code}｜{coverage_label(status)}\n"
+                f"{_shorten(cluster.canonical_question, 80)}"
+            )
+        lines.append("私聊发送 /南哪日报 查看 <问题编号> 可看详细报告。")
         yield event.plain_result("\n\n".join(lines))
 
     @nju_report.command("查看")
@@ -1004,27 +1017,6 @@ def _command_tail(message: str, command: str) -> str:
     if normalized.startswith(prefix):
         return normalized[len(prefix) :].strip()
     return ""
-
-
-def _parse_list_arguments(tail: str) -> tuple[str | None, int]:
-    parts = tail.split()
-    if len(parts) > 2:
-        raise ValueError("用法：/南哪日报 列表 [YYYY-MM-DD|全部] [页码]")
-    report_date: str | None = None
-    page = 1
-    if parts and parts[0] not in {"全部", "all"}:
-        try:
-            report_date = date.fromisoformat(parts[0]).isoformat()
-        except ValueError as exc:
-            raise ValueError("日期必须使用 YYYY-MM-DD，或填写 全部。") from exc
-    if len(parts) == 2:
-        try:
-            page = int(parts[1])
-        except ValueError as exc:
-            raise ValueError("页码必须是正整数。") from exc
-        if page < 1:
-            raise ValueError("页码必须是正整数。")
-    return report_date, page
 
 
 def _shorten(value: str, limit: int) -> str:

@@ -16,7 +16,12 @@ from nju_report.models import (
     ScopeAssessment,
     ScopeDecision,
 )
-from nju_report.reporting import ReportService
+from nju_report.reporting import (
+    ReportService,
+    coverage_counts,
+    format_coverage_counts,
+    format_question_detail,
+)
 from nju_report.storage import ReportStorage
 
 
@@ -36,18 +41,28 @@ class FakeKnowledge:
 
 
 class FakeAi:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, status: str = "PARTIAL") -> None:
         self.fail = fail
+        self.status = status
 
     async def assess(self, cluster, evidence):
         if self.fail:
             raise RuntimeError("provider down")
+        no_evidence = self.status == "NO_USABLE_EVIDENCE"
         return {
-            "status": "PARTIAL",
-            "summary": "已有挂失说明，但补办地点不完整。",
-            "missing_information": "缺少各校区补办地点。",
-            "recommendation": "补充各校区服务点和开放时间。",
-            "evidence_indices": [1],
+            "status": self.status,
+            "summary": (
+                "候选资料不能支持回答。"
+                if no_evidence
+                else "已有挂失说明，但补办地点不完整。"
+            ),
+            "missing_information": "缺少正式资料。" if no_evidence else "缺少各校区补办地点。",
+            "recommendation": (
+                "核实后补充知识库。"
+                if no_evidence
+                else "补充各校区服务点和开放时间。"
+            ),
+            "evidence_indices": [] if no_evidence else [1],
             "flags": ["TIME_SENSITIVE"],
         }
 
@@ -86,7 +101,26 @@ def test_no_evidence_requires_all_repositories_ready(tmp_path: Path) -> None:
         return result.status
 
     assert asyncio.run(run("READY")) is CoverageStatus.NO_USABLE_EVIDENCE
-    assert asyncio.run(run("PARTIAL")) is CoverageStatus.INCOMPLETE
+    assert asyncio.run(run("PARTIAL")) is CoverageStatus.ERROR
+
+
+def test_irrelevant_hits_can_be_classified_as_no_usable_evidence(tmp_path: Path) -> None:
+    async def run() -> None:
+        storage, config, cluster, hit = _prepared_case(tmp_path, repository_status="READY")
+        service = InvestigationService(  # type: ignore[arg-type]
+            config,
+            storage,
+            FakeKnowledge([hit]),
+            FakeAi(status="NO_USABLE_EVIDENCE"),
+        )
+
+        result = await service.investigate(cluster)
+
+        assert result.status is CoverageStatus.NO_USABLE_EVIDENCE
+        assert result.evidence == ()
+        storage.close()
+
+    asyncio.run(run())
 
 
 def test_model_failure_is_error_not_knowledge_gap(tmp_path: Path) -> None:
@@ -150,9 +184,37 @@ def test_report_versions_and_mail_delivery_are_idempotent(
         rendered = Path(first.html_path).read_text(encoding="utf-8")
         assert "校园卡丢了怎么补办" in rendered
         assert "message:" not in rendered
+        assert "出现 1 次" not in rendered
+        assert "出现次数" not in format_question_detail(
+            cluster,
+            storage.latest_investigation(cluster.question_code),
+            timezone_name="Asia/Shanghai",
+        )
         storage.close()
 
     asyncio.run(run())
+
+
+def test_public_counts_fold_legacy_incomplete_into_execution_error(tmp_path: Path) -> None:
+    storage, _, cluster, _ = _prepared_case(tmp_path, repository_status="READY")
+    storage.save_investigation(
+        InvestigationResult(
+            question_code=cluster.question_code,
+            status=CoverageStatus.INCOMPLETE,
+            summary="旧状态",
+            missing_information="无",
+            recommendation="重试",
+        )
+    )
+    clusters = storage.list_question_clusters(None)
+    investigations = storage.investigations_for_date(None)
+
+    counts = coverage_counts(clusters, investigations)
+
+    assert counts[CoverageStatus.ERROR] == 1
+    assert "程序执行异常 1" in format_coverage_counts(counts)
+    assert [item.question_code for item in clusters] == [cluster.question_code]
+    storage.close()
 
 
 def _prepared_case(

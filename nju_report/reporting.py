@@ -24,14 +24,51 @@ from .storage import ReportStorage
 _STATUS_LABELS = {
     CoverageStatus.ANSWERABLE: "可找到明确回答",
     CoverageStatus.PARTIAL: "找到部分相关资料",
-    CoverageStatus.NO_USABLE_EVIDENCE: "暂未找到可用知识",
-    CoverageStatus.INCOMPLETE: "调查未完成",
-    CoverageStatus.ERROR: "调查发生错误",
+    CoverageStatus.NO_USABLE_EVIDENCE: "知识库未找到可用信息",
+    CoverageStatus.INCOMPLETE: "程序执行异常",
+    CoverageStatus.ERROR: "程序执行异常",
 }
 
 
 def coverage_label(status: CoverageStatus) -> str:
     return _STATUS_LABELS[status]
+
+
+def public_coverage_status(status: CoverageStatus) -> CoverageStatus:
+    """Fold the legacy incomplete state into the public execution-error state."""
+
+    return CoverageStatus.ERROR if status is CoverageStatus.INCOMPLETE else status
+
+
+def coverage_counts(
+    clusters: list[QuestionCluster],
+    investigations: dict[str, InvestigationResult],
+) -> dict[CoverageStatus, int]:
+    counts = Counter(
+        public_coverage_status(investigations[item.question_code].status)
+        if item.question_code in investigations
+        else CoverageStatus.ERROR
+        for item in clusters
+    )
+    return {
+        status: counts[status]
+        for status in (
+            CoverageStatus.ANSWERABLE,
+            CoverageStatus.PARTIAL,
+            CoverageStatus.NO_USABLE_EVIDENCE,
+            CoverageStatus.ERROR,
+        )
+    }
+
+
+def format_coverage_counts(counts: dict[CoverageStatus, int]) -> str:
+    return (
+        "状态统计："
+        f"明确回答 {counts[CoverageStatus.ANSWERABLE]}｜"
+        f"部分覆盖 {counts[CoverageStatus.PARTIAL]}｜"
+        f"未找到可用信息 {counts[CoverageStatus.NO_USABLE_EVIDENCE]}｜"
+        f"程序执行异常 {counts[CoverageStatus.ERROR]}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +222,7 @@ def format_question_detail(
     last = datetime.fromtimestamp(cluster.last_sent_at_utc, timezone).strftime("%Y-%m-%d %H:%M")
     result = investigation or InvestigationResult(
         question_code=cluster.question_code,
-        status=CoverageStatus.INCOMPLETE,
+        status=CoverageStatus.ERROR,
         summary="尚未执行知识库调查。",
         missing_information="尚无调查结果。",
         recommendation="请管理员运行该日期的完整日报处理。",
@@ -194,7 +231,6 @@ def format_question_detail(
         f"问题编号：{cluster.question_code}",
         f"聚合问题：{cluster.canonical_question}",
         f"分类：{cluster.category or '未分类'}",
-        f"出现次数：{cluster.occurrence_count}",
         f"群聊：{'、'.join(cluster.group_aliases) or '未设置别名'}",
         f"时间范围：{first} 至 {last}",
         f"知识库覆盖：{_STATUS_LABELS[result.status]}",
@@ -222,16 +258,13 @@ def _summary_payload(
     *,
     screening_errors: int,
 ) -> dict[str, object]:
-    statuses = Counter(
-        investigations.get(item.question_code).status.value
-        if item.question_code in investigations
-        else CoverageStatus.INCOMPLETE.value
-        for item in clusters
-    )
+    public_counts = coverage_counts(clusters, investigations)
     return {
         "report_date": report_date,
         "question_count": len(clusters),
-        "status_counts": {status.value: statuses[status.value] for status in CoverageStatus},
+        "status_counts": {
+            status.value: public_counts.get(status, 0) for status in CoverageStatus
+        },
         "groups": sorted({alias for item in clusters for alias in item.group_aliases}),
         "screening_errors": screening_errors,
     }
@@ -244,7 +277,7 @@ def _subject(prefix: str, report_date: str, summary: dict[str, object]) -> str:
         f"[{prefix}][{report_date}] 问题{summary['question_count']}｜"
         f"无可用知识{counts[CoverageStatus.NO_USABLE_EVIDENCE.value]}｜"
         f"部分覆盖{counts[CoverageStatus.PARTIAL.value]}｜"
-        f"未完成{counts[CoverageStatus.INCOMPLETE.value] + counts[CoverageStatus.ERROR.value]}"
+        f"程序异常{counts[CoverageStatus.ERROR.value]}"
     )
 
 
@@ -262,7 +295,7 @@ def _render_html(
         if result is None:
             result = InvestigationResult(
                 question_code=cluster.question_code,
-                status=CoverageStatus.INCOMPLETE,
+                status=CoverageStatus.ERROR,
                 summary="尚未执行知识库调查。",
                 missing_information="尚无调查结果。",
                 recommendation="请管理员重新运行日报。",
@@ -286,7 +319,7 @@ def _render_html(
             f"""
             <article>
               <h2>{html.escape(cluster.question_code)} · {html.escape(cluster.canonical_question)}</h2>
-              <p class="meta">{html.escape(cluster.category or "未分类")} · 出现 {cluster.occurrence_count} 次 · {_STATUS_LABELS[result.status]}</p>
+              <p class="meta">{html.escape(cluster.category or "未分类")} · {_STATUS_LABELS[result.status]}</p>
               <h3>代表性提问（已脱敏）</h3><ul>{questions}</ul>
               <h3>群友回答（未经核实）</h3><ul>{answers}</ul>
               <h3>知识库调查</h3><p>{html.escape(result.summary)}</p>
@@ -305,7 +338,7 @@ def _render_html(
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;max-width:920px;margin:0 auto;padding:28px;background:#f6f7f9;color:#20242a;line-height:1.7}}
 header,article{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-bottom:18px}}h1,h2,h3{{line-height:1.35}}h2{{font-size:20px}}h3{{font-size:15px;margin-bottom:4px}}.meta{{color:#5b6472}}.stats{{display:flex;flex-wrap:wrap;gap:10px}}.stats span{{background:#eef3ff;border-radius:999px;padding:5px 11px}}a{{color:#185abd}}.command{{background:#f3f4f6;padding:9px 12px;border-radius:7px}}footer{{color:#68707d;font-size:13px;padding:12px}}</style></head>
 <body><header><h1>南大知识缺口日报</h1><p>报告日期：{html.escape(report_date)}｜群聊：{html.escape(groups)}</p>
-<div class="stats"><span>问题 {summary["question_count"]}</span><span>明确回答 {counts[CoverageStatus.ANSWERABLE.value]}</span><span>部分覆盖 {counts[CoverageStatus.PARTIAL.value]}</span><span>无可用知识 {counts[CoverageStatus.NO_USABLE_EVIDENCE.value]}</span><span>调查未完成/错误 {counts[CoverageStatus.INCOMPLETE.value] + counts[CoverageStatus.ERROR.value]}</span><span>筛选技术错误 {summary["screening_errors"]}</span></div></header>
+<div class="stats"><span>问题 {summary["question_count"]}</span><span>明确回答 {counts[CoverageStatus.ANSWERABLE.value]}</span><span>部分覆盖 {counts[CoverageStatus.PARTIAL.value]}</span><span>未找到可用信息 {counts[CoverageStatus.NO_USABLE_EVIDENCE.value]}</span><span>程序执行异常 {counts[CoverageStatus.ERROR.value]}</span><span>筛选技术错误 {summary["screening_errors"]}</span></div></header>
 {"".join(cards) if cards else "<article><p>本日没有纳入日报的问题。</p></article>"}
 <footer>本报告由非官方维护辅助插件生成。群友回答未经核实；知识结论仅依据配置允许的语雀仓库。</footer></body></html>"""
 

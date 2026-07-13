@@ -583,15 +583,23 @@ class ReportStorage:
                 ],
             )
 
-    def list_question_clusters(self, report_date: str) -> list[QuestionCluster]:
+    def list_question_clusters(self, report_date: str | None) -> list[QuestionCluster]:
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT * FROM question_clusters
-                WHERE report_date = ? ORDER BY question_code
-                """,
-                (report_date,),
-            ).fetchall()
+            if report_date is None:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM question_clusters
+                    ORDER BY report_date DESC, question_code
+                    """
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM question_clusters
+                    WHERE report_date = ? ORDER BY question_code
+                    """,
+                    (report_date,),
+                ).fetchall()
             return [self._cluster_from_row(row) for row in rows]
 
     def get_question_cluster(self, question_code: str) -> QuestionCluster | None:
@@ -709,10 +717,15 @@ class ReportStorage:
             ).fetchone()
         return _investigation_from_row(row) if row is not None else None
 
-    def investigations_for_date(self, report_date: str) -> dict[str, InvestigationResult]:
+    def investigations_for_date(
+        self,
+        report_date: str | None,
+    ) -> dict[str, InvestigationResult]:
         with self._lock:
+            where = "WHERE q.report_date = ?" if report_date is not None else ""
+            params = (report_date,) if report_date is not None else ()
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT i.*, q.question_code
                 FROM investigations i
                 JOIN question_clusters q ON q.id = i.cluster_id
@@ -720,9 +733,9 @@ class ReportStorage:
                     SELECT cluster_id, MAX(version) AS version
                     FROM investigations GROUP BY cluster_id
                 ) latest ON latest.cluster_id = i.cluster_id AND latest.version = i.version
-                WHERE q.report_date = ?
-                """,
-                (report_date,),
+                {where}
+                """,  # noqa: S608 -- where is a fixed local fragment
+                params,
             ).fetchall()
         return {str(row["question_code"]): _investigation_from_row(row) for row in rows}
 
