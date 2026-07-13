@@ -131,7 +131,7 @@ astrbot_plugin_nju_qa_report/
 capture_enabled
 capture_mode = selected_groups | all_group_messages
 target_group_ids = ["..."]
-group_aliases = {"群号": "南大迎新群一"}
+group_aliases = [{"group_id": "群号", "alias": "南大迎新群一"}]
 timezone = "Asia/Shanghai"
 raw_message_retention_days = 90
 ```

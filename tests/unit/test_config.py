@@ -20,6 +20,37 @@ def test_webui_schema_defaults_are_accepted_by_runtime_parser() -> None:
     assert config.capture_enabled is False
 
 
+def test_webui_schema_uses_only_supported_astrbot_types() -> None:
+    schema_path = Path(__file__).parents[2] / "_conf_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    supported = {
+        "int",
+        "float",
+        "bool",
+        "string",
+        "text",
+        "list",
+        "file",
+        "object",
+        "template_list",
+    }
+
+    def assert_schema_items(items: dict[str, object]) -> None:
+        for definition in items.values():
+            assert isinstance(definition, dict)
+            assert definition["type"] in supported
+            if definition["type"] == "object":
+                assert_schema_items(definition.get("items", {}))
+            if definition["type"] == "template_list":
+                templates = definition.get("templates", {})
+                assert isinstance(templates, dict)
+                for template in templates.values():
+                    assert isinstance(template, dict)
+                    assert_schema_items(template.get("items", {}))
+
+    assert_schema_items(schema)
+
+
 def test_defaults_are_safe_and_exclude_qa_repository() -> None:
     config = PluginConfig.from_mapping({})
 
@@ -134,6 +165,23 @@ def test_group_alias_falls_back_to_masked_group_id() -> None:
     config = PluginConfig.from_mapping({"group_aliases": {"12345678": "迎新一群"}})
     assert config.group_alias("12345678") == "迎新一群"
     assert config.group_alias("87654321") == "群聊-****4321"
+
+
+def test_group_alias_template_list_and_legacy_mapping_are_supported() -> None:
+    template_config = PluginConfig.from_mapping(
+        {
+            "group_aliases": [
+                {
+                    "__template_key": "group_alias",
+                    "group_id": "12345678",
+                    "alias": "迎新一群",
+                }
+            ]
+        }
+    )
+    legacy_config = PluginConfig.from_mapping({"group_aliases": {"12345678": "迎新一群"}})
+    assert template_config.group_alias("12345678") == "迎新一群"
+    assert legacy_config.group_alias("12345678") == "迎新一群"
 
 
 def test_email_recipients_are_validated_and_independent_from_qq_roles() -> None:

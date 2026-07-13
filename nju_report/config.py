@@ -316,14 +316,23 @@ def _id_tuple(value: Any, field: str) -> tuple[str, ...]:
 def _aliases(value: Any) -> dict[str, str]:
     if value in (None, ""):
         return {}
-    if not isinstance(value, Mapping):
-        raise ConfigError("group_aliases 必须是对象")
     aliases: dict[str, str] = {}
-    for group_id, alias in value.items():
+    if isinstance(value, Mapping):
+        entries = value.items()
+    elif isinstance(value, (list, tuple)):
+        parsed_entries: list[tuple[Any, Any]] = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                raise ConfigError("group_aliases 的模板条目必须是对象")
+            parsed_entries.append((item.get("group_id", ""), item.get("alias", "")))
+        entries = parsed_entries
+    else:
+        raise ConfigError("group_aliases 必须是模板列表或兼容的对象")
+    for group_id, alias in entries:
         if not isinstance(group_id, str) or not group_id.strip():
-            raise ConfigError("group_aliases 的群号键必须是非空字符串")
+            raise ConfigError("group_aliases 的 group_id 必须是非空字符串")
         if not isinstance(alias, str) or not alias.strip():
-            raise ConfigError("group_aliases 的群别名必须是非空字符串")
+            raise ConfigError("group_aliases 的 alias 必须是非空字符串")
         aliases[group_id.strip()] = alias.strip()
     return aliases
 

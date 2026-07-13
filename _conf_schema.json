@@ -20,10 +20,33 @@
   },
   "group_aliases": {
     "description": "群号到日报群别名的映射",
-    "type": "dict",
-    "items": {},
-    "default": {"826811581": "南京大学迎新群"},
-    "hint": "例如 {\"123456\": \"南大迎新群一\"}。日报不直接显示群号。"
+    "type": "template_list",
+    "templates": {
+      "group_alias": {
+        "name": "QQ群别名",
+        "hint": "日报只显示别名，不直接显示群号。",
+        "display_item": "alias",
+        "items": {
+          "group_id": {
+            "description": "QQ群号",
+            "type": "string",
+            "default": ""
+          },
+          "alias": {
+            "description": "日报群别名",
+            "type": "string",
+            "default": ""
+          }
+        }
+      }
+    },
+    "default": [
+      {
+        "__template_key": "group_alias",
+        "group_id": "826811581",
+        "alias": "南京大学迎新群"
+      }
+    ]
   },
   "command_prefixes": {
     "description": "不作为问题采集的 Bot 指令前缀",
@@ -150,14 +173,34 @@
   },
   "excluded_repositories": {
     "description": "禁止下载和调查的语雀仓库",
-    "type": "list",
+    "type": "template_list",
+    "templates": {
+      "repository_exclusion": {
+        "name": "排除语雀仓库",
+        "hint": "排除优先级高于批准；排除后不下载正文、不进入检索。",
+        "display_item": "namespace",
+        "items": {
+          "namespace": {
+            "description": "仓库 namespace",
+            "type": "string",
+            "default": ""
+          },
+          "reason": {
+            "description": "排除原因",
+            "type": "string",
+            "default": ""
+          }
+        }
+      }
+    },
     "default": [
       {
+        "__template_key": "repository_exclusion",
         "namespace": "qc19gt/ogaye8",
         "reason": "QA 成品仓库，默认不作为缺口调查源"
       }
     ],
-    "hint": "支持 namespace 字符串或带 namespace/reason 的对象；此列表可修改。"
+    "hint": "此列表可修改；取消排除后仍需另行批准才会同步。"
   },
   "purge_excluded_repository_data": {
     "description": "排除仓库后清理其历史本地文档和索引",
