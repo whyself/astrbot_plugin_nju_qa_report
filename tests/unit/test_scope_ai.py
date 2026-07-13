@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -10,7 +11,9 @@ from nju_report.scope_ai import (
     AstrBotScopeAiClient,
     ScopeAiResponseError,
     parse_scope_assessment,
+    parse_scope_batch,
 )
+from nju_report.scope_classifier import ScopeBatchMessage
 
 
 def test_parse_scope_assessment_accepts_fenced_json() -> None:
@@ -72,6 +75,44 @@ def test_multiple_or_prefixed_json_objects_are_rejected() -> None:
         parse_scope_assessment("模型回答：" + valid)
 
 
+def test_parse_scope_batch_requires_exact_ordered_id_coverage() -> None:
+    question = {
+        "source_message_ids": ["m1", "m2"],
+        "reason": "两条消息共同表达一个校园问题",
+        "confidence": 0.9,
+        "canonical_question": "南京大学校园卡如何补办？",
+        "category": "校园生活/校园卡",
+        "clarity": "CLEAR",
+        "knowledge_value": "HIGH",
+        "time_sensitive": False,
+    }
+    payload = json.dumps(
+        {
+            "questions": [question],
+            "uncertain_questions": [],
+            "dropped_message_ids": [],
+        },
+        ensure_ascii=False,
+    )
+    result = parse_scope_batch(payload, ["m1", "m2"])
+    assert list(result) == ["m1", "m2"]
+    assert result["m1"].canonical_question == result["m2"].canonical_question
+
+    with pytest.raises(ScopeAiResponseError):
+        parse_scope_batch(payload, ["m1"])
+
+    duplicate_payload = json.dumps(
+        {
+            "questions": [question],
+            "uncertain_questions": [],
+            "dropped_message_ids": ["m2"],
+        },
+        ensure_ascii=False,
+    )
+    with pytest.raises(ScopeAiResponseError):
+        parse_scope_batch(duplicate_payload, ["m1", "m2"])
+
+
 def test_scope_input_is_redacted_and_bounded() -> None:
     prepared = prepare_scope_input(
         "我叫张三，QQ:12345678，手机号13800138000，邮箱a@example.com，宿舍1A23",
@@ -122,3 +163,36 @@ def test_ai_client_never_sends_raw_identifiers_to_provider() -> None:
     assert "12345678" not in context.prompt
     assert "[手机号]" in context.prompt
     assert "[账号]" in context.prompt
+
+
+def test_batch_client_sends_every_target_and_redacts_content() -> None:
+    completion = json.dumps(
+        {
+            "questions": [],
+            "uncertain_questions": [],
+            "dropped_message_ids": ["m1"],
+        },
+        ensure_ascii=False,
+    )
+
+    class Response:
+        completion_text = completion
+
+    class Context:
+        prompt = ""
+
+        async def llm_generate(self, **kwargs):
+            self.prompt = kwargs["prompt"]
+            return Response()
+
+    context = Context()
+    client = AstrBotScopeAiClient(context, provider_id="provider", max_retries=0)
+    result = asyncio.run(
+        client.classify_batch(
+            [ScopeBatchMessage("m1", "手机号 13800138000，这是回答")],
+            ["m1"],
+        )
+    )
+    assert list(result) == ["m1"]
+    assert "13800138000" not in context.prompt
+    assert "[手机号]" in context.prompt

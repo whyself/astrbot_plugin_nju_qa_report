@@ -2,14 +2,32 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Protocol
 
 from .models import ScopeAssessment, ScopeDecision, ScopeResolution
 
 
+@dataclass(frozen=True, slots=True)
+class ScopeBatchMessage:
+    message_id: str
+    content: str
+    context_only: bool = False
+    speaker_id: str = ""
+    reply_to_id: str = ""
+
+
 class ScopeClassifier(Protocol):
     async def classify(self, message: str, context: str) -> ScopeAssessment:
         """Perform the first-pass scope decision."""
+
+    async def classify_batch(
+        self,
+        messages: Sequence[ScopeBatchMessage],
+        target_ids: Sequence[str],
+    ) -> dict[str, ScopeAssessment]:
+        """Classify every target in one ordered chat chunk."""
 
 
 class ScopeReviewer(Protocol):
@@ -21,6 +39,15 @@ class ScopeReviewer(Protocol):
         round_no: int,
     ) -> ScopeAssessment:
         """Independently review an uncertain candidate."""
+
+    async def review_batch(
+        self,
+        messages: Sequence[ScopeBatchMessage],
+        target_ids: Sequence[str],
+        *,
+        round_no: int,
+    ) -> dict[str, ScopeAssessment]:
+        """Independently review unresolved targets in one chat chunk."""
 
 
 class ScopeAssessmentError(RuntimeError):
@@ -131,6 +158,127 @@ class AutoScopeReviewService:
             review_attempts=tuple(review_attempts),
         )
 
+    async def resolve_batch(
+        self,
+        messages: Sequence[ScopeBatchMessage],
+        target_ids: Sequence[str],
+    ) -> dict[str, ScopeResolution]:
+        ordered_ids = tuple(dict.fromkeys(str(item) for item in target_ids))
+        if not ordered_ids:
+            return {}
+        try:
+            initial_raw = await self._classifier.classify_batch(messages, ordered_ids)
+            _require_exact_ids(initial_raw, ordered_ids)
+            initial = {item: _validated(initial_raw[item]) for item in ordered_ids}
+        except Exception as exc:
+            return {
+                item: _error_resolution(exc, review_rounds=0)
+                for item in ordered_ids
+            }
+
+        resolved: dict[str, ScopeResolution] = {}
+        pending: list[str] = []
+        attempts: dict[str, list[ScopeAssessment]] = {item: [] for item in ordered_ids}
+        for item in ordered_ids:
+            assessment = initial[item]
+            if assessment.decision in {ScopeDecision.INCLUDE, ScopeDecision.DROP}:
+                resolved[item] = ScopeResolution(
+                    assessment,
+                    review_rounds=0,
+                    initial_assessment=assessment,
+                )
+            elif assessment.decision is ScopeDecision.AUTO_REVIEW:
+                pending.append(item)
+            else:
+                resolved[item] = _error_resolution(
+                    ScopeAssessmentError("批量初筛模型返回了不允许的决策"),
+                    review_rounds=0,
+                    initial=assessment,
+                )
+
+        if not pending:
+            return resolved
+        if not self._enabled:
+            for item in pending:
+                assessment = initial[item]
+                resolved[item] = ScopeResolution(
+                    ScopeAssessment(
+                        decision=ScopeDecision.DROP_LOW_CONFIDENCE,
+                        reason="AI 自动复核已关闭，低置信候选自动排除",
+                        confidence=assessment.confidence,
+                        canonical_question=assessment.canonical_question,
+                        category=assessment.category,
+                        clarity=assessment.clarity,
+                        knowledge_value=assessment.knowledge_value,
+                        time_sensitive=assessment.time_sensitive,
+                    ),
+                    review_rounds=0,
+                    initial_assessment=assessment,
+                )
+            return resolved
+
+        for round_no in range(1, self._max_rounds + 1):
+            try:
+                reviewed_raw = await self._reviewer.review_batch(
+                    messages,
+                    pending,
+                    round_no=round_no,
+                )
+                _require_exact_ids(reviewed_raw, pending)
+                reviewed = {item: _validated(reviewed_raw[item]) for item in pending}
+            except Exception as exc:
+                for item in pending:
+                    resolved[item] = _error_resolution(
+                        exc,
+                        review_rounds=round_no,
+                        initial=initial[item],
+                        review_attempts=tuple(attempts[item]),
+                    )
+                return resolved
+
+            next_pending: list[str] = []
+            for item in pending:
+                assessment = reviewed[item]
+                attempts[item].append(assessment)
+                if assessment.decision in {ScopeDecision.INCLUDE, ScopeDecision.DROP}:
+                    resolved[item] = ScopeResolution(
+                        assessment,
+                        review_rounds=round_no,
+                        initial_assessment=initial[item],
+                        review_attempts=tuple(attempts[item]),
+                    )
+                elif assessment.decision is ScopeDecision.AUTO_REVIEW:
+                    next_pending.append(item)
+                else:
+                    resolved[item] = _error_resolution(
+                        ScopeAssessmentError("批量复核模型返回了不允许的决策"),
+                        review_rounds=round_no,
+                        initial=initial[item],
+                        review_attempts=tuple(attempts[item]),
+                    )
+            pending = next_pending
+            if not pending:
+                return resolved
+
+        for item in pending:
+            last = attempts[item][-1] if attempts[item] else initial[item]
+            resolved[item] = ScopeResolution(
+                ScopeAssessment(
+                    decision=ScopeDecision.DROP_LOW_CONFIDENCE,
+                    reason="AI 自动复核后仍无法形成明确且可沉淀的问题",
+                    confidence=last.confidence,
+                    canonical_question=last.canonical_question,
+                    category=last.category,
+                    clarity=last.clarity,
+                    knowledge_value=last.knowledge_value,
+                    time_sensitive=last.time_sensitive,
+                ),
+                review_rounds=self._max_rounds,
+                initial_assessment=initial[item],
+                review_attempts=tuple(attempts[item]),
+            )
+        return resolved
+
 
 def _validated(assessment: ScopeAssessment) -> ScopeAssessment:
     if not isinstance(assessment, ScopeAssessment):
@@ -152,6 +300,14 @@ def _validated(assessment: ScopeAssessment) -> ScopeAssessment:
     if assessment.decision is ScopeDecision.INCLUDE and not assessment.canonical_question.strip():
         raise ScopeAssessmentError("纳入的问题必须有清楚的聚合问题表达")
     return assessment
+
+
+def _require_exact_ids(
+    assessments: dict[str, ScopeAssessment],
+    expected_ids: Sequence[str],
+) -> None:
+    if not isinstance(assessments, dict) or set(assessments) != set(expected_ids):
+        raise ScopeAssessmentError("批量模型结果未精确覆盖全部目标消息 ID")
 
 
 def _error_resolution(

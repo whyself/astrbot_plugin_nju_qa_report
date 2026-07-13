@@ -10,9 +10,13 @@ from zoneinfo import ZoneInfo
 
 from .models import ScopeAssessment, ScopeDecision, ScopeResolution, StoredMessage
 from .privacy import redact_for_report
-from .scope_classifier import AutoScopeReviewService
+from .scope_classifier import AutoScopeReviewService, ScopeBatchMessage
 from .storage import ReportStorage
 from .time_windows import natural_day_window
+
+_BATCH_MAX_TARGETS = 200
+_BATCH_MAX_TARGET_CHARS = 24_000
+_BATCH_MESSAGE_CHAR_LIMIT = 1_200
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,8 +35,14 @@ class DailyRunResult:
         return self.status in {"SKIPPED_COMPLETED", "SKIPPED_REPORT_COMPLETE"}
 
 
+@dataclass(frozen=True, slots=True)
+class _ScreeningChunk:
+    messages: tuple[ScopeBatchMessage, ...]
+    targets: tuple[tuple[str, int, StoredMessage], ...]
+
+
 class DailyQuestionProcessor:
-    """Send every nonempty captured message through AI scope screening."""
+    """Send every nonempty captured message through full-coverage AI chunks."""
 
     def __init__(
         self,
@@ -41,7 +51,7 @@ class DailyQuestionProcessor:
         *,
         timezone_name: str,
         concurrency: int = 2,
-        context_radius: int = 5,
+        context_radius: int = 30,
     ) -> None:
         if concurrency < 1:
             raise ValueError("concurrency 必须大于 0")
@@ -119,30 +129,26 @@ class DailyQuestionProcessor:
                 self._storage.messages_in_window,
                 window,
             )
-            screenable = [
-                (index, item)
-                for index, item in enumerate(messages)
-                if item.text.strip() or item.outline.strip()
-            ]
+            chunks = _screening_chunks(messages, context_radius=self._context_radius)
             semaphore = asyncio.Semaphore(self._concurrency)
 
-            async def screen(index: int, message: StoredMessage) -> ScopeDecision:
+            async def screen(chunk: _ScreeningChunk) -> list[ScopeDecision]:
                 async with semaphore:
-                    return await self._screen_one(
-                        message,
-                        context=_nearby_context(messages, index, self._context_radius),
+                    return await self._screen_chunk(
+                        chunk,
                         report_date=report_date.isoformat(),
-                        review_run_id=f"{run_id}:{index}",
+                        review_run_id=run_id,
                     )
 
-            tasks = [asyncio.create_task(screen(index, item)) for index, item in screenable]
+            tasks = [asyncio.create_task(screen(chunk)) for chunk in chunks]
             decisions: list[ScopeDecision] = []
             self._progress_date = report_date.isoformat()
-            self._progress_total = len(tasks)
+            self._progress_total = sum(len(chunk.targets) for chunk in chunks)
             self._progress_completed = 0
-            for completed, task in enumerate(asyncio.as_completed(tasks), start=1):
-                decisions.append(await task)
-                self._progress_completed = completed
+            for task in asyncio.as_completed(tasks):
+                chunk_decisions = await task
+                decisions.extend(chunk_decisions)
+                self._progress_completed += len(chunk_decisions)
             included_count = sum(item is ScopeDecision.INCLUDE for item in decisions)
             error_count = sum(item is ScopeDecision.AUTO_REVIEW_ERROR for item in decisions)
             dropped_count = len(decisions) - included_count - error_count
@@ -185,30 +191,57 @@ class DailyQuestionProcessor:
                 error_summary=error_name,
             )
 
-    async def _screen_one(
+    async def _screen_chunk(
         self,
-        message: StoredMessage,
+        chunk: _ScreeningChunk,
         *,
-        context: str,
         report_date: str,
         review_run_id: str,
-    ) -> ScopeDecision:
-        content = message.text.strip() or message.outline.strip()
+    ) -> list[ScopeDecision]:
+        target_ids = tuple(item[0] for item in chunk.targets)
         try:
-            resolution = await self._scope_review_service.resolve(content, context)
+            resolutions = await self._scope_review_service.resolve_batch(
+                chunk.messages,
+                target_ids,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # Defensive: the service normally converts errors itself.
-            resolution = ScopeResolution(
-                assessment=ScopeAssessment(
-                    decision=ScopeDecision.AUTO_REVIEW_ERROR,
-                    reason="AI 范围审核发生技术错误，已保留本地记录",
-                    confidence=0.0,
-                ),
-                review_rounds=0,
-                retryable=True,
-                error_summary=type(exc).__name__,
+            resolutions = {
+                message_id: ScopeResolution(
+                    assessment=ScopeAssessment(
+                        decision=ScopeDecision.AUTO_REVIEW_ERROR,
+                        reason="AI 范围审核发生技术错误，已保留本地记录",
+                        confidence=0.0,
+                    ),
+                    review_rounds=0,
+                    retryable=True,
+                    error_summary=type(exc).__name__,
+                )
+                for message_id in target_ids
+            }
+
+        decisions: list[ScopeDecision] = []
+        for message_id, index, message in chunk.targets:
+            resolution = resolutions[message_id]
+            await self._save_resolution(
+                message,
+                resolution,
+                report_date=report_date,
+                review_run_id=f"{review_run_id}:{index}",
             )
+            decisions.append(resolution.assessment.decision)
+        return decisions
+
+    async def _save_resolution(
+        self,
+        message: StoredMessage,
+        resolution: ScopeResolution,
+        *,
+        report_date: str,
+        review_run_id: str,
+    ) -> None:
+        content = message.text.strip() or message.outline.strip()
 
         source_key = ":".join(
             (
@@ -228,39 +261,72 @@ class DailyQuestionProcessor:
             group_alias=message.group_alias,
             sent_at_utc=message.sent_at_utc,
         )
-        return resolution.assessment.decision
 
 
-def _nearby_context(messages: list[StoredMessage], index: int, radius: int) -> str:
-    if radius == 0:
-        return ""
-    target = messages[index]
-    lines: list[str] = []
-    before: list[StoredMessage] = []
-    for nearby_index in range(index - 1, -1, -1):
-        item = messages[nearby_index]
-        if item.group_id != target.group_id:
+def _screening_chunks(
+    messages: list[StoredMessage],
+    *,
+    context_radius: int,
+) -> list[_ScreeningChunk]:
+    groups: dict[str, list[tuple[int, StoredMessage]]] = {}
+    for index, item in enumerate(messages):
+        if not (item.text.strip() or item.outline.strip()):
             continue
-        before.append(item)
-        if len(before) >= radius:
-            break
-    after: list[StoredMessage] = []
-    for nearby_index in range(index + 1, len(messages)):
-        item = messages[nearby_index]
-        if item.group_id != target.group_id:
-            continue
-        after.append(item)
-        if len(after) >= radius:
-            break
-    for relation, item in [
-        *(("此前", item) for item in reversed(before)),
-        *(("此后", item) for item in after),
-    ]:
-        content = item.text.strip() or item.outline.strip()
-        if not content:
-            continue
-        lines.append(f"{relation}群聊消息：{content}")
-    return "\n".join(lines)
+        group_key = item.group_id or item.session_id
+        groups.setdefault(group_key, []).append((index, item))
+
+    chunks: list[_ScreeningChunk] = []
+    for group_entries in groups.values():
+        external_to_internal = {
+            message.external_message_id: f"m{global_index}"
+            for global_index, message in group_entries
+            if message.external_message_id
+        }
+        speaker_aliases: dict[str, str] = {}
+        for global_index, message in group_entries:
+            speaker_key = message.sender_id or message.sender_name or f"unknown:{global_index}"
+            speaker_aliases.setdefault(speaker_key, f"u{len(speaker_aliases) + 1}")
+        start = 0
+        while start < len(group_entries):
+            end = start
+            target_chars = 0
+            while end < len(group_entries) and end - start < _BATCH_MAX_TARGETS:
+                content = _message_content(group_entries[end][1])
+                next_chars = min(len(content), _BATCH_MESSAGE_CHAR_LIMIT) + 80
+                if end > start and target_chars + next_chars > _BATCH_MAX_TARGET_CHARS:
+                    break
+                target_chars += next_chars
+                end += 1
+
+            context_start = max(0, start - context_radius)
+            context_end = min(len(group_entries), end + context_radius)
+            batch_messages: list[ScopeBatchMessage] = []
+            targets: list[tuple[str, int, StoredMessage]] = []
+            for local_index in range(context_start, context_end):
+                global_index, message = group_entries[local_index]
+                message_id = f"m{global_index}"
+                speaker_key = (
+                    message.sender_id or message.sender_name or f"unknown:{global_index}"
+                )
+                is_target = start <= local_index < end
+                batch_messages.append(
+                    ScopeBatchMessage(
+                        message_id=message_id,
+                        content=_message_content(message),
+                        context_only=not is_target,
+                        speaker_id=speaker_aliases[speaker_key],
+                        reply_to_id=external_to_internal.get(message.reply_to_message_id, ""),
+                    )
+                )
+                if is_target:
+                    targets.append((message_id, global_index, message))
+            chunks.append(_ScreeningChunk(tuple(batch_messages), tuple(targets)))
+            start = end
+    return chunks
+
+
+def _message_content(message: StoredMessage) -> str:
+    return message.text.strip() or message.outline.strip()
 
 
 def today_in_timezone(timezone_name: str) -> date:

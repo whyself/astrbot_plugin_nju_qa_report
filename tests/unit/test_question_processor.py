@@ -13,6 +13,7 @@ from nju_report.models import (
 )
 from nju_report.question_export import QuestionCsvExporter
 from nju_report.question_processor import DailyQuestionProcessor
+from nju_report.scope_classifier import ScopeBatchMessage
 from nju_report.storage import ReportStorage
 from nju_report.time_windows import natural_day_window
 
@@ -20,6 +21,9 @@ from nju_report.time_windows import natural_day_window
 class FakeScopeService:
     def __init__(self) -> None:
         self.seen: list[str] = []
+        self.batch_calls = 0
+        self.batch_sizes: list[int] = []
+        self.batch_message_sizes: list[int] = []
 
     async def resolve(self, message: str, context: str = "") -> ScopeResolution:
         del context
@@ -52,6 +56,20 @@ class FakeScopeService:
         )
         return ScopeResolution(assessment, review_rounds=0)
 
+    async def resolve_batch(
+        self,
+        messages: list[ScopeBatchMessage] | tuple[ScopeBatchMessage, ...],
+        target_ids: list[str] | tuple[str, ...],
+    ) -> dict[str, ScopeResolution]:
+        self.batch_calls += 1
+        self.batch_sizes.append(len(target_ids))
+        self.batch_message_sizes.append(len(messages))
+        by_id = {item.message_id: item for item in messages}
+        return {
+            message_id: await self.resolve(by_id[message_id].content)
+            for message_id in target_ids
+        }
+
 
 def _stored(message_id: str, text: str, timestamp: int) -> StoredMessage:
     return StoredMessage(
@@ -82,9 +100,10 @@ def test_daily_processor_retains_include_drop_and_error_and_skips_rerun(
     storage.insert_message(_stored("m-1", "纳入：校园卡怎么补办？", window.start_timestamp + 1))
     storage.insert_message(_stored("m-2", "排除：今晚吃什么？", window.start_timestamp + 2))
     storage.insert_message(_stored("m-3", "错误：模型超时", window.start_timestamp + 3))
+    scope = FakeScopeService()
     processor = DailyQuestionProcessor(
         storage,
-        FakeScopeService(),  # type: ignore[arg-type]
+        scope,  # type: ignore[arg-type]
         timezone_name="Asia/Shanghai",
         concurrency=2,
     )
@@ -95,6 +114,7 @@ def test_daily_processor_retains_include_drop_and_error_and_skips_rerun(
     assert first.included_count == 1
     assert first.dropped_count == 1
     assert first.error_count == 1
+    assert scope.batch_calls == 1
 
     candidates, total = storage.list_question_candidates(limit=None)
     assert total == 3
@@ -194,4 +214,39 @@ def test_every_nonempty_message_reaches_ai_without_keyword_prefilter(tmp_path: P
 
     assert result.candidates_saved == 2
     assert scope.seen == ["哈哈哈", "[图片]"]
+    assert scope.batch_calls == 1
+    storage.close()
+
+
+def test_large_day_is_split_into_full_coverage_batches(tmp_path: Path) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    report_date = date(2026, 7, 12)
+    window = natural_day_window(report_date, "Asia/Shanghai")
+    for index in range(425):
+        storage.insert_message(
+            _stored(
+                f"m-{index}",
+                f"纳入：第 {index} 个校园问题？",
+                window.start_timestamp + index,
+            )
+        )
+    scope = FakeScopeService()
+    processor = DailyQuestionProcessor(
+        storage,
+        scope,  # type: ignore[arg-type]
+        timezone_name="Asia/Shanghai",
+        concurrency=2,
+    )
+
+    result = asyncio.run(processor.process_date(report_date))
+
+    assert result.status == "COMPLETED"
+    assert result.candidates_saved == 425
+    assert result.included_count == 425
+    assert scope.batch_calls == 3
+    assert scope.batch_sizes == [200, 200, 25]
+    assert sorted(scope.batch_message_sizes) == [55, 230, 255]
+    assert len(scope.seen) == 425
+    assert len(set(scope.seen)) == 425
     storage.close()

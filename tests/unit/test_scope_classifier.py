@@ -8,7 +8,7 @@ from nju_report.models import (
     ScopeAssessment,
     ScopeDecision,
 )
-from nju_report.scope_classifier import AutoScopeReviewService
+from nju_report.scope_classifier import AutoScopeReviewService, ScopeBatchMessage
 
 
 def _assessment(decision: ScopeDecision, *, reason: str = "理由") -> ScopeAssessment:
@@ -56,6 +56,38 @@ class FakeAi:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+class BatchFakeAi:
+    def __init__(
+        self,
+        primary: dict[str, ScopeAssessment],
+        reviews: list[dict[str, ScopeAssessment]] | None = None,
+    ) -> None:
+        self.primary = primary
+        self.reviews = list(reviews or [])
+        self.classify_batch_calls = 0
+        self.review_batch_targets: list[tuple[str, ...]] = []
+
+    async def classify_batch(
+        self,
+        messages: list[ScopeBatchMessage],
+        target_ids: list[str] | tuple[str, ...],
+    ) -> dict[str, ScopeAssessment]:
+        del messages, target_ids
+        self.classify_batch_calls += 1
+        return self.primary
+
+    async def review_batch(
+        self,
+        messages: list[ScopeBatchMessage],
+        target_ids: list[str] | tuple[str, ...],
+        *,
+        round_no: int,
+    ) -> dict[str, ScopeAssessment]:
+        del messages, round_no
+        self.review_batch_targets.append(tuple(target_ids))
+        return self.reviews.pop(0)
 
 
 def test_include_and_drop_skip_review_model() -> None:
@@ -111,3 +143,42 @@ def test_technical_failure_is_not_disguised_as_low_quality() -> None:
     assert result.retryable is True
     assert result.error_summary == "TimeoutError"
     assert "自动重试" in result.assessment.reason
+
+
+def test_batch_review_only_rechecks_uncertain_targets() -> None:
+    ai = BatchFakeAi(
+        {
+            "m1": _assessment(ScopeDecision.INCLUDE),
+            "m2": _assessment(ScopeDecision.AUTO_REVIEW),
+            "m3": _assessment(ScopeDecision.DROP),
+        },
+        [{"m2": _assessment(ScopeDecision.INCLUDE)}],
+    )
+    messages = [
+        ScopeBatchMessage("m1", "第一条"),
+        ScopeBatchMessage("m2", "第二条"),
+        ScopeBatchMessage("m3", "第三条"),
+    ]
+
+    result = asyncio.run(
+        AutoScopeReviewService(ai, ai).resolve_batch(messages, ["m1", "m2", "m3"])
+    )
+
+    assert result["m1"].assessment.decision is ScopeDecision.INCLUDE
+    assert result["m2"].assessment.decision is ScopeDecision.INCLUDE
+    assert result["m2"].review_rounds == 1
+    assert result["m3"].assessment.decision is ScopeDecision.DROP
+    assert ai.review_batch_targets == [("m2",)]
+
+
+def test_batch_missing_target_becomes_technical_error_for_entire_batch() -> None:
+    ai = BatchFakeAi({"m1": _assessment(ScopeDecision.INCLUDE)})
+    result = asyncio.run(
+        AutoScopeReviewService(ai, ai).resolve_batch(
+            [ScopeBatchMessage("m1", "第一条"), ScopeBatchMessage("m2", "第二条")],
+            ["m1", "m2"],
+        )
+    )
+    assert {item.assessment.decision for item in result.values()} == {
+        ScopeDecision.AUTO_REVIEW_ERROR
+    }
