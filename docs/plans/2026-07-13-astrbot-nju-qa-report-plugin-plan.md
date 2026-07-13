@@ -1,7 +1,7 @@
 # 南京大学迎新问答采集与知识缺口日报插件实施计划
 
 > 日期：2026-07-13
-> 状态：实现中（初始插件骨架）
+> 状态：实现中（第一阶段基础采集与 AI 自动复核已完成）
 > 目标平台：AstrBot / QQ 群聊 / 语雀知识空间
 
 ## 1. 项目目标
@@ -180,7 +180,7 @@ report_viewer_qq_ids = []
 operator_qq_ids = []
 inherit_astrbot_admins_as_viewers = true
 inherit_astrbot_admins_as_operators = true
-report_commands_private_only = true
+sensitive_commands_private_only = true
 ```
 
 - 报告查看人员：可以查看脱敏日报和单个问题详情。

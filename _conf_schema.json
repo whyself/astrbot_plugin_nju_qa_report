@@ -1,4 +1,51 @@
 {
+  "capture_enabled": {
+    "description": "启用 QQ 群消息采集",
+    "type": "bool",
+    "default": false,
+    "hint": "首次安装默认关闭；填写目标群后再开启。",
+    "obvious_hint": true
+  },
+  "capture_mode": {
+    "description": "消息采集范围",
+    "type": "string",
+    "default": "selected_groups",
+    "options": ["selected_groups", "all_group_messages"]
+  },
+  "target_group_ids": {
+    "description": "需要采集的 QQ 群号（字符串数组）",
+    "type": "list",
+    "default": [],
+    "hint": "selected_groups 模式下必填。请将 QQ 群号作为字符串填写。"
+  },
+  "group_aliases": {
+    "description": "群号到日报群别名的映射",
+    "type": "dict",
+    "items": {},
+    "default": {},
+    "hint": "例如 {\"123456\": \"南大迎新群一\"}。日报不直接显示群号。"
+  },
+  "command_prefixes": {
+    "description": "不作为问题采集的 Bot 指令前缀",
+    "type": "list",
+    "default": ["/"]
+  },
+  "capture_queue_size": {
+    "description": "群消息后台写入队列容量",
+    "type": "int",
+    "default": 5000,
+    "hint": "队列使 SQLite 写入不会阻塞 AstrBot 消息事件；队列满时会记录丢弃计数。"
+  },
+  "timezone": {
+    "description": "日报自然日时区",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "raw_message_retention_days": {
+    "description": "本地原始消息保留天数",
+    "type": "int",
+    "default": 90
+  },
   "report_viewer_qq_ids": {
     "description": "允许私聊查看脱敏日报的 QQ 号列表",
     "type": "list",
@@ -19,10 +66,37 @@
     "type": "bool",
     "default": true
   },
-  "report_commands_private_only": {
+  "sensitive_commands_private_only": {
     "description": "日报查看和敏感管理命令仅允许私聊调用",
     "type": "bool",
     "default": true
+  },
+  "llm_provider_id": {
+    "description": "问题筛选、聚合和调查使用的对话模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空时使用 AstrBot 当前默认对话模型。"
+  },
+  "embedding_provider_id": {
+    "description": "向量检索使用的 Embedding Provider ID",
+    "type": "string",
+    "default": ""
+  },
+  "batch_concurrency": {
+    "description": "本插件批处理并发数",
+    "type": "int",
+    "default": 2
+  },
+  "request_timeout_seconds": {
+    "description": "单次模型或外部请求超时秒数",
+    "type": "int",
+    "default": 120
+  },
+  "max_retries": {
+    "description": "模型和外部请求的自动重试次数",
+    "type": "int",
+    "default": 3
   },
   "scope_auto_review_enabled": {
     "description": "对范围判断不确定的问题执行独立 AI 自动审核",
@@ -33,5 +107,92 @@
     "description": "AI 自动审核的最大轮数",
     "type": "int",
     "default": 2
+  },
+  "yuque_token": {
+    "description": "语雀 Token",
+    "type": "string",
+    "default": "",
+    "hint": "只在本机 AstrBot WebUI 填写，不要提交到 GitHub 或发送到群聊。",
+    "obvious_hint": true
+  },
+  "yuque_api_base": {
+    "description": "语雀 API 根地址",
+    "type": "string",
+    "default": "https://nova.yuque.com/api/v2"
+  },
+  "yuque_space_login": {
+    "description": "语雀数据空间 login",
+    "type": "string",
+    "default": "qc19gt"
+  },
+  "approved_repositories": {
+    "description": "允许下载和调查的语雀仓库 namespace",
+    "type": "list",
+    "default": [],
+    "hint": "例如 qc19gt/book-slug。新发现仓库不会自动下载正文。"
+  },
+  "excluded_repositories": {
+    "description": "禁止下载和调查的语雀仓库",
+    "type": "list",
+    "default": [
+      {
+        "namespace": "qc19gt/ogaye8",
+        "reason": "QA 成品仓库，默认不作为缺口调查源"
+      }
+    ],
+    "hint": "支持 namespace 字符串或带 namespace/reason 的对象；此列表可修改。"
+  },
+  "purge_excluded_repository_data": {
+    "description": "排除仓库后清理其历史本地文档和索引",
+    "type": "bool",
+    "default": true
+  },
+  "daily_report_enabled": {
+    "description": "启用每日日报任务",
+    "type": "bool",
+    "default": false,
+    "hint": "SMTP、收件人和知识库配置完成前建议保持关闭。"
+  },
+  "daily_report_time": {
+    "description": "每日日报执行时间（HH:MM）",
+    "type": "string",
+    "default": "03:30"
+  },
+  "smtp_host": {
+    "description": "SMTP 服务器",
+    "type": "string",
+    "default": ""
+  },
+  "smtp_port": {
+    "description": "SMTP 端口",
+    "type": "int",
+    "default": 465
+  },
+  "smtp_username": {
+    "description": "SMTP 用户名",
+    "type": "string",
+    "default": ""
+  },
+  "smtp_password": {
+    "description": "SMTP 密码或邮箱授权码",
+    "type": "string",
+    "default": "",
+    "hint": "只在本机 AstrBot WebUI 填写，不要提交到 GitHub。",
+    "obvious_hint": true
+  },
+  "smtp_use_ssl": {
+    "description": "使用 SMTP SSL",
+    "type": "bool",
+    "default": true
+  },
+  "mail_from": {
+    "description": "日报发件地址",
+    "type": "string",
+    "default": ""
+  },
+  "mail_recipients": {
+    "description": "日报收件地址列表",
+    "type": "list",
+    "default": []
   }
 }
