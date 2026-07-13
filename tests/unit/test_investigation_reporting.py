@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 from nju_report.config import PluginConfig
-from nju_report.investigation import InvestigationService
+from nju_report.investigation import (
+    InvestigationService,
+    _evidence_from_hits,
+    _grep_terms,
+    _queries_for,
+)
 from nju_report.models import (
     CoverageStatus,
     InvestigationResult,
@@ -121,6 +127,44 @@ def test_irrelevant_hits_can_be_classified_as_no_usable_evidence(tmp_path: Path)
         storage.close()
 
     asyncio.run(run())
+
+
+def test_dorm_query_expands_aliases_and_specific_grep_terms(tmp_path: Path) -> None:
+    storage, _, cluster, _ = _prepared_case(tmp_path, repository_status="READY")
+    dorm_cluster = replace(
+        cluster,
+        canonical_question="南京大学南园二舍的宿舍结构是怎样的，是否有套间？",
+        category="住宿食堂",
+    )
+
+    queries = _queries_for(dorm_cluster)
+    terms = _grep_terms(dorm_cluster.canonical_question)
+
+    assert any("南二" in item for item in queries)
+    assert "南园二舍" in terms
+    assert "南二" in terms
+    assert "套间" in terms
+    storage.close()
+
+
+def test_evidence_combines_multiple_relevant_chunks_from_same_document(tmp_path: Path) -> None:
+    storage, _, _, first_hit = _prepared_case(tmp_path, repository_status="READY")
+    second_chunk = replace(
+        first_hit.chunk,
+        chunk_id="qc19gt/guide:card:1",
+        chunk_index=1,
+        content="南园二舍分为若干房型，其中一部分为套间结构。",
+        content_hash="second",
+    )
+    second_hit = replace(first_hit, chunk=second_chunk, score=0.85)
+
+    evidence = _evidence_from_hits([first_hit, second_hit])
+
+    assert len(evidence) == 1
+    assert "校园卡丢失后" in evidence[0].excerpt
+    assert "南园二舍" in evidence[0].excerpt
+    assert "相关段落 2" in evidence[0].excerpt
+    storage.close()
 
 
 def test_model_failure_is_error_not_knowledge_gap(tmp_path: Path) -> None:

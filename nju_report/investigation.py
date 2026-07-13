@@ -28,6 +28,10 @@ _SYSTEM_PROMPT = """
 - PARTIAL：证据相关，但缺少关键条件、步骤、范围、时效或子问题。
 - NO_USABLE_EVIDENCE：检索候选与问题无关或不足以支持任何可靠结论。
 
+资料时效必须结合问题类型判断：宿舍结构、房型、校舍布局等相对稳定的信息，
+2025 年资料在 2026 年默认仍可使用，除非证据明确显示后来有改造、调整或冲突。
+不得仅因资料不是当年发布就返回 NO_USABLE_EVIDENCE；有轻微时效风险可使用 STALE_RISK。
+
 只输出一个 JSON 对象，不要 Markdown：
 {
   "status": "ANSWERABLE | PARTIAL | NO_USABLE_EVIDENCE",
@@ -233,14 +237,16 @@ class InvestigationService:
     async def _search_all(self, queries: tuple[str, ...]) -> list[KnowledgeSearchHit]:
         found: dict[str, KnowledgeSearchHit] = {}
         for query in queries:
-            for hit in await self._knowledge.search(query, limit=8):
+            for hit in await self._knowledge.search(query, limit=16):
                 current = found.get(hit.chunk.chunk_id)
                 if current is None or hit.score > current.score:
                     found[hit.chunk.chunk_id] = hit
         for term in _grep_terms(queries[0]):
             for hit in await self._knowledge.grep(term, limit=10):
-                found.setdefault(hit.chunk.chunk_id, hit)
-        return sorted(found.values(), key=lambda item: -item.score)[:12]
+                current = found.get(hit.chunk.chunk_id)
+                if current is None or hit.score > current.score:
+                    found[hit.chunk.chunk_id] = hit
+        return sorted(found.values(), key=lambda item: -item.score)[:32]
 
     def _knowledge_ready(self) -> tuple[bool, str]:
         allowed = set(self._allowed_namespaces())
@@ -281,6 +287,7 @@ def _queries_for(cluster: QuestionCluster) -> tuple[str, ...]:
         values.append(simplified)
     if cluster.category:
         values.append(f"{cluster.category} {question}")
+    values.extend(_domain_query_variants(question))
     if len(dict.fromkeys(values)) < 2 and len(question) >= 4:
         midpoint = len(question) // 2
         values.append(f"{question[:midpoint]} {question[midpoint:]}")
@@ -288,31 +295,75 @@ def _queries_for(cluster: QuestionCluster) -> tuple[str, ...]:
 
 
 def _grep_terms(question: str) -> tuple[str, ...]:
-    runs = re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u3400-\u9fff]{2,8}", question)
-    stop = {"请问", "一下", "怎么", "如何", "是否", "可以", "能否", "南京大学"}
-    return tuple(dict.fromkeys(item for item in runs if item not in stop))[:4]
+    values: list[str] = []
+    dorm_pattern = r"南园([一二三四五六七八九十百0-9]+)(?:舍|栋|楼)?"
+    for match in re.finditer(dorm_pattern, question):
+        number = match.group(1)
+        values.extend((match.group(0), f"南{number}", f"{number}舍"))
+    key_phrases = (
+        "宿舍结构",
+        "宿舍布局",
+        "房间结构",
+        "套间",
+        "房型",
+        "户型",
+        "马桶",
+        "蹲坑",
+        "翻新",
+        "装修",
+    )
+    values.extend(item for item in key_phrases if item in question)
+    cleaned = re.sub(
+        r"南京大学|请问|一下|怎么|如何|怎样|是否|可以|能否|是什么|有吗|[？?。！!，,；;：:]",
+        " ",
+        question,
+    )
+    values.extend(re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u3400-\u9fff]{2,8}", cleaned))
+    return tuple(dict.fromkeys(item for item in values if len(item.strip()) >= 2))[:8]
+
+
+def _domain_query_variants(question: str) -> tuple[str, ...]:
+    values: list[str] = []
+    dorm_pattern = r"南园([一二三四五六七八九十百0-9]+)(?:舍|栋|楼)?"
+    for match in re.finditer(dorm_pattern, question):
+        number = match.group(1)
+        short_name = f"南{number}"
+        values.append(question.replace(match.group(0), short_name))
+        values.append(f"{short_name} 宿舍结构 布局 房型 套间")
+    return tuple(dict.fromkeys(values))
 
 
 def _evidence_from_hits(hits: Sequence[KnowledgeSearchHit]) -> tuple[EvidenceItem, ...]:
-    documents: set[tuple[str, str]] = set()
-    result: list[EvidenceItem] = []
+    grouped: dict[tuple[str, str], list[KnowledgeSearchHit]] = {}
     for hit in hits:
         key = (hit.chunk.namespace, hit.chunk.document_id)
-        if key in documents:
+        if key not in grouped and len(grouped) >= 8:
             continue
-        documents.add(key)
+        document_hits = grouped.setdefault(key, [])
+        if len(document_hits) < 4:
+            document_hits.append(hit)
+    result: list[EvidenceItem] = []
+    for document_hits in grouped.values():
+        first = document_hits[0]
+        excerpts: list[str] = []
+        for hit in document_hits:
+            excerpt = " ".join(hit.chunk.content.split()).strip()
+            if excerpt and excerpt not in excerpts:
+                excerpts.append(excerpt[:900])
+        combined = "\n\n".join(
+            f"【相关段落 {index}】{excerpt}"
+            for index, excerpt in enumerate(excerpts, start=1)
+        )[:2400]
         result.append(
             EvidenceItem(
-                namespace=hit.chunk.namespace,
-                document_id=hit.chunk.document_id,
-                title=hit.chunk.title,
-                source_url=hit.chunk.source_url,
-                updated_at=hit.chunk.updated_at,
-                excerpt=" ".join(hit.chunk.content.split())[:800],
+                namespace=first.chunk.namespace,
+                document_id=first.chunk.document_id,
+                title=first.chunk.title,
+                source_url=first.chunk.source_url,
+                updated_at=first.chunk.updated_at,
+                excerpt=combined,
             )
         )
-        if len(result) >= 8:
-            break
     return tuple(result)
 
 
