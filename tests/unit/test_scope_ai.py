@@ -77,7 +77,7 @@ def test_multiple_or_prefixed_json_objects_are_rejected() -> None:
 
 def test_parse_scope_batch_accepts_selected_questions_only() -> None:
     question = {
-        "source_message_ids": ["m1", "m2"],
+        "question_message_ids": ["m1", "m2"],
         "reason": "两条消息共同表达一个校园问题",
         "confidence": 0.9,
         "canonical_question": "南京大学校园卡如何补办？",

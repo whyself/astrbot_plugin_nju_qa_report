@@ -234,14 +234,10 @@ class StartupCheckService:
             ),
         ]
         try:
-            answers = await self._answer_agent.collect(
-                cluster,
-                messages,
-                excluded_message_ids={"startup-q"},
-            )
+            discovery = await self._answer_agent.collect(cluster, messages)
         except Exception as exc:
             return StartupCheck("FAIL", "实连：群答上下文判断", type(exc).__name__)
-        if not any(item.external_message_id == "startup-a" for item in answers):
+        if discovery.question_message_ids != ("startup-q",) or not discovery.answers:
             return StartupCheck("FAIL", "实连：群答上下文判断", "未识别测试回答")
         return StartupCheck("PASS", "实连：群答上下文判断", "定长上下文和结果解析正常")
 

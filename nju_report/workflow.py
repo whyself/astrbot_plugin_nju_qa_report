@@ -204,7 +204,7 @@ class DailyReportWorkflow:
                 None,
                 token_usage=self._token_usage.snapshot().since(usage_before),
             )
-        self._stage = "问题聚合与群友回答上下文判断"
+        self._stage = "问题与回答划分及脱敏摘要"
         clusters = await self._aggregation.aggregate_date(report_date)
         self._stage = "知识库调查"
         await self._investigation.investigate_date(report_date.isoformat())

@@ -4,7 +4,11 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from nju_report.answer_agent import AstrBotContextAnswerAgent, ChatContextLookup
+from nju_report.answer_agent import (
+    AstrBotContextAnswerAgent,
+    ChatContextLookup,
+    _AnswerAssessment,
+)
 from nju_report.models import QuestionCluster, StoredMessage
 
 
@@ -20,7 +24,7 @@ class _FakeContext:
 
 def test_context_window_contains_only_the_question_group() -> None:
     cluster, messages = _case()
-    lookup = ChatContextLookup(cluster, messages, excluded_message_ids={"q1"})
+    lookup = ChatContextLookup(cluster, messages)
 
     result = lookup.context_payload(cluster, limit=50)
     message_ids = [item["message_id"] for item in result["messages"]]
@@ -28,9 +32,12 @@ def test_context_window_contains_only_the_question_group() -> None:
     assert message_ids == ["q1", "water", "a1"]
     assert "before" not in message_ids
     assert "other-group" not in message_ids
-    answers = lookup.answers_from_ids(["a1"])
-    assert [item.external_message_id for item in answers] == ["a1"]
-    assert answers[0].direct_reply is True
+    discovery = lookup.discovery_result(
+        _AnswerAssessment(("q1",), ("a1",), "应先在信息门户挂失，再前往服务点处理。")
+    )
+    assert discovery.question_message_ids == ("q1",)
+    assert discovery.answers[0].redacted_text == "应先在信息门户挂失，再前往服务点处理。"
+    assert discovery.answers[0].direct_reply is True
 
 
 def test_agent_finds_answer_in_first_50_messages_with_one_call() -> None:
@@ -40,7 +47,9 @@ def test_agent_finds_answer_in_first_50_messages_with_one_call() -> None:
             [
                 SimpleNamespace(
                     completion_text=(
-                        '{"found":true,"answer_message_ids":["a1"],'
+                        '{"question_message_ids":["q1"],'
+                        '"answer_message_ids":["a1"],'
+                        '"answer_summary":"应先挂失，再前往服务点处理。",'
                         '"reason":"a1明确回答，water是闲聊"}'
                     ),
                 ),
@@ -51,9 +60,10 @@ def test_agent_finds_answer_in_first_50_messages_with_one_call() -> None:
             provider_id="provider",
         )
 
-        answers = await agent.collect(cluster, messages, excluded_message_ids={"q1"})
+        discovery = await agent.collect(cluster, messages)
 
-        assert [item.external_message_id for item in answers] == ["a1"]
+        assert discovery.question_message_ids == ("q1",)
+        assert discovery.answers[0].redacted_text == "应先挂失，再前往服务点处理。"
         assert len(context.calls) == 1
         assert "tools" not in context.calls[0]
         assert _prompt_payload(context.calls[0])["message_limit"] == 50
@@ -79,12 +89,15 @@ def test_agent_expands_once_to_100_messages_then_stops() -> None:
             [
                 SimpleNamespace(
                     completion_text=(
-                        '{"found":false,"answer_message_ids":[],"reason":"前50条未找到"}'
+                        '{"question_message_ids":["q1"],"answer_message_ids":[],'
+                        '"answer_summary":"","reason":"前50条未找到"}'
                     )
                 ),
                 SimpleNamespace(
                     completion_text=(
-                        '{"found":true,"answer_message_ids":["m70"],'
+                        '{"question_message_ids":["q1"],'
+                        '"answer_message_ids":["m70"],'
+                        '"answer_summary":"应先在信息门户挂失。",'
                         '"reason":"扩展后找到明确回答"}'
                     )
                 ),
@@ -92,9 +105,10 @@ def test_agent_expands_once_to_100_messages_then_stops() -> None:
         )
         agent = AstrBotContextAnswerAgent(context, provider_id="provider")
 
-        answers = await agent.collect(cluster, messages, excluded_message_ids={"q1"})
+        discovery = await agent.collect(cluster, messages)
 
-        assert [item.external_message_id for item in answers] == ["m70"]
+        assert discovery.question_message_ids == ("q1",)
+        assert discovery.answers[0].redacted_text == "应先在信息门户挂失。"
         assert len(context.calls) == 2
         assert [_prompt_payload(item)["message_limit"] for item in context.calls] == [50, 100]
         assert [len(_prompt_payload(item)["messages"]) for item in context.calls] == [50, 100]

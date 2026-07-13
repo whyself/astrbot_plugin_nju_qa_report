@@ -237,13 +237,13 @@ def format_question_detail(
         f"调查结论：{result.summary}",
         f"仍缺少：{result.missing_information}",
         f"维护建议：{result.recommendation}",
-        "代表性提问（已脱敏）：",
+        "问题表达（AI 已归纳脱敏）：",
     ]
     lines.extend(f"- {item}" for item in cluster.representative_questions[:5])
-    lines.append("群友回答（未经核实）：")
+    lines.append("群聊回答摘要（AI 已归纳脱敏，未经核实）：")
     lines.extend(f"- {item.redacted_text}" for item in cluster.answers[:5])
     if not cluster.answers:
-        lines.append("- 未发现群友回答")
+        lines.append("- 未发现明确回答")
     lines.append("知识库引用：")
     lines.extend(f"- {item.title}｜{item.source_url}" for item in result.evidence)
     if not result.evidence:
@@ -304,7 +304,7 @@ def _render_html(
             f"<li>{html.escape(item.redacted_text)}</li>" for item in cluster.answers[:5]
         )
         if not answers:
-            answers = "<li>未发现群友回答</li>"
+            answers = "<li>未发现明确回答</li>"
         questions = "".join(
             f"<li>{html.escape(item)}</li>" for item in cluster.representative_questions[:5]
         )
@@ -320,8 +320,8 @@ def _render_html(
             <article>
               <h2>{html.escape(cluster.question_code)} · {html.escape(cluster.canonical_question)}</h2>
               <p class="meta">{html.escape(cluster.category or "未分类")} · {_STATUS_LABELS[result.status]}</p>
-              <h3>代表性提问（已脱敏）</h3><ul>{questions}</ul>
-              <h3>群友回答（未经核实）</h3><ul>{answers}</ul>
+              <h3>问题表达（AI 已归纳脱敏）</h3><ul>{questions}</ul>
+              <h3>群聊回答摘要（AI 已归纳脱敏，未经核实）</h3><ul>{answers}</ul>
               <h3>知识库调查</h3><p>{html.escape(result.summary)}</p>
               <p><strong>仍缺少：</strong>{html.escape(result.missing_information)}</p>
               <p><strong>维护建议：</strong>{html.escape(result.recommendation)}</p>
@@ -340,7 +340,7 @@ header,article{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padd
 <body><header><h1>南大知识缺口日报</h1><p>报告日期：{html.escape(report_date)}｜群聊：{html.escape(groups)}</p>
 <div class="stats"><span>问题 {summary["question_count"]}</span><span>明确回答 {counts[CoverageStatus.ANSWERABLE.value]}</span><span>部分覆盖 {counts[CoverageStatus.PARTIAL.value]}</span><span>未找到可用信息 {counts[CoverageStatus.NO_USABLE_EVIDENCE.value]}</span><span>程序执行异常 {counts[CoverageStatus.ERROR.value]}</span><span>筛选技术错误 {summary["screening_errors"]}</span></div></header>
 {"".join(cards) if cards else "<article><p>本日没有纳入日报的问题。</p></article>"}
-<footer>本报告由非官方维护辅助插件生成。群友回答未经核实；知识结论仅依据配置允许的语雀仓库。</footer></body></html>"""
+<footer>本报告由非官方维护辅助插件生成。群聊回答由 AI 去除身份信息后归纳，内容未经核实；知识结论仅依据配置允许的语雀仓库。</footer></body></html>"""
 
 
 def _write_once(path: Path, content: str) -> None:

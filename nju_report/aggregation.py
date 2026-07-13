@@ -60,24 +60,15 @@ class QuestionAggregationService:
         included = [item for item in candidates if item.final_decision == "INCLUDE"]
         window = natural_day_window(report_date, self._timezone_name)
         messages = await asyncio.to_thread(self._storage.messages_in_window, window)
+        message_by_external_id = {item.external_message_id: item for item in messages}
         clusters = _aggregate(included)
         self._progress_date = report_date.isoformat()
         self._progress_completed = 0
         self._progress_total = len(clusters)
-        excluded_message_ids = {
-            external_id
-            for item in included
-            if (external_id := _external_id_from_source_key(item.source_key))
-        }
-
         async def attach(cluster: QuestionCluster) -> QuestionCluster:
             async with self._semaphore:
                 try:
-                    answers = await self._answer_agent.collect(
-                        cluster,
-                        messages,
-                        excluded_message_ids=excluded_message_ids,
-                    )
+                    discovery = await self._answer_agent.collect(cluster, messages)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -85,8 +76,46 @@ class QuestionAggregationService:
                         "NJU community-answer context agent failed for %s",
                         cluster.question_code,
                     )
-                    answers = ()
-                result = replace(cluster, answers=answers)
+                    discovery = None
+                if discovery is None or not discovery.question_message_ids:
+                    result = replace(
+                        cluster,
+                        representative_questions=(cluster.canonical_question,),
+                        answers=(),
+                    )
+                else:
+                    source_by_external_id = {
+                        external_id: source_key
+                        for source_key in cluster.candidate_source_keys
+                        if (external_id := _external_id_from_source_key(source_key))
+                    }
+                    refined_source_keys = tuple(
+                        source_by_external_id[item]
+                        for item in discovery.question_message_ids
+                        if item in source_by_external_id
+                    )
+                    refined_messages = [
+                        message_by_external_id[item]
+                        for item in discovery.question_message_ids
+                        if item in message_by_external_id
+                    ]
+                    result = replace(
+                        cluster,
+                        candidate_source_keys=refined_source_keys
+                        or cluster.candidate_source_keys,
+                        representative_questions=(cluster.canonical_question,),
+                        first_sent_at_utc=(
+                            min(item.sent_at_utc for item in refined_messages)
+                            if refined_messages
+                            else cluster.first_sent_at_utc
+                        ),
+                        last_sent_at_utc=(
+                            max(item.sent_at_utc for item in refined_messages)
+                            if refined_messages
+                            else cluster.last_sent_at_utc
+                        ),
+                        answers=discovery.answers,
+                    )
             self._progress_completed += 1
             return result
 

@@ -37,10 +37,10 @@ _BATCH_OUTPUT_CONTRACT = """
 {
   "questions": [
     {
-      "source_message_ids": ["共同表达这个问题的一个或多个目标消息 ID"],
+      "question_message_ids": ["真正参与提出这个问题的一个或多个目标消息 ID"],
       "reason": "简短中文理由",
       "confidence": 0.0,
-      "canonical_question": "综合这些消息后，脱离聊天上下文也能理解的问题",
+      "canonical_question": "综合这些消息后的脱敏问题，不含姓名、昵称、账号或联系方式",
       "category": "知识分类；无法判断时为空字符串",
       "clarity": "CLEAR | UNCERTAIN",
       "knowledge_value": "HIGH | MEDIUM | LOW",
@@ -50,9 +50,11 @@ _BATCH_OUTPUT_CONTRACT = """
   "uncertain_questions": []
 }
 一个问题若由连续多条消息共同表达，必须合并成一个问题，
-并把这些目标消息 ID 都放进同一个 source_message_ids。
-只返回真正参与表达问题的消息；回答、旁聊、补充答案和其他未入选消息不要输出。
-questions、uncertain_questions 中的 source_message_ids 只能取自 target_message_ids，且不得重复归属。
+并把这些目标消息 ID 都放进同一个 question_message_ids。
+question_message_ids 只能包含提问本身：即使回答与问题紧密相关，也绝不能把回答、解释、猜测、
+补充答案或旁聊的消息 ID 放进去。它们只作为理解上下文的材料，不要输出。
+questions、uncertain_questions 中的 question_message_ids 只能取自 target_message_ids，
+且不得重复归属。
 不要求逐条返回所有 target_message_ids；没有返回的目标消息自动视为未入选。
 uncertain_questions 中每一项的对象结构与 questions 完全相同，仅放仍需独立复核的候选问题。
 context_only=true 的消息只用于理解上下文，不得出现在输出中。
@@ -306,7 +308,7 @@ def parse_scope_batch(
         for item in candidates:
             if not isinstance(item, dict):
                 raise ScopeAiResponseError(f"{field} 中每一项必须是对象")
-            source_ids = _required_string_list(item, "source_message_ids")
+            source_ids = _required_string_list(item, "question_message_ids")
             assessment = _scope_assessment_from_data({**item, "decision": decision.value})
             for message_id in source_ids:
                 if message_id not in expected:

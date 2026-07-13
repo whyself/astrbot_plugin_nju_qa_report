@@ -227,6 +227,8 @@ def test_report_versions_and_mail_delivery_are_idempotent(
         assert sent == ["reader@example.com"]
         rendered = Path(first.html_path).read_text(encoding="utf-8")
         assert "校园卡丢了怎么补办" in rendered
+        assert "问题表达（AI 已归纳脱敏）" in rendered
+        assert "群聊回答摘要（AI 已归纳脱敏，未经核实）" in rendered
         assert "message:" not in rendered
         assert "出现 1 次" not in rendered
         assert "出现次数" not in format_question_detail(

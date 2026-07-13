@@ -5,7 +5,9 @@ from datetime import date
 from pathlib import Path
 
 from nju_report.aggregation import QuestionAggregationService, _aggregate
+from nju_report.answer_agent import AnswerDiscoveryResult
 from nju_report.models import (
+    CommunityAnswer,
     QuestionCandidate,
     QuestionCluster,
     ScopeAssessment,
@@ -118,10 +120,13 @@ def test_answer_lookup_progress_counts_completed_clusters() -> None:
             del report_date, clusters
 
     class Agent:
-        async def collect(self, cluster, messages, *, excluded_message_ids):
-            del cluster, messages, excluded_message_ids
+        async def collect(self, cluster, messages):
+            from nju_report.answer_agent import AnswerDiscoveryResult
+
+            del messages
             await asyncio.sleep(0)
-            return ()
+            external_id = cluster.candidate_source_keys[0].rsplit(":", 1)[-1]
+            return AnswerDiscoveryResult((external_id,), ())
 
     async def run() -> None:
         service = QuestionAggregationService(  # type: ignore[arg-type]
@@ -133,6 +138,91 @@ def test_answer_lookup_progress_counts_completed_clusters() -> None:
         result = await service.aggregate_date(date(2026, 7, 12))
         assert len(result) == 2
         assert service.progress == ("2026-07-12", 2, 2)
+
+    asyncio.run(run())
+
+
+def test_answer_agent_repairs_overinclusive_question_sources_and_uses_summary() -> None:
+    class Storage:
+        saved: list[QuestionCluster] = []
+
+        def list_question_candidates(self, *, report_date: str, limit):
+            del report_date, limit
+            return (
+                [
+                    _candidate(
+                        "20260712-Q001",
+                        "message:qq:bot:q1",
+                        "[回复 王思喆] 校园卡丢了怎么办？",
+                        "南京大学校园卡丢失后如何补办？",
+                        "校园卡",
+                        100,
+                    ),
+                    _candidate(
+                        "20260712-Q002",
+                        "message:qq:bot:a1",
+                        "陶子秋说先挂失，再去服务点办理。",
+                        "南京大学校园卡丢失后如何补办？",
+                        "校园卡",
+                        101,
+                    ),
+                ],
+                2,
+            )
+
+        def messages_in_window(self, window):
+            del window
+            return [
+                _message("q1", 100, "u1", "[回复 王思喆] 校园卡丢了怎么办？"),
+                _message(
+                    "a1",
+                    101,
+                    "u2",
+                    "陶子秋说先挂失，再去服务点办理。",
+                    reply="q1",
+                ),
+            ]
+
+        def save_question_clusters(self, report_date: str, clusters):
+            del report_date
+            self.saved = list(clusters)
+
+    class Agent:
+        async def collect(self, cluster, messages):
+            del cluster, messages
+            return AnswerDiscoveryResult(
+                ("q1",),
+                (
+                    CommunityAnswer(
+                        external_message_id="summary:test",
+                        redacted_text="应先挂失，再前往服务点办理。",
+                        sent_at_utc=101,
+                        confidence=0.95,
+                        direct_reply=True,
+                    ),
+                ),
+            )
+
+    async def run() -> None:
+        storage = Storage()
+        service = QuestionAggregationService(  # type: ignore[arg-type]
+            storage,
+            Agent(),
+            timezone_name="Asia/Shanghai",
+            concurrency=1,
+        )
+
+        clusters = await service.aggregate_date(date(2026, 7, 12))
+
+        assert len(clusters) == 1
+        assert clusters[0].candidate_source_keys == ("message:qq:bot:q1",)
+        assert clusters[0].representative_questions == (
+            "南京大学校园卡丢失后如何补办？",
+        )
+        assert clusters[0].answers[0].redacted_text == "应先挂失，再前往服务点办理。"
+        assert "王思喆" not in clusters[0].representative_questions[0]
+        assert "陶子秋" not in clusters[0].answers[0].redacted_text
+        assert storage.saved == clusters
 
     asyncio.run(run())
 
