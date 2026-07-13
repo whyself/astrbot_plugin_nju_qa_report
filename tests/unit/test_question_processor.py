@@ -11,7 +11,7 @@ from nju_report.models import (
     StoredMessage,
 )
 from nju_report.question_export import QuestionCsvExporter
-from nju_report.question_processor import DailyQuestionProcessor
+from nju_report.question_processor import DailyQuestionProcessor, appears_to_seek_help
 from nju_report.storage import ReportStorage
 from nju_report.time_windows import natural_day_window
 
@@ -85,7 +85,7 @@ def test_daily_processor_retains_include_drop_and_error_and_skips_rerun(
     )
 
     first = asyncio.run(processor.process_date(report_date))
-    assert first.status == "COMPLETED"
+    assert first.status == "RETRY_PENDING"
     assert first.candidates_saved == 3
     assert first.included_count == 1
     assert first.dropped_count == 1
@@ -106,7 +106,7 @@ def test_daily_processor_retains_include_drop_and_error_and_skips_rerun(
     assert all(item.original_question for item in candidates)
 
     second = asyncio.run(processor.process_date(report_date))
-    assert second.skipped is True
+    assert second.status == "RETRY_PENDING"
     assert storage.question_candidate_count() == 3
     storage.close()
 
@@ -159,3 +159,11 @@ def test_cumulative_csv_contains_every_decision(tmp_path: Path) -> None:
     assert "已排除" in content
     assert not output.with_suffix(".csv.tmp").exists()
     storage.close()
+
+
+def test_deterministic_prefilter_keeps_implicit_help_and_drops_obvious_chat() -> None:
+    assert appears_to_seek_help("校园卡丢了") is True
+    assert appears_to_seek_help("统一认证进不去") is True
+    assert appears_to_seek_help("有人知道图书馆几点关门吗") is True
+    assert appears_to_seek_help("哈哈哈") is False
+    assert appears_to_seek_help("收到") is False

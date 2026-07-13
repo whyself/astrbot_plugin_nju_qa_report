@@ -84,6 +84,8 @@ class PluginConfig:
     smtp_use_ssl: bool = True
     mail_from: str = ""
     mail_recipients: tuple[str, ...] = ()
+    mail_subject_prefix: str = "NJU 知识库日报"
+    attach_full_html: bool = True
 
     def group_alias(self, group_id: str) -> str:
         """Return a configured group alias, falling back to a masked identifier."""
@@ -240,6 +242,8 @@ class PluginConfig:
                 raw.get("mail_recipients", ()),
                 "mail_recipients",
             ),
+            mail_subject_prefix=_string(raw, "mail_subject_prefix", "NJU 知识库日报"),
+            attach_full_html=_boolean(raw, "attach_full_html", True),
         )
 
 

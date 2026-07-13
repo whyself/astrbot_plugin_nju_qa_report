@@ -83,16 +83,23 @@ Access Token 只用于打开本机 QCE 页面，不要上传到 AstrBot、GitHub
 
 ```text
 /nju_collect status
+/nju_collect repo sync
 /nju_collect report run all
 ```
+
+`report run all` 会执行 AI 筛选、问题聚合、群友回答关联、知识库调查并生成 HTML，
+不会自动发邮件。历史消息很多时会产生较多模型调用，请保持 AstrBot 运行并等待完成。
 
 再按日期查看：
 
 ```text
 /nju_collect report status 2026-07-01
+/nju_collect report preview 2026-07-01
 /南哪日报 列表 2026-07-01
 /南哪日报 导出
 ```
+
+确认 HTML 内容后，如需发信再运行 `/nju_collect report send 2026-07-01`。
 
 确认导入成功后，可以从插件配置移除上传文件并保存。已经写入 SQLite 的消息不会因此删除，
 仍按 `raw_message_retention_days` 配置清理。

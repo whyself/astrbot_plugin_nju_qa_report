@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -12,15 +13,24 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .models import (
+    CommunityAnswer,
+    CoverageStatus,
+    EvidenceItem,
+    InvestigationResult,
+    KnowledgeChunk,
+    KnowledgeDocument,
+    MailDelivery,
     ProcessingWindowRecord,
     QuestionCandidate,
+    QuestionCluster,
+    ReportArtifact,
     ScopeAssessment,
     ScopeResolution,
     StoredMessage,
 )
 from .time_windows import TimeWindow
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 5
 
 
 class StorageError(RuntimeError):
@@ -239,6 +249,615 @@ class ReportStorage:
             )
             return max(0, cursor.rowcount)
 
+    def upsert_repository(
+        self,
+        namespace: str,
+        *,
+        display_name: str = "",
+        status: str,
+        excluded_reason: str = "",
+        last_error: str = "",
+        synced_at_utc: int | None = None,
+    ) -> None:
+        """Persist repository policy and synchronization state."""
+
+        now = int(time.time())
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO repositories (
+                    namespace, display_name, status, excluded_reason,
+                    last_error, synced_at_utc, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(namespace) DO UPDATE SET
+                    display_name = CASE
+                        WHEN excluded.display_name = '' THEN repositories.display_name
+                        ELSE excluded.display_name
+                    END,
+                    status = excluded.status,
+                    excluded_reason = excluded.excluded_reason,
+                    last_error = excluded.last_error,
+                    synced_at_utc = COALESCE(excluded.synced_at_utc, repositories.synced_at_utc),
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (
+                    namespace,
+                    display_name,
+                    status,
+                    excluded_reason,
+                    last_error[:1000],
+                    synced_at_utc,
+                    now,
+                ),
+            )
+
+    def repository_records(self) -> list[dict[str, object]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM repositories ORDER BY namespace").fetchall()
+        return [dict(row) for row in rows]
+
+    def replace_knowledge_document(
+        self,
+        document: KnowledgeDocument,
+        chunks: list[KnowledgeChunk],
+    ) -> bool:
+        """Upsert one document and replace chunks only when its body changed."""
+
+        now = int(time.time())
+        with self._transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT id, body_hash FROM knowledge_documents
+                WHERE namespace = ? AND yuque_id = ?
+                """,
+                (document.namespace, document.yuque_id),
+            ).fetchone()
+            changed = existing is None or str(existing["body_hash"]) != document.body_hash
+            connection.execute(
+                """
+                INSERT INTO knowledge_documents (
+                    namespace, yuque_id, title, slug, url, updated_at,
+                    body, body_hash, synced_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(namespace, yuque_id) DO UPDATE SET
+                    title = excluded.title,
+                    slug = excluded.slug,
+                    url = excluded.url,
+                    updated_at = excluded.updated_at,
+                    body = excluded.body,
+                    body_hash = excluded.body_hash,
+                    synced_at_utc = excluded.synced_at_utc
+                """,
+                (
+                    document.namespace,
+                    document.yuque_id,
+                    document.title,
+                    document.slug,
+                    document.url,
+                    document.updated_at,
+                    document.body,
+                    document.body_hash,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT id FROM knowledge_documents
+                WHERE namespace = ? AND yuque_id = ?
+                """,
+                (document.namespace, document.yuque_id),
+            ).fetchone()
+            if row is None:
+                raise StorageError("无法保存语雀文档")
+            document_id = int(row[0])
+            if changed:
+                connection.execute(
+                    "DELETE FROM knowledge_chunks WHERE document_row_id = ?",
+                    (document_id,),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO knowledge_chunks (
+                        chunk_id, document_row_id, chunk_index, content,
+                        content_hash, embedding_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            chunk.chunk_id,
+                            document_id,
+                            chunk.chunk_index,
+                            chunk.content,
+                            chunk.content_hash,
+                            json.dumps(chunk.embedding) if chunk.embedding else "",
+                        )
+                        for chunk in chunks
+                    ],
+                )
+            return changed
+
+    def knowledge_document_hash(self, namespace: str, yuque_id: str) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT body_hash FROM knowledge_documents
+                WHERE namespace = ? AND yuque_id = ?
+                """,
+                (namespace, yuque_id),
+            ).fetchone()
+        return str(row[0]) if row is not None else ""
+
+    def delete_missing_knowledge_documents(self, namespace: str, seen_ids: set[str]) -> int:
+        """Delete local documents no longer present in one approved repository."""
+
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT id, yuque_id FROM knowledge_documents WHERE namespace = ?",
+                (namespace,),
+            ).fetchall()
+            doomed = [int(row["id"]) for row in rows if str(row["yuque_id"]) not in seen_ids]
+            if doomed:
+                connection.executemany(
+                    "DELETE FROM knowledge_documents WHERE id = ?",
+                    [(item,) for item in doomed],
+                )
+            return len(doomed)
+
+    def purge_knowledge_repository(self, namespace: str) -> int:
+        """Remove all locally stored bodies and chunks for one repository."""
+
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM knowledge_documents WHERE namespace = ?",
+                (namespace,),
+            )
+            return max(0, cursor.rowcount)
+
+    def knowledge_chunks(self, allowed_namespaces: tuple[str, ...]) -> list[KnowledgeChunk]:
+        """Return searchable chunks, always filtered by the current allowlist."""
+
+        if not allowed_namespaces:
+            return []
+        placeholders = ",".join("?" for _ in allowed_namespaces)
+        sql = f"""
+            SELECT
+                c.chunk_id, c.chunk_index, c.content, c.content_hash,
+                c.embedding_json, d.namespace, d.yuque_id, d.title,
+                d.url, d.updated_at
+            FROM knowledge_chunks c
+            JOIN knowledge_documents d ON d.id = c.document_row_id
+            WHERE d.namespace IN ({placeholders})
+            ORDER BY d.namespace, d.id, c.chunk_index
+        """  # noqa: S608
+        with self._lock:
+            rows = self._conn.execute(sql, allowed_namespaces).fetchall()
+        result: list[KnowledgeChunk] = []
+        for row in rows:
+            embedding: tuple[float, ...] = ()
+            if row["embedding_json"]:
+                try:
+                    values = json.loads(row["embedding_json"])
+                    embedding = tuple(float(item) for item in values)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    embedding = ()
+            result.append(
+                KnowledgeChunk(
+                    chunk_id=row["chunk_id"],
+                    namespace=row["namespace"],
+                    document_id=row["yuque_id"],
+                    title=row["title"],
+                    source_url=row["url"],
+                    updated_at=row["updated_at"],
+                    chunk_index=int(row["chunk_index"]),
+                    content=row["content"],
+                    content_hash=row["content_hash"],
+                    embedding=embedding,
+                )
+            )
+        return result
+
+    def knowledge_counts(
+        self,
+        allowed_namespaces: tuple[str, ...] | None = None,
+    ) -> tuple[int, int]:
+        where = ""
+        params: tuple[str, ...] = ()
+        if allowed_namespaces is not None:
+            if not allowed_namespaces:
+                return 0, 0
+            placeholders = ",".join("?" for _ in allowed_namespaces)
+            where = f" WHERE namespace IN ({placeholders})"  # noqa: S608
+            params = allowed_namespaces
+        with self._lock:
+            documents = self._conn.execute(
+                f"SELECT COUNT(*) FROM knowledge_documents{where}",  # noqa: S608
+                params,
+            ).fetchone()[0]
+            chunks = self._conn.execute(
+                f"""
+                SELECT COUNT(*) FROM knowledge_chunks c
+                JOIN knowledge_documents d ON d.id = c.document_row_id
+                {where.replace("namespace", "d.namespace")}
+                """,  # noqa: S608
+                params,
+            ).fetchone()[0]
+        return int(documents), int(chunks)
+
+    def save_question_clusters(self, report_date: str, clusters: list[QuestionCluster]) -> None:
+        """Replace one date's deterministic aggregation and answer associations."""
+
+        now = int(time.time())
+        active_codes = {item.question_code for item in clusters}
+        with self._transaction() as connection:
+            for cluster in clusters:
+                connection.execute(
+                    """
+                    INSERT INTO question_clusters (
+                        report_date, question_code, canonical_question, category,
+                        occurrence_count, group_aliases_json,
+                        representative_questions_json, first_sent_at_utc,
+                        last_sent_at_utc, updated_at_utc, created_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(question_code) DO UPDATE SET
+                        canonical_question = excluded.canonical_question,
+                        category = excluded.category,
+                        occurrence_count = excluded.occurrence_count,
+                        group_aliases_json = excluded.group_aliases_json,
+                        representative_questions_json = excluded.representative_questions_json,
+                        first_sent_at_utc = excluded.first_sent_at_utc,
+                        last_sent_at_utc = excluded.last_sent_at_utc,
+                        updated_at_utc = excluded.updated_at_utc
+                    """,
+                    (
+                        cluster.report_date,
+                        cluster.question_code,
+                        cluster.canonical_question,
+                        cluster.category,
+                        cluster.occurrence_count,
+                        json.dumps(cluster.group_aliases, ensure_ascii=False),
+                        json.dumps(cluster.representative_questions, ensure_ascii=False),
+                        cluster.first_sent_at_utc,
+                        cluster.last_sent_at_utc,
+                        now,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT id FROM question_clusters WHERE question_code = ?",
+                    (cluster.question_code,),
+                ).fetchone()
+                if row is None:
+                    raise StorageError("无法保存聚合问题")
+                cluster_id = int(row[0])
+                connection.execute(
+                    "DELETE FROM cluster_candidates WHERE cluster_id = ?",
+                    (cluster_id,),
+                )
+                for source_key in cluster.candidate_source_keys:
+                    candidate = connection.execute(
+                        "SELECT id FROM question_candidates WHERE source_key = ?",
+                        (source_key,),
+                    ).fetchone()
+                    if candidate is None:
+                        raise StorageError("聚合问题引用了不存在的候选记录")
+                    connection.execute(
+                        """
+                        INSERT INTO cluster_candidates(cluster_id, candidate_id)
+                        VALUES (?, ?)
+                        """,
+                        (cluster_id, int(candidate[0])),
+                    )
+                connection.execute(
+                    "DELETE FROM community_answers WHERE cluster_id = ?",
+                    (cluster_id,),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO community_answers (
+                        cluster_id, external_message_id, redacted_text,
+                        sent_at_utc, confidence, direct_reply
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            cluster_id,
+                            answer.external_message_id,
+                            answer.redacted_text,
+                            answer.sent_at_utc,
+                            answer.confidence,
+                            int(answer.direct_reply),
+                        )
+                        for answer in cluster.answers
+                    ],
+                )
+            stale = connection.execute(
+                "SELECT id, question_code FROM question_clusters WHERE report_date = ?",
+                (report_date,),
+            ).fetchall()
+            connection.executemany(
+                "DELETE FROM question_clusters WHERE id = ?",
+                [
+                    (int(row["id"]),)
+                    for row in stale
+                    if str(row["question_code"]) not in active_codes
+                ],
+            )
+
+    def list_question_clusters(self, report_date: str) -> list[QuestionCluster]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM question_clusters
+                WHERE report_date = ? ORDER BY question_code
+                """,
+                (report_date,),
+            ).fetchall()
+            return [self._cluster_from_row(row) for row in rows]
+
+    def get_question_cluster(self, question_code: str) -> QuestionCluster | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM question_clusters WHERE question_code = ?",
+                (question_code.strip().upper(),),
+            ).fetchone()
+            return self._cluster_from_row(row) if row is not None else None
+
+    def _cluster_from_row(self, row: sqlite3.Row) -> QuestionCluster:
+        cluster_id = int(row["id"])
+        source_rows = self._conn.execute(
+            """
+            SELECT q.source_key
+            FROM cluster_candidates cc
+            JOIN question_candidates q ON q.id = cc.candidate_id
+            WHERE cc.cluster_id = ? ORDER BY q.sent_at_utc, q.id
+            """,
+            (cluster_id,),
+        ).fetchall()
+        answer_rows = self._conn.execute(
+            """
+            SELECT * FROM community_answers
+            WHERE cluster_id = ? ORDER BY sent_at_utc, id
+            """,
+            (cluster_id,),
+        ).fetchall()
+        return QuestionCluster(
+            question_code=str(row["question_code"]),
+            report_date=str(row["report_date"]),
+            canonical_question=str(row["canonical_question"]),
+            category=str(row["category"]),
+            candidate_source_keys=tuple(str(item[0]) for item in source_rows),
+            representative_questions=tuple(json.loads(row["representative_questions_json"])),
+            group_aliases=tuple(json.loads(row["group_aliases_json"])),
+            first_sent_at_utc=int(row["first_sent_at_utc"]),
+            last_sent_at_utc=int(row["last_sent_at_utc"]),
+            answers=tuple(
+                CommunityAnswer(
+                    external_message_id=str(item["external_message_id"]),
+                    redacted_text=str(item["redacted_text"]),
+                    sent_at_utc=int(item["sent_at_utc"]),
+                    confidence=float(item["confidence"]),
+                    direct_reply=bool(item["direct_reply"]),
+                )
+                for item in answer_rows
+            ),
+        )
+
+    def save_investigation(self, result: InvestigationResult) -> int:
+        """Append one auditable investigation version for a cluster."""
+
+        with self._transaction() as connection:
+            cluster = connection.execute(
+                "SELECT id FROM question_clusters WHERE question_code = ?",
+                (result.question_code,),
+            ).fetchone()
+            if cluster is None:
+                raise StorageError("调查结果引用了不存在的聚合问题")
+            cluster_id = int(cluster[0])
+            row = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM investigations WHERE cluster_id = ?",
+                (cluster_id,),
+            ).fetchone()
+            version = int(row[0]) + 1
+            connection.execute(
+                """
+                INSERT INTO investigations (
+                    cluster_id, version, status, summary, missing_information,
+                    recommendation, evidence_json, flags_json, queries_json,
+                    error_summary, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cluster_id,
+                    version,
+                    result.status.value,
+                    result.summary,
+                    result.missing_information,
+                    result.recommendation,
+                    json.dumps(
+                        [
+                            {
+                                "namespace": item.namespace,
+                                "document_id": item.document_id,
+                                "title": item.title,
+                                "source_url": item.source_url,
+                                "updated_at": item.updated_at,
+                                "excerpt": item.excerpt,
+                            }
+                            for item in result.evidence
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(result.flags, ensure_ascii=False),
+                    json.dumps(result.queries, ensure_ascii=False),
+                    result.error_summary[:1000],
+                    int(time.time()),
+                ),
+            )
+            return version
+
+    def latest_investigation(self, question_code: str) -> InvestigationResult | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT i.*, q.question_code
+                FROM investigations i
+                JOIN question_clusters q ON q.id = i.cluster_id
+                WHERE q.question_code = ?
+                ORDER BY i.version DESC LIMIT 1
+                """,
+                (question_code.strip().upper(),),
+            ).fetchone()
+        return _investigation_from_row(row) if row is not None else None
+
+    def investigations_for_date(self, report_date: str) -> dict[str, InvestigationResult]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT i.*, q.question_code
+                FROM investigations i
+                JOIN question_clusters q ON q.id = i.cluster_id
+                JOIN (
+                    SELECT cluster_id, MAX(version) AS version
+                    FROM investigations GROUP BY cluster_id
+                ) latest ON latest.cluster_id = i.cluster_id AND latest.version = i.version
+                WHERE q.report_date = ?
+                """,
+                (report_date,),
+            ).fetchall()
+        return {str(row["question_code"]): _investigation_from_row(row) for row in rows}
+
+    def save_report(
+        self,
+        *,
+        report_date: str,
+        subject: str,
+        html_path: str,
+        summary_json: str,
+        status: str = "READY",
+    ) -> ReportArtifact:
+        """Freeze a new report version, or return an identical existing version."""
+
+        now = int(time.time())
+        with self._transaction() as connection:
+            identical = connection.execute(
+                """
+                SELECT * FROM reports
+                WHERE report_date = ? AND subject = ? AND html_path = ?
+                    AND summary_json = ? AND status = ?
+                ORDER BY version DESC LIMIT 1
+                """,
+                (report_date, subject, html_path, summary_json, status),
+            ).fetchone()
+            if identical is not None:
+                return _report_from_row(identical)
+            row = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM reports WHERE report_date = ?",
+                (report_date,),
+            ).fetchone()
+            version = int(row[0]) + 1
+            cursor = connection.execute(
+                """
+                INSERT INTO reports (
+                    report_date, version, status, subject, html_path,
+                    summary_json, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (report_date, version, status, subject, html_path, summary_json, now),
+            )
+            created = connection.execute(
+                "SELECT * FROM reports WHERE id = ?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+            if created is None:
+                raise StorageError("无法保存日报")
+            return _report_from_row(created)
+
+    def latest_report(self, report_date: str) -> ReportArtifact | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM reports WHERE report_date = ?
+                ORDER BY version DESC LIMIT 1
+                """,
+                (report_date,),
+            ).fetchone()
+        return _report_from_row(row) if row is not None else None
+
+    def begin_mail_delivery(self, report_id: int, recipient_hash: str) -> bool:
+        """Claim a recipient delivery unless it already completed successfully."""
+
+        now = int(time.time())
+        with self._transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT status FROM mail_deliveries
+                WHERE report_id = ? AND recipient_hash = ?
+                """,
+                (report_id, recipient_hash),
+            ).fetchone()
+            if existing is not None and str(existing["status"]) == "SENT":
+                return False
+            connection.execute(
+                """
+                INSERT INTO mail_deliveries (
+                    report_id, recipient_hash, status, attempts,
+                    error_summary, sent_at_utc, updated_at_utc
+                ) VALUES (?, ?, 'SENDING', 1, '', NULL, ?)
+                ON CONFLICT(report_id, recipient_hash) DO UPDATE SET
+                    status = 'SENDING', attempts = mail_deliveries.attempts + 1,
+                    error_summary = '', updated_at_utc = excluded.updated_at_utc
+                """,
+                (report_id, recipient_hash, now),
+            )
+            return True
+
+    def complete_mail_delivery(
+        self,
+        report_id: int,
+        recipient_hash: str,
+        *,
+        error_summary: str = "",
+    ) -> None:
+        status = "FAILED" if error_summary else "SENT"
+        sent_at = None if error_summary else int(time.time())
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                UPDATE mail_deliveries
+                SET status = ?, error_summary = ?, sent_at_utc = ?, updated_at_utc = ?
+                WHERE report_id = ? AND recipient_hash = ?
+                """,
+                (
+                    status,
+                    error_summary[:1000],
+                    sent_at,
+                    int(time.time()),
+                    report_id,
+                    recipient_hash,
+                ),
+            )
+
+    def mail_deliveries(self, report_id: int) -> list[MailDelivery]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM mail_deliveries
+                WHERE report_id = ? ORDER BY recipient_hash
+                """,
+                (report_id,),
+            ).fetchall()
+        return [
+            MailDelivery(
+                report_id=int(row["report_id"]),
+                recipient_hash=str(row["recipient_hash"]),
+                status=str(row["status"]),
+                attempts=int(row["attempts"]),
+                error_summary=str(row["error_summary"]),
+                sent_at_utc=(int(row["sent_at_utc"]) if row["sent_at_utc"] is not None else None),
+            )
+            for row in rows
+        ]
+
     def messages_in_window(
         self,
         window: TimeWindow,
@@ -359,16 +978,18 @@ class ReportStorage:
     ) -> None:
         """Atomically persist successful run totals."""
 
+        final_status = "COMPLETED" if error_count == 0 else "RETRY_PENDING"
         with self._transaction() as connection:
             cursor = connection.execute(
                 """
                 UPDATE processing_windows
-                SET status = 'COMPLETED', messages_scanned = ?, candidates_saved = ?,
+                SET status = ?, messages_scanned = ?, candidates_saved = ?,
                     included_count = ?, dropped_count = ?, error_count = ?,
                     error_summary = '', updated_at_utc = ?
                 WHERE report_date = ? AND status = 'RUNNING'
                 """,
                 (
+                    final_status,
                     messages_scanned,
                     candidates_saved,
                     included_count,
@@ -746,6 +1367,27 @@ class ReportStorage:
                     "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
                     (2, int(time.time())),
                 )
+                version = 2
+            if version < 3:
+                self._migration_v3(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+                    (3, int(time.time())),
+                )
+                version = 3
+            if version < 4:
+                self._migration_v4(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+                    (4, int(time.time())),
+                )
+                version = 4
+            if version < 5:
+                self._migration_v5(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+                    (5, int(time.time())),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -868,9 +1510,168 @@ class ReportStorage:
         connection.execute(
             "CREATE UNIQUE INDEX idx_question_candidates_code ON question_candidates(question_code)"
         )
+
+    @staticmethod
+    def _migration_v3(connection: sqlite3.Connection) -> None:
+        """Add allowlisted Yuque repository, document, and chunk storage."""
+
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS repositories (
+                namespace TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                excluded_reason TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                synced_at_utc INTEGER,
+                updated_at_utc INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS knowledge_documents (
+                id INTEGER PRIMARY KEY,
+                namespace TEXT NOT NULL,
+                yuque_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                url TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                body TEXT NOT NULL,
+                body_hash TEXT NOT NULL,
+                synced_at_utc INTEGER NOT NULL,
+                UNIQUE(namespace, yuque_id)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_knowledge_documents_namespace
+                ON knowledge_documents(namespace)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS knowledge_chunks (
+                id INTEGER PRIMARY KEY,
+                chunk_id TEXT NOT NULL UNIQUE,
+                document_row_id INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                embedding_json TEXT NOT NULL DEFAULT '',
+                UNIQUE(document_row_id, chunk_index),
+                FOREIGN KEY(document_row_id)
+                    REFERENCES knowledge_documents(id)
+                    ON DELETE CASCADE
+            )
+            """,
+        )
+        for statement in statements:
+            connection.execute(statement)
         connection.execute(
             "CREATE INDEX idx_question_candidates_date ON question_candidates(report_date, id)"
         )
+
+    @staticmethod
+    def _migration_v4(connection: sqlite3.Connection) -> None:
+        """Add clustered questions, community answers, and investigation history."""
+
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS question_clusters (
+                id INTEGER PRIMARY KEY,
+                report_date TEXT NOT NULL,
+                question_code TEXT NOT NULL UNIQUE,
+                canonical_question TEXT NOT NULL,
+                category TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL,
+                group_aliases_json TEXT NOT NULL,
+                representative_questions_json TEXT NOT NULL,
+                first_sent_at_utc INTEGER NOT NULL,
+                last_sent_at_utc INTEGER NOT NULL,
+                updated_at_utc INTEGER NOT NULL,
+                created_at_utc INTEGER NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_question_clusters_date
+                ON question_clusters(report_date, question_code)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS cluster_candidates (
+                cluster_id INTEGER NOT NULL,
+                candidate_id INTEGER NOT NULL UNIQUE,
+                PRIMARY KEY(cluster_id, candidate_id),
+                FOREIGN KEY(cluster_id) REFERENCES question_clusters(id) ON DELETE CASCADE,
+                FOREIGN KEY(candidate_id) REFERENCES question_candidates(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS community_answers (
+                id INTEGER PRIMARY KEY,
+                cluster_id INTEGER NOT NULL,
+                external_message_id TEXT NOT NULL,
+                redacted_text TEXT NOT NULL,
+                sent_at_utc INTEGER NOT NULL,
+                confidence REAL NOT NULL,
+                direct_reply INTEGER NOT NULL CHECK(direct_reply IN (0, 1)),
+                UNIQUE(cluster_id, external_message_id),
+                FOREIGN KEY(cluster_id) REFERENCES question_clusters(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS investigations (
+                id INTEGER PRIMARY KEY,
+                cluster_id INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                missing_information TEXT NOT NULL,
+                recommendation TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                flags_json TEXT NOT NULL,
+                queries_json TEXT NOT NULL,
+                error_summary TEXT NOT NULL,
+                created_at_utc INTEGER NOT NULL,
+                UNIQUE(cluster_id, version),
+                FOREIGN KEY(cluster_id) REFERENCES question_clusters(id) ON DELETE CASCADE
+            )
+            """,
+        )
+        for statement in statements:
+            connection.execute(statement)
+
+    @staticmethod
+    def _migration_v5(connection: sqlite3.Connection) -> None:
+        """Add frozen report versions and idempotent per-recipient delivery state."""
+
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY,
+                report_date TEXT NOT NULL,
+                version INTEGER NOT NULL CHECK(version >= 1),
+                status TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                html_path TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                created_at_utc INTEGER NOT NULL,
+                UNIQUE(report_date, version)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS mail_deliveries (
+                id INTEGER PRIMARY KEY,
+                report_id INTEGER NOT NULL,
+                recipient_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error_summary TEXT NOT NULL DEFAULT '',
+                sent_at_utc INTEGER,
+                updated_at_utc INTEGER NOT NULL,
+                UNIQUE(report_id, recipient_hash),
+                FOREIGN KEY(report_id) REFERENCES reports(id) ON DELETE CASCADE
+            )
+            """,
+        )
+        for statement in statements:
+            connection.execute(statement)
 
 
 def _candidate_from_row(row: sqlite3.Row) -> QuestionCandidate:
@@ -890,6 +1691,45 @@ def _candidate_from_row(row: sqlite3.Row) -> QuestionCandidate:
         sent_at_utc=int(row["sent_at_utc"]),
         created_at_utc=int(row["created_at_utc"]),
         updated_at_utc=int(row["updated_at_utc"]),
+    )
+
+
+def _investigation_from_row(row: sqlite3.Row) -> InvestigationResult:
+    evidence_data = json.loads(row["evidence_json"])
+    return InvestigationResult(
+        question_code=str(row["question_code"]),
+        status=CoverageStatus(str(row["status"])),
+        summary=str(row["summary"]),
+        missing_information=str(row["missing_information"]),
+        recommendation=str(row["recommendation"]),
+        evidence=tuple(
+            EvidenceItem(
+                namespace=str(item.get("namespace", "")),
+                document_id=str(item.get("document_id", "")),
+                title=str(item.get("title", "")),
+                source_url=str(item.get("source_url", "")),
+                updated_at=str(item.get("updated_at", "")),
+                excerpt=str(item.get("excerpt", "")),
+            )
+            for item in evidence_data
+            if isinstance(item, dict)
+        ),
+        flags=tuple(str(item) for item in json.loads(row["flags_json"])),
+        queries=tuple(str(item) for item in json.loads(row["queries_json"])),
+        error_summary=str(row["error_summary"]),
+    )
+
+
+def _report_from_row(row: sqlite3.Row) -> ReportArtifact:
+    return ReportArtifact(
+        report_id=int(row["id"]),
+        report_date=str(row["report_date"]),
+        version=int(row["version"]),
+        status=str(row["status"]),
+        subject=str(row["subject"]),
+        html_path=str(row["html_path"]),
+        summary_json=str(row["summary_json"]),
+        created_at_utc=int(row["created_at_utc"]),
     )
 
 

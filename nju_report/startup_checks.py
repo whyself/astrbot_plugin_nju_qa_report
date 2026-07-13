@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import smtplib
 import urllib.request
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ class StartupCheckService:
         scope_review_service: AutoScopeReviewService,
         astrbot_context: Any,
         export_dir: Path,
+        embedding_probe: Callable[[], Awaitable[int]] | None = None,
     ) -> None:
         self._config = config
         self._storage = storage
@@ -42,11 +44,13 @@ class StartupCheckService:
         self._scope_review_service = scope_review_service
         self._context = astrbot_context
         self._export_dir = Path(export_dir)
+        self._embedding_probe = embedding_probe
 
     async def run(self, *, live: bool = False) -> list[StartupCheck]:
         checks = await asyncio.to_thread(self._local_checks)
         if live:
             checks.append(await self._check_llm_live())
+            checks.append(await self._check_embedding_live())
             checks.append(await asyncio.to_thread(self._check_yuque_live))
             checks.append(await asyncio.to_thread(self._check_smtp_live))
         return checks
@@ -199,6 +203,19 @@ class StartupCheckService:
             return StartupCheck("FAIL", "实连：对话模型", detail)
         return StartupCheck("PASS", "实连：对话模型", "调用和结构化结果正常")
 
+    async def _check_embedding_live(self) -> StartupCheck:
+        if not self._config.enable_vector_search:
+            return StartupCheck("WARN", "实连：Embedding", "向量检索已关闭，跳过")
+        if not self._config.embedding_api_key or not self._config.embedding_base_url:
+            return StartupCheck("WARN", "实连：Embedding", "未完整配置，已跳过")
+        if self._embedding_probe is None:
+            return StartupCheck("FAIL", "实连：Embedding", "插件未注册向量探针")
+        try:
+            dimensions = await self._embedding_probe()
+        except Exception as exc:
+            return StartupCheck("FAIL", "实连：Embedding", type(exc).__name__)
+        return StartupCheck("PASS", "实连：Embedding", f"调用正常，返回 {dimensions} 维向量")
+
     def _check_yuque_live(self) -> StartupCheck:
         if not self._config.yuque_token:
             return StartupCheck("WARN", "实连：语雀", "未配置，已跳过")
@@ -244,6 +261,9 @@ class StartupCheckService:
                 )
             with client:
                 client.ehlo()
+                if not self._config.smtp_use_ssl:
+                    client.starttls()
+                    client.ehlo()
                 if self._config.smtp_username:
                     client.login(
                         self._config.smtp_username,

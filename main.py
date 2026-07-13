@@ -13,8 +13,11 @@ from astrbot.api import message_components as Comp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .nju_report.aggregation import QuestionAggregationService
 from .nju_report.capture_writer import AsyncCaptureWriter
 from .nju_report.config import PluginConfig
+from .nju_report.investigation import AstrBotInvestigationAiClient, InvestigationService
+from .nju_report.knowledge import KnowledgeError, KnowledgeService
 from .nju_report.message_capture import MessageCaptureService
 from .nju_report.models import MessageEnvelope
 from .nju_report.permissions import PermissionAction, PermissionService
@@ -22,13 +25,14 @@ from .nju_report.qce_import import QceHistoryImporter, QceImportError
 from .nju_report.question_export import DECISION_LABELS, QuestionCsvExporter
 from .nju_report.question_processor import (
     DailyQuestionProcessor,
-    DailyRunResult,
     today_in_timezone,
 )
+from .nju_report.reporting import ReportService, coverage_label, format_question_detail
 from .nju_report.scope_ai import AstrBotScopeAiClient
 from .nju_report.scope_classifier import AutoScopeReviewService
 from .nju_report.startup_checks import StartupCheckService, format_startup_checks
 from .nju_report.storage import ReportStorage
+from .nju_report.workflow import DailyReportWorkflow, DailyScheduler, FullReportRunResult
 
 PLUGIN_NAME = "astrbot_plugin_nju_qa_report"
 REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
@@ -38,7 +42,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.1.3",
+    "0.2.0",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -88,6 +92,43 @@ class NjuQaReportPlugin(Star):
             self.storage,
             base_dir=self._data_dir,
         )
+        self.knowledge_service = KnowledgeService(self.runtime_config, self.storage)
+        self.aggregation_service = QuestionAggregationService(
+            self.storage,
+            timezone_name=self.runtime_config.timezone,
+        )
+        investigation_ai = AstrBotInvestigationAiClient(
+            context,
+            provider_id=self.runtime_config.llm_provider_id,
+            timeout_seconds=self.runtime_config.request_timeout_seconds,
+            max_retries=self.runtime_config.max_retries,
+        )
+        self.investigation_service = InvestigationService(
+            self.runtime_config,
+            self.storage,
+            self.knowledge_service,
+            investigation_ai,
+        )
+        self.report_service = ReportService(
+            self.runtime_config,
+            self.storage,
+            self._data_dir / "reports",
+        )
+        self.workflow = DailyReportWorkflow(
+            self.storage,
+            self.question_processor,
+            self.aggregation_service,
+            self.investigation_service,
+            self.report_service,
+            self.knowledge_service,
+            timezone_name=self.runtime_config.timezone,
+        )
+        self.scheduler = DailyScheduler(
+            self.workflow,
+            timezone_name=self.runtime_config.timezone,
+            report_time=self.runtime_config.daily_report_time,
+            enabled=self.runtime_config.daily_report_enabled,
+        )
         self.startup_checks = StartupCheckService(
             config=self.runtime_config,
             storage=self.storage,
@@ -95,6 +136,7 @@ class NjuQaReportPlugin(Star):
             scope_review_service=self.scope_review_service,
             astrbot_context=context,
             export_dir=self._data_dir / "exports",
+            embedding_probe=self.knowledge_service.test_embedding,
         )
 
     async def initialize(self) -> None:
@@ -106,6 +148,7 @@ class NjuQaReportPlugin(Star):
         if deleted:
             logger.info("NJU report pruned %s expired raw messages", deleted)
         self.capture_writer.start()
+        self.scheduler.start()
         capture_state = "已启用" if self.runtime_config.capture_enabled else "未启用"
         logger.info("NJU QA report plugin loaded; message capture %s", capture_state)
 
@@ -196,6 +239,33 @@ class NjuQaReportPlugin(Star):
             yield event.plain_result(str(exc))
             return
         page_size = 20
+        if report_date is not None:
+            clusters = await asyncio.to_thread(
+                self.storage.list_question_clusters,
+                report_date,
+            )
+            if clusters:
+                start = (page - 1) * page_size
+                shown = clusters[start : start + page_size]
+                if not shown:
+                    yield event.plain_result("没有符合该日期和页码的聚合问题。")
+                    return
+                investigations = await asyncio.to_thread(
+                    self.storage.investigations_for_date,
+                    report_date,
+                )
+                total_pages = max(1, (len(clusters) + page_size - 1) // page_size)
+                lines = [f"日报问题（第 {page}/{total_pages} 页，共 {len(clusters)} 条）"]
+                for cluster in shown:
+                    result = investigations.get(cluster.question_code)
+                    label = coverage_label(result.status) if result else "尚未调查"
+                    lines.append(
+                        f"{cluster.question_code}｜{label}｜出现 {cluster.occurrence_count} 次\n"
+                        f"{_shorten(cluster.canonical_question, 80)}"
+                    )
+                lines.append("私聊发送 /南哪日报 查看 <问题编号> 可看详细报告。")
+                yield event.plain_result("\n\n".join(lines))
+                return
         candidates, total = await asyncio.to_thread(
             self.storage.list_question_candidates,
             report_date=report_date,
@@ -231,10 +301,21 @@ class NjuQaReportPlugin(Star):
         if not question_code:
             yield event.plain_result("请提供问题编号，例如：/南哪日报 查看 20260712-Q001")
             return
-        candidate = await asyncio.to_thread(
-            self.storage.get_question_candidate,
-            question_code,
-        )
+        cluster = await asyncio.to_thread(self.storage.get_question_cluster, question_code)
+        if cluster is not None:
+            investigation = await asyncio.to_thread(
+                self.storage.latest_investigation,
+                question_code,
+            )
+            yield event.plain_result(
+                format_question_detail(
+                    cluster,
+                    investigation,
+                    timezone_name=self.runtime_config.timezone,
+                )
+            )
+            return
+        candidate = await asyncio.to_thread(self.storage.get_question_candidate, question_code)
         if candidate is None:
             yield event.plain_result("没有找到该问题编号。")
             return
@@ -317,6 +398,97 @@ class NjuQaReportPlugin(Star):
     @nju_collect.group("import")
     def nju_collect_import(self):
         """Import QQ Chat Exporter history files."""
+
+    @nju_collect.group("repo")
+    def nju_collect_repo(self):
+        """Manage allowlisted Yuque knowledge repositories."""
+
+    @nju_collect_repo.command("sync")
+    async def operator_repo_sync(self, event: AstrMessageEvent):
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.OPERATE,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
+        if self.knowledge_service.syncing:
+            yield event.plain_result("已有语雀同步任务正在运行。")
+            return
+        try:
+            result = await self.knowledge_service.sync_all()
+        except KnowledgeError as exc:
+            yield event.plain_result(f"语雀同步失败：{exc}")
+            return
+        lines = ["语雀允许仓库同步完成"]
+        for item in result.repositories:
+            lines.append(
+                f"{item.namespace}\n"
+                f"文档 {item.documents_seen}；更新 {item.documents_changed}；"
+                f"未变 {item.documents_unchanged}；删除 {item.documents_deleted}；"
+                f"分块 {item.chunks_written}；向量 {item.embeddings_written}；"
+                f"失败 {len(item.failures)}"
+            )
+        if result.excluded_purged:
+            lines.append(
+                "排除仓库清理："
+                + "、".join(
+                    f"{namespace} {count} 篇"
+                    for namespace, count in sorted(result.excluded_purged.items())
+                )
+            )
+        yield event.plain_result("\n\n".join(lines))
+
+    @nju_collect_repo.command("status")
+    async def operator_repo_status(self, event: AstrMessageEvent):
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.OPERATE,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
+        records = await asyncio.to_thread(self.storage.repository_records)
+        documents, chunks = await asyncio.to_thread(self.storage.knowledge_counts)
+        lines = [f"本地知识库：文档 {documents}，分块 {chunks}"]
+        if not records:
+            lines.append("尚未运行语雀同步。")
+        for item in records:
+            lines.append(
+                f"{item['namespace']}｜{item['status']}｜{item['display_name'] or '未同步名称'}"
+            )
+        yield event.plain_result("\n".join(lines))
+
+    @nju_collect_repo.command("search")
+    async def operator_repo_search(self, event: AstrMessageEvent):
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.OPERATE,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
+        query = _command_tail(event.get_message_str(), "nju_collect repo search")
+        if not query:
+            yield event.plain_result("用法：/nju_collect repo search 校园卡补办")
+            return
+        hits = await self.knowledge_service.search(query, limit=5)
+        if not hits:
+            yield event.plain_result("允许仓库中没有检索到结果；请先运行 repo sync。")
+            return
+        lines = [f"本地混合检索：{query}"]
+        for index, hit in enumerate(hits, start=1):
+            lines.append(
+                f"{index}. {hit.chunk.title}｜{hit.chunk.namespace}｜{hit.score:.3f}\n"
+                f"{_shorten(hit.chunk.content, 180)}\n{hit.chunk.source_url}"
+            )
+        yield event.plain_result("\n\n".join(lines))
 
     @nju_collect_import.command("inspect")
     async def operator_import_inspect(self, event: AstrMessageEvent):
@@ -402,7 +574,7 @@ class NjuQaReportPlugin(Star):
                 "/nju_collect report run all"
             )
             return
-        if self.question_processor.running:
+        if self.workflow.running:
             yield event.plain_result("已有日报批处理正在运行，请稍后查询状态。")
             return
         try:
@@ -410,26 +582,117 @@ class NjuQaReportPlugin(Star):
         except TimeoutError:
             logger.warning("NJU report run started with capture messages still pending")
 
+        try:
+            await self.workflow.sync_knowledge()
+        except KnowledgeError as exc:
+            yield event.plain_result(f"知识库同步失败，日报未开始：{exc}")
+            return
+
         current_date = today_in_timezone(self.runtime_config.timezone)
         normalized = tail.lower()
-        if normalized in {"all", "全部"}:
-            results = await self.question_processor.process_all_history(before_date=current_date)
-        else:
-            try:
+        try:
+            if normalized in {"all", "全部"}:
+                results = await self.workflow.run_all_history(before_date=current_date)
+            else:
                 requested_date = date.fromisoformat(tail)
-            except ValueError:
-                yield event.plain_result("日期必须使用 YYYY-MM-DD，或填写 all/全部。")
-                return
-            if requested_date >= current_date:
-                yield event.plain_result("只能处理已经结束的自然日，不能锁定今天或未来日期。")
-                return
-            results = [await self.question_processor.process_date(requested_date)]
+                if requested_date >= current_date:
+                    yield event.plain_result("只能处理已经结束的自然日，不能锁定今天或未来日期。")
+                    return
+                results = [await self.workflow.run_date(requested_date)]
+        except ValueError:
+            yield event.plain_result("日期必须使用 YYYY-MM-DD，或填写 all/全部。")
+            return
+        except Exception as exc:
+            logger.exception("NJU full report processing failed")
+            yield event.plain_result(f"完整日报处理失败：{type(exc).__name__}")
+            return
 
         if not results:
             yield event.plain_result("本地没有可处理的历史聊天日期。")
             return
         await asyncio.to_thread(self.question_exporter.export_all)
-        yield event.plain_result(_format_run_results(results))
+        yield event.plain_result(_format_full_run_results(results))
+
+    @nju_collect_report.command("preview")
+    async def operator_report_preview(self, event: AstrMessageEvent):
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.OPERATE,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
+        tail = _command_tail(event.get_message_str(), "nju_collect report preview")
+        try:
+            requested_date = date.fromisoformat(tail)
+        except ValueError:
+            yield event.plain_result("请提供日期，例如：/nju_collect report preview 2026-07-12")
+            return
+        report = await asyncio.to_thread(self.storage.latest_report, requested_date.isoformat())
+        if report is None:
+            yield event.plain_result("该日期尚未生成完整日报。")
+            return
+        path = Path(report.html_path)
+        if not path.is_file():
+            yield event.plain_result("该日报的本地 HTML 文件已丢失，请重新运行日报处理。")
+            return
+        yield event.plain_result(f"日报预览：{report.report_date} / 版本 {report.version}")
+        yield event.chain_result([Comp.File(name=path.name, file=str(path))])
+
+    @nju_collect_report.command("send")
+    async def operator_report_send(self, event: AstrMessageEvent):
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.OPERATE,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
+        tail = _command_tail(event.get_message_str(), "nju_collect report send")
+        try:
+            requested_date = date.fromisoformat(tail)
+            delivery = await self.workflow.deliver_latest(requested_date.isoformat())
+        except ValueError:
+            yield event.plain_result("请提供日期，例如：/nju_collect report send 2026-07-12")
+            return
+        except RuntimeError as exc:
+            yield event.plain_result(f"日报发送失败：{exc}")
+            return
+        yield event.plain_result(
+            f"日报邮件处理完成：发送 {delivery.sent}，"
+            f"已发送跳过 {delivery.skipped}，失败 {delivery.failed}"
+        )
+
+    @nju_collect.command("investigate")
+    async def operator_investigate(self, event: AstrMessageEvent):
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.OPERATE,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
+        question_code = _command_tail(event.get_message_str(), "nju_collect investigate").upper()
+        cluster = await asyncio.to_thread(self.storage.get_question_cluster, question_code)
+        if cluster is None:
+            yield event.plain_result("没有找到该聚合问题；请先运行对应日期的日报处理。")
+            return
+        result = await self.investigation_service.investigate(cluster)
+        try:
+            await self.report_service.build(cluster.report_date)
+        except Exception as exc:
+            logger.exception("NJU report rebuild after investigation failed")
+            yield event.plain_result(f"调查已留档，但 HTML 更新失败：{type(exc).__name__}")
+            return
+        yield event.plain_result(
+            f"调查完成：{question_code} / {result.status.value}\n{result.summary}"
+        )
 
     @nju_collect_report.command("status")
     async def operator_report_status(self, event: AstrMessageEvent):
@@ -455,6 +718,18 @@ class NjuQaReportPlugin(Star):
         if window is None:
             yield event.plain_result("该日期尚未运行。")
             return
+        clusters = await asyncio.to_thread(
+            self.storage.list_question_clusters,
+            requested_date.isoformat(),
+        )
+        investigations = await asyncio.to_thread(
+            self.storage.investigations_for_date,
+            requested_date.isoformat(),
+        )
+        report = await asyncio.to_thread(
+            self.storage.latest_report,
+            requested_date.isoformat(),
+        )
         yield event.plain_result(
             f"{window.report_date} 处理状态\n"
             f"状态：{window.status}\n"
@@ -463,7 +738,10 @@ class NjuQaReportPlugin(Star):
             f"纳入：{window.included_count}\n"
             f"排除：{window.dropped_count}\n"
             f"技术错误：{window.error_count}\n"
-            f"运行中：{'是' if self.question_processor.running else '否'}"
+            f"聚合问题：{len(clusters)}\n"
+            f"已调查：{len(investigations)}\n"
+            f"HTML 日报：{('版本 ' + str(report.version)) if report else '未生成'}\n"
+            f"运行中：{'是' if self.workflow.running else '否'}"
         )
 
     @nju_collect.command("export")
@@ -549,7 +827,9 @@ class NjuQaReportPlugin(Star):
     async def terminate(self) -> None:
         """Close local resources during disable or hot reload."""
 
+        await self.scheduler.close()
         await self.capture_writer.close()
+        await self.knowledge_service.close()
         self.storage.close()
         logger.info("NJU QA report plugin unloaded")
 
@@ -638,29 +918,44 @@ def _shorten(value: str, limit: int) -> str:
     return normalized[: limit - 1] + "…"
 
 
-def _format_run_results(results: list[DailyRunResult]) -> str:
-    completed = [item for item in results if item.status == "COMPLETED"]
-    skipped = [item for item in results if item.skipped]
-    failed = [item for item in results if item.status == "FAILED"]
+def _format_full_run_results(results: list[FullReportRunResult]) -> str:
+    completed = [item for item in results if item.screening.status == "COMPLETED"]
+    retry_pending = [item for item in results if item.screening.status == "RETRY_PENDING"]
+    processed = completed + retry_pending
+    skipped = [item for item in results if item.screening.skipped]
+    failed = [item for item in results if item.screening.status == "FAILED"]
     lines = [
-        "历史聊天处理完成",
+        "历史聊天完整日报处理完成（尚未发送邮件）",
         f"新处理日期：{len(completed)}",
         f"已处理而跳过：{len(skipped)}",
         f"失败日期：{len(failed)}",
-        f"扫描消息：{sum(item.messages_scanned for item in completed)}",
-        f"本次留档：{sum(item.candidates_saved for item in completed)}",
-        f"纳入：{sum(item.included_count for item in completed)}",
-        f"排除：{sum(item.dropped_count for item in completed)}",
-        f"技术错误：{sum(item.error_count for item in completed)}",
+        f"需重试日期：{len(retry_pending)}",
+        f"扫描消息：{sum(item.screening.messages_scanned for item in processed)}",
+        f"本次留档：{sum(item.screening.candidates_saved for item in processed)}",
+        f"聚合问题：{sum(item.cluster_count for item in results)}",
+        f"生成报告：{sum(item.report is not None for item in results)}",
+        f"技术错误：{sum(item.screening.error_count for item in processed)}",
     ]
     if skipped:
-        lines.append("跳过日期：" + _compact_dates([item.report_date for item in skipped]))
+        lines.append(
+            "筛选跳过日期：" + _compact_dates([item.screening.report_date for item in skipped])
+        )
     if failed:
-        lines.append("失败日期：" + _compact_dates([item.report_date for item in failed]))
+        lines.append("失败日期：" + _compact_dates([item.screening.report_date for item in failed]))
+    if retry_pending:
+        lines.append(
+            "存在筛选技术错误："
+            + _compact_dates([item.screening.report_date for item in retry_pending])
+            + "；再次运行相同命令会重试。"
+        )
     if len(results) == 1:
         item = results[0]
-        lines.append(f"日期明细：{item.report_date} / {item.status} / 留档 {item.candidates_saved}")
-    lines.append("累计简表已自动刷新；可用 /南哪日报 导出 获取。")
+        report_text = f"报告版本 {item.report.version}" if item.report else "未生成报告"
+        lines.append(
+            f"日期明细：{item.screening.report_date} / {item.screening.status} / "
+            f"聚合 {item.cluster_count} / {report_text}"
+        )
+    lines.append("先用 report preview 检查 HTML；确认后再用 report send 发送邮件。")
     return "\n".join(lines)
 
 

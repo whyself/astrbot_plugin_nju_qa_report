@@ -75,6 +75,15 @@ def test_storage_initialization_is_idempotent_and_uses_safety_pragmas(
         "processing_windows",
         "question_candidates",
         "scope_review_runs",
+        "repositories",
+        "knowledge_documents",
+        "knowledge_chunks",
+        "question_clusters",
+        "cluster_candidates",
+        "community_answers",
+        "investigations",
+        "reports",
+        "mail_deliveries",
     }
     storage.close()
 

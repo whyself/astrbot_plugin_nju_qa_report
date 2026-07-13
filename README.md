@@ -1,12 +1,12 @@
 # astrbot_plugin_nju_qa_report
 
-南京大学迎新群问答采集与知识缺口日报插件（开发中）。
+南京大学迎新群问答采集与知识缺口日报插件。
 
-该插件计划从指定 QQ 群消息中筛选并聚合与南京大学学习、生活、办事和校园服务有关的有效问题，关联群友回答，再由独立知识库调查 Agent 检查允许使用的语雀仓库，最终生成面向非技术知识库维护人员的脱敏日报。
+该插件从指定 QQ 群消息中筛选并聚合与南京大学学习、生活、办事和校园服务有关的有效问题，关联群友回答，再检查明确允许使用的语雀仓库，最终生成面向非技术知识库维护人员的脱敏 HTML 与邮件日报。它不会在群里自动回答，也不会修改语雀。
 
 ## 当前状态
 
-仓库处于开发阶段。目前已经包含：
+当前版本已经包含：
 
 - AstrBot 静默群消息监听，不回复也不阻断其他问答插件；
 - 带迁移、WAL、外键和消息幂等约束的独立 SQLite 数据库；
@@ -16,15 +16,17 @@
 - 全部筛选结果的私聊查询与脱敏 CSV 累计导出；
 - 本地配置检查及可选的 LLM、语雀、SMTP 实连自检；
 - QQ Chat Exporter 普通 JSON/分块 JSONL ZIP 历史记录检查与幂等导入；
+- 语雀批准/排除策略、正文增量同步、分块及关键词/向量混合检索；
+- 保守问题聚合、QQ 原生回复优先的群友回答关联；
+- 证据约束的知识库调查，失败或不完整时绝不误报“没有知识”；
+- 脱敏 HTML 日报、QQ 私聊详情、SMTP 逐收件人幂等投递；
+- 前一自然日定时处理、手动预览和失败重试；
 - 自动化测试。
-
-语雀同步、问题聚合、群友回答关联、知识调查和邮件日报仍在后续阶段实现，
-当前版本不应作为完整日报系统部署。
 
 完整计划见 [docs/plans/2026-07-13-astrbot-nju-qa-report-plugin-plan.md](docs/plans/2026-07-13-astrbot-nju-qa-report-plugin-plan.md)。
 部署前需要准备的参数见 [docs/configuration.md](docs/configuration.md)。
 
-## 计划中的使用方式
+## 使用方式
 
 非技术维护人员通过私聊机器人查看脱敏报告：
 
@@ -34,7 +36,7 @@
 /南哪日报 导出
 ```
 
-当前运维命令包括历史处理、处理状态、累计导出和启动自检：
+主要运维命令：
 
 ```text
 /nju_collect report run 2026-07-12
@@ -44,9 +46,17 @@
 /nju_collect test startup live
 /nju_collect import inspect
 /nju_collect import run
+/nju_collect repo sync
+/nju_collect repo status
+/nju_collect repo search 校园卡补办
+/nju_collect investigate 20260712-Q001
+/nju_collect report preview 2026-07-12
+/nju_collect report send 2026-07-12
 ```
 
-仓库同步、调查重跑、邮件发送和错误诊断等后续功能仅向配置的运维管理员开放。
+`report run` 会先同步允许仓库并生成本地 HTML，但不会发邮件。检查 `report preview`
+后再显式执行 `report send`。只有开启 `daily_report_enabled` 后，定时任务才会自动同步、
+处理前一自然日并发送邮件。
 
 ## 相关项目
 
@@ -54,7 +64,7 @@
 - [astrbot_plugin_nju_qa](https://github.com/Gu-Heping/astrbot_plugin_nju_qa)
 - [AstrBot 插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
 
-后续同步与检索代码将从 `astrbot_plugin_nju_qa` 的设计中独立改造。本仓库采用 AGPL-3.0-or-later，以保持后续代码复用的许可证兼容性。
+同步与检索实现参考了 `astrbot_plugin_nju_qa` 的接口设计，但本插件使用独立配置、数据库、索引和任务。本仓库采用 AGPL-3.0-or-later。
 
 QQ 历史记录导出与导入步骤见
 [docs/history-import.md](docs/history-import.md)。

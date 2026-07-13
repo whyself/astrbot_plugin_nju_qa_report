@@ -267,5 +267,15 @@
     "description": "日报收件地址列表（与 QQ 查看/管理权限独立配置）",
     "type": "list",
     "default": []
+  },
+  "mail_subject_prefix": {
+    "description": "日报邮件主题前缀",
+    "type": "string",
+    "default": "NJU 知识库日报"
+  },
+  "attach_full_html": {
+    "description": "邮件附加完整脱敏 HTML 日报",
+    "type": "bool",
+    "default": true
   }
 }

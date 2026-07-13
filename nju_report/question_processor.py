@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from uuid import uuid4
@@ -126,9 +127,10 @@ class DailyQuestionProcessor:
                 dropped_count=dropped_count,
                 error_count=error_count,
             )
+            final_status = "COMPLETED" if error_count == 0 else "RETRY_PENDING"
             return DailyRunResult(
                 report_date=report_date.isoformat(),
-                status="COMPLETED",
+                status=final_status,
                 messages_scanned=len(messages),
                 candidates_saved=len(decisions),
                 included_count=included_count,
@@ -163,21 +165,31 @@ class DailyQuestionProcessor:
         report_date: str,
         review_run_id: str,
     ) -> ScopeDecision:
-        try:
-            resolution = await self._scope_review_service.resolve(message.text, context)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # Defensive: the service normally converts errors itself.
+        if not appears_to_seek_help(message.text):
             resolution = ScopeResolution(
                 assessment=ScopeAssessment(
-                    decision=ScopeDecision.AUTO_REVIEW_ERROR,
-                    reason="AI 范围审核发生技术错误，已保留本地记录",
-                    confidence=0.0,
+                    decision=ScopeDecision.DROP,
+                    reason="未检测到明确求问、求助或故障描述，按低信息聊天排除",
+                    confidence=0.98,
                 ),
                 review_rounds=0,
-                retryable=True,
-                error_summary=type(exc).__name__,
             )
+        else:
+            try:
+                resolution = await self._scope_review_service.resolve(message.text, context)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # Defensive: the service normally converts errors itself.
+                resolution = ScopeResolution(
+                    assessment=ScopeAssessment(
+                        decision=ScopeDecision.AUTO_REVIEW_ERROR,
+                        reason="AI 范围审核发生技术错误，已保留本地记录",
+                        confidence=0.0,
+                    ),
+                    review_rounds=0,
+                    retryable=True,
+                    error_summary=type(exc).__name__,
+                )
 
         source_key = ":".join(
             (
@@ -219,6 +231,73 @@ def _nearby_context(messages: list[StoredMessage], index: int, radius: int) -> s
         relation = "此前" if nearby_index < index else "此后"
         lines.append(f"{relation}群聊消息：{content}")
     return "\n".join(lines)
+
+
+_HELP_MARKERS = (
+    "请问",
+    "想问",
+    "问下",
+    "咨询",
+    "求问",
+    "求助",
+    "求一个",
+    "帮忙",
+    "怎么办",
+    "怎么",
+    "咋",
+    "怎样",
+    "如何",
+    "为什么",
+    "为何",
+    "哪里",
+    "哪儿",
+    "去哪",
+    "哪个",
+    "什么",
+    "啥",
+    "谁",
+    "几时",
+    "何时",
+    "什么时候",
+    "多少",
+    "能否",
+    "能不能",
+    "可否",
+    "可不可以",
+    "有没有",
+    "有无",
+    "是否",
+    "不懂",
+    "不会",
+    "不清楚",
+    "不知道",
+    "找不到",
+    "打不开",
+    "进不去",
+    "登不上",
+    "连不上",
+    "用不了",
+    "报错",
+    "错误",
+    "失败",
+    "超时",
+    "丢了",
+    "忘了",
+    "没了",
+)
+
+
+def appears_to_seek_help(value: str) -> bool:
+    """Cheaply remove obvious chat before the much costlier LLM scope pass."""
+
+    text = " ".join(str(value).split()).strip()
+    if len(text) < 2:
+        return False
+    if "?" in text or "？" in text:
+        return True
+    if any(marker in text for marker in _HELP_MARKERS):
+        return True
+    return bool(re.search(r"(?:吗|嘛|么|呢|不)[啊呀诶哎]?$", text))
 
 
 def today_in_timezone(timezone_name: str) -> date:

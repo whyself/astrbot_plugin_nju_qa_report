@@ -1,1 +1,1 @@
-# Runtime dependencies will be added and pinned as implementation proceeds.
+httpx>=0.27,<1
