@@ -36,6 +36,7 @@ class WorkflowProgress:
     report_date: str
     date_index: int
     date_total: int
+    screening_phase: str
     screening_completed: int
     screening_total: int
     aggregation_completed: int
@@ -97,6 +98,7 @@ class DailyReportWorkflow:
             report_date=self._current_date,
             date_index=self._date_index,
             date_total=self._date_total,
+            screening_phase=self._question_processor.progress_phase,
             screening_completed=screening_completed,
             screening_total=screening_total,
             aggregation_completed=aggregation_completed,

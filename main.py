@@ -23,7 +23,7 @@ from .nju_report.help_text import COVERAGE_STATUS_HELP, available_help_topics, d
 from .nju_report.investigation import AstrBotInvestigationAiClient, InvestigationService
 from .nju_report.knowledge import KnowledgeError, KnowledgeService
 from .nju_report.message_capture import MessageCaptureService
-from .nju_report.models import CoverageStatus, MessageEnvelope
+from .nju_report.models import CoverageStatus, MessageEnvelope, ScopeDecision
 from .nju_report.permissions import PermissionAction, PermissionService
 from .nju_report.qce_import import QceHistoryImporter, QceImportError
 from .nju_report.question_export import DECISION_LABELS, QuestionCsvExporter
@@ -41,7 +41,7 @@ from .nju_report.reporting import (
     public_coverage_status,
 )
 from .nju_report.scope_ai import AstrBotScopeAiClient
-from .nju_report.scope_classifier import AutoScopeReviewService
+from .nju_report.scope_classifier import AutoScopeReviewService, QuestionGateCandidate
 from .nju_report.startup_checks import StartupCheckService, format_startup_checks
 from .nju_report.storage import ReportStorage, StorageError
 from .nju_report.token_usage import TokenUsage, TokenUsageTracker
@@ -55,7 +55,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.6.1",
+    "0.6.2",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -86,6 +86,7 @@ class NjuQaReportPlugin(Star):
             max_retries=self.runtime_config.max_retries,
             token_usage=self.token_usage,
         )
+        self.scope_ai = scope_ai
         self.scope_review_service = AutoScopeReviewService(
             scope_ai,
             scope_ai,
@@ -95,6 +96,9 @@ class NjuQaReportPlugin(Star):
         self.question_processor = DailyQuestionProcessor(
             self.storage,
             self.scope_review_service,
+            final_question_reviewer=(
+                scope_ai if self.runtime_config.scope_auto_review_enabled else None
+            ),
             timezone_name=self.runtime_config.timezone,
             concurrency=self.runtime_config.batch_concurrency,
             ignored_sender_ids=self.runtime_config.history_import_bot_qq_ids,
@@ -968,7 +972,10 @@ class NjuQaReportPlugin(Star):
                 return
             screening = ""
             if progress.screening_total and progress.stage == "AI 筛选与自动复核":
-                screening = f"\n消息筛选：{progress.screening_completed}/{progress.screening_total}"
+                screening = (
+                    f"\n{progress.screening_phase}："
+                    f"{progress.screening_completed}/{progress.screening_total}"
+                )
             aggregation = ""
             if (
                 progress.aggregation_total
@@ -1136,11 +1143,35 @@ class NjuQaReportPlugin(Star):
 
         result = await self.scope_review_service.resolve(message)
         assessment = result.assessment
+        final_gate_state = "未执行（初筛未纳入）"
+        final_gate_error = ""
+        if (
+            assessment.decision is ScopeDecision.INCLUDE
+            and self.runtime_config.scope_auto_review_enabled
+        ):
+            try:
+                final = await self.scope_ai.final_review_batch(
+                    [
+                        QuestionGateCandidate(
+                            candidate_id="test",
+                            canonical_question=assessment.canonical_question,
+                            category=assessment.category,
+                            time_sensitive=assessment.time_sensitive,
+                        )
+                    ]
+                )
+            except Exception as exc:
+                final_gate_state = "技术错误"
+                final_gate_error = type(exc).__name__
+            else:
+                assessment = final["test"]
+                final_gate_state = "已执行"
         lines = [
             "AI 范围审核测试",
             f"结果：{assessment.decision.value}",
             f"理由：{assessment.reason}",
             f"自动复核轮数：{result.review_rounds}",
+            f"最终问题闸门：{final_gate_state}",
         ]
         if assessment.canonical_question:
             lines.append(f"聚合问题：{assessment.canonical_question}")
@@ -1148,6 +1179,8 @@ class NjuQaReportPlugin(Star):
             lines.append(f"分类：{assessment.category}")
         if result.error_summary:
             lines.append(f"技术错误类型：{result.error_summary}")
+        if final_gate_error:
+            lines.append(f"最终闸门错误类型：{final_gate_error}")
         yield event.plain_result("\n".join(lines))
 
     @nju_collect_test.command("startup")

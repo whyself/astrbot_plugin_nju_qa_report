@@ -8,15 +8,28 @@ from datetime import date, datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from .models import ScopeAssessment, ScopeDecision, ScopeResolution, StoredMessage
+from .models import (
+    Clarity,
+    KnowledgeValue,
+    ScopeAssessment,
+    ScopeDecision,
+    ScopeResolution,
+    StoredMessage,
+)
 from .privacy import redact_for_report
-from .scope_classifier import AutoScopeReviewService, ScopeBatchMessage
+from .scope_classifier import (
+    AutoScopeReviewService,
+    FinalQuestionReviewer,
+    QuestionGateCandidate,
+    ScopeBatchMessage,
+)
 from .storage import ReportStorage
 from .time_windows import natural_day_window
 
 _BATCH_MAX_TARGETS = 200
 _BATCH_MAX_TARGET_CHARS = 24_000
 _BATCH_MESSAGE_CHAR_LIMIT = 1_200
+_FINAL_GATE_BATCH_SIZE = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +54,20 @@ class _ScreeningChunk:
     targets: tuple[tuple[str, int, StoredMessage], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _ScreenedTarget:
+    message_id: str
+    index: int
+    message: StoredMessage
+    resolution: ScopeResolution
+
+
+@dataclass(frozen=True, slots=True)
+class _GateGroup:
+    candidate: QuestionGateCandidate
+    targets: tuple[_ScreenedTarget, ...]
+
+
 class DailyQuestionProcessor:
     """Send every nonempty captured message through full-coverage AI chunks."""
 
@@ -49,6 +76,7 @@ class DailyQuestionProcessor:
         storage: ReportStorage,
         scope_review_service: AutoScopeReviewService,
         *,
+        final_question_reviewer: FinalQuestionReviewer | None = None,
         timezone_name: str,
         concurrency: int = 2,
         context_radius: int = 30,
@@ -60,6 +88,7 @@ class DailyQuestionProcessor:
             raise ValueError("context_radius 不能小于 0")
         self._storage = storage
         self._scope_review_service = scope_review_service
+        self._final_question_reviewer = final_question_reviewer
         self._timezone_name = timezone_name
         self._concurrency = concurrency
         self._context_radius = context_radius
@@ -70,6 +99,7 @@ class DailyQuestionProcessor:
         self._progress_date = ""
         self._progress_completed = 0
         self._progress_total = 0
+        self._progress_phase = "消息初筛"
 
     @property
     def running(self) -> bool:
@@ -78,6 +108,10 @@ class DailyQuestionProcessor:
     @property
     def progress(self) -> tuple[str, int, int]:
         return self._progress_date, self._progress_completed, self._progress_total
+
+    @property
+    def progress_phase(self) -> str:
+        return self._progress_phase
 
     async def process_date(
         self,
@@ -141,23 +175,32 @@ class DailyQuestionProcessor:
             )
             semaphore = asyncio.Semaphore(self._concurrency)
 
-            async def screen(chunk: _ScreeningChunk) -> list[ScopeDecision]:
+            async def screen(chunk: _ScreeningChunk) -> list[_ScreenedTarget]:
                 async with semaphore:
-                    return await self._screen_chunk(
-                        chunk,
-                        report_date=report_date.isoformat(),
-                        review_run_id=run_id,
-                    )
+                    return await self._screen_chunk(chunk)
 
             tasks = [asyncio.create_task(screen(chunk)) for chunk in chunks]
-            decisions: list[ScopeDecision] = []
+            screened_targets: list[_ScreenedTarget] = []
             self._progress_date = report_date.isoformat()
+            self._progress_phase = "消息初筛"
             self._progress_total = sum(len(chunk.targets) for chunk in chunks)
             self._progress_completed = 0
             for task in asyncio.as_completed(tasks):
-                chunk_decisions = await task
-                decisions.extend(chunk_decisions)
-                self._progress_completed += len(chunk_decisions)
+                chunk_targets = await task
+                screened_targets.extend(chunk_targets)
+                self._progress_completed += len(chunk_targets)
+
+            screened_targets = await self._apply_final_question_gate(screened_targets)
+            screened_targets.sort(key=lambda item: item.index)
+            for item in screened_targets:
+                await self._save_resolution(
+                    item.message,
+                    item.resolution,
+                    report_date=report_date.isoformat(),
+                    review_run_id=f"{run_id}:{item.index}",
+                )
+
+            decisions = [item.resolution.assessment.decision for item in screened_targets]
             included_count = sum(item is ScopeDecision.INCLUDE for item in decisions)
             error_count = sum(item is ScopeDecision.AUTO_REVIEW_ERROR for item in decisions)
             dropped_count = len(decisions) - included_count - error_count
@@ -206,10 +249,7 @@ class DailyQuestionProcessor:
     async def _screen_chunk(
         self,
         chunk: _ScreeningChunk,
-        *,
-        report_date: str,
-        review_run_id: str,
-    ) -> list[ScopeDecision]:
+    ) -> list[_ScreenedTarget]:
         target_ids = tuple(item[0] for item in chunk.targets)
         try:
             resolutions = await self._scope_review_service.resolve_batch(
@@ -233,17 +273,59 @@ class DailyQuestionProcessor:
                 for message_id in target_ids
             }
 
-        decisions: list[ScopeDecision] = []
-        for message_id, index, message in chunk.targets:
-            resolution = resolutions[message_id]
-            await self._save_resolution(
-                message,
-                resolution,
-                report_date=report_date,
-                review_run_id=f"{review_run_id}:{index}",
-            )
-            decisions.append(resolution.assessment.decision)
-        return decisions
+        return [
+            _ScreenedTarget(message_id, index, message, resolutions[message_id])
+            for message_id, index, message in chunk.targets
+        ]
+
+    async def _apply_final_question_gate(
+        self,
+        targets: list[_ScreenedTarget],
+    ) -> list[_ScreenedTarget]:
+        if self._final_question_reviewer is None:
+            return targets
+        groups = _final_gate_groups(targets)
+        if not groups:
+            return targets
+
+        self._progress_phase = "最终问题复核"
+        self._progress_completed = 0
+        self._progress_total = len(groups)
+        final_assessments: dict[str, ScopeAssessment] = {}
+        try:
+            for start in range(0, len(groups), _FINAL_GATE_BATCH_SIZE):
+                batch = groups[start : start + _FINAL_GATE_BATCH_SIZE]
+                reviewed = await self._final_question_reviewer.final_review_batch(
+                    [item.candidate for item in batch]
+                )
+                expected = {item.candidate.candidate_id for item in batch}
+                if set(reviewed) != expected:
+                    raise RuntimeError("最终问题 AI 闸门未完整返回候选 ID")
+                final_assessments.update(reviewed)
+                self._progress_completed += len(batch)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return _final_gate_error_targets(targets, groups, exc)
+
+        by_message_id: dict[str, ScopeAssessment] = {}
+        for group in groups:
+            assessment = final_assessments[group.candidate.candidate_id]
+            if not _valid_final_assessment(assessment):
+                return _final_gate_error_targets(
+                    targets,
+                    groups,
+                    RuntimeError("最终问题 AI 闸门返回了无效终态"),
+                )
+            for target in group.targets:
+                by_message_id[target.message_id] = assessment
+
+        return [
+            _with_final_assessment(item, by_message_id[item.message_id])
+            if item.message_id in by_message_id
+            else item
+            for item in targets
+        ]
 
     async def _save_resolution(
         self,
@@ -273,6 +355,132 @@ class DailyQuestionProcessor:
             group_alias=message.group_alias,
             sent_at_utc=message.sent_at_utc,
         )
+
+
+def _final_gate_groups(targets: list[_ScreenedTarget]) -> list[_GateGroup]:
+    included = sorted(
+        (
+            item
+            for item in targets
+            if item.resolution.assessment.decision is ScopeDecision.INCLUDE
+        ),
+        key=lambda item: item.index,
+    )
+    grouped: dict[str, list[_ScreenedTarget]] = {}
+    for item in included:
+        question = " ".join(item.resolution.assessment.canonical_question.split()).strip()
+        if not question:
+            continue
+        grouped.setdefault(question.casefold(), []).append(item)
+
+    result: list[_GateGroup] = []
+    for number, items in enumerate(grouped.values(), start=1):
+        assessment = items[0].resolution.assessment
+        result.append(
+            _GateGroup(
+                candidate=QuestionGateCandidate(
+                    candidate_id=f"c{number}",
+                    canonical_question=assessment.canonical_question,
+                    category=assessment.category,
+                    time_sensitive=assessment.time_sensitive,
+                    source_count=len(items),
+                ),
+                targets=tuple(items),
+            )
+        )
+    return result
+
+
+def _with_final_assessment(
+    target: _ScreenedTarget,
+    final: ScopeAssessment,
+) -> _ScreenedTarget:
+    previous = target.resolution
+    if final.decision is ScopeDecision.DROP and not final.canonical_question:
+        prior = previous.assessment
+        final = ScopeAssessment(
+            decision=ScopeDecision.DROP,
+            reason=final.reason,
+            confidence=final.confidence,
+            canonical_question=prior.canonical_question,
+            category=prior.category,
+            clarity=final.clarity,
+            knowledge_value=final.knowledge_value,
+            time_sensitive=prior.time_sensitive,
+        )
+    return _ScreenedTarget(
+        target.message_id,
+        target.index,
+        target.message,
+        ScopeResolution(
+            assessment=final,
+            review_rounds=previous.review_rounds + 1,
+            initial_assessment=previous.initial_assessment or previous.assessment,
+            review_attempts=previous.review_attempts + (final,),
+        ),
+    )
+
+
+def _valid_final_assessment(assessment: ScopeAssessment) -> bool:
+    if not isinstance(assessment, ScopeAssessment):
+        return False
+    if assessment.decision is ScopeDecision.DROP:
+        return bool(assessment.reason.strip())
+    return bool(
+        assessment.decision is ScopeDecision.INCLUDE
+        and assessment.reason.strip()
+        and assessment.canonical_question.strip()
+        and assessment.clarity is Clarity.CLEAR
+        and assessment.knowledge_value in {KnowledgeValue.HIGH, KnowledgeValue.MEDIUM}
+        and 0 <= assessment.confidence <= 1
+    )
+
+
+def _final_gate_error_targets(
+    targets: list[_ScreenedTarget],
+    groups: list[_GateGroup],
+    exc: Exception,
+) -> list[_ScreenedTarget]:
+    affected = {
+        target.message_id
+        for group in groups
+        for target in group.targets
+    }
+    error_name = type(exc).__name__
+    detail = " ".join(str(exc).split()).strip()
+    summary = f"{error_name}: {detail}" if detail else error_name
+    result: list[_ScreenedTarget] = []
+    for target in targets:
+        if target.message_id not in affected:
+            result.append(target)
+            continue
+        previous = target.resolution
+        prior = previous.assessment
+        result.append(
+            _ScreenedTarget(
+                target.message_id,
+                target.index,
+                target.message,
+                ScopeResolution(
+                    assessment=ScopeAssessment(
+                        decision=ScopeDecision.AUTO_REVIEW_ERROR,
+                        reason="最终问题 AI 闸门发生技术错误，将由后台自动重试",
+                        confidence=0.0,
+                        canonical_question=prior.canonical_question,
+                        category=prior.category,
+                        clarity=prior.clarity,
+                        knowledge_value=prior.knowledge_value,
+                        time_sensitive=prior.time_sensitive,
+                    ),
+                    review_rounds=previous.review_rounds + 1,
+                    initial_assessment=previous.initial_assessment or prior,
+                    review_attempts=previous.review_attempts,
+                    retryable=True,
+                    error_summary=summary[:1000],
+                ),
+            )
+        )
+    return result
 
 
 def _screening_chunks(

@@ -147,12 +147,12 @@
     "default": 3
   },
   "scope_auto_review_enabled": {
-    "description": "对范围判断不确定的问题执行独立 AI 自动审核",
+    "description": "启用不确定项自动审核和全部入选问题的最终 AI 闸门",
     "type": "bool",
     "default": true
   },
   "scope_auto_review_max_rounds": {
-    "description": "AI 自动审核的最大轮数",
+    "description": "不确定项 AI 自动审核的最大轮数（不含一次最终问题闸门）",
     "type": "int",
     "default": 2
   },

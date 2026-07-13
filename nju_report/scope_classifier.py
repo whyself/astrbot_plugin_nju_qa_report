@@ -19,6 +19,17 @@ class ScopeBatchMessage:
     conversation_date: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class QuestionGateCandidate:
+    """One already-extracted question sent to the low-cost final AI gate."""
+
+    candidate_id: str
+    canonical_question: str
+    category: str = ""
+    time_sensitive: bool = False
+    source_count: int = 1
+
+
 class ScopeClassifier(Protocol):
     async def classify(self, message: str, context: str) -> ScopeAssessment:
         """Perform the first-pass scope decision."""
@@ -49,6 +60,14 @@ class ScopeReviewer(Protocol):
         round_no: int,
     ) -> dict[str, ScopeAssessment]:
         """Independently review unresolved targets in one chat chunk."""
+
+
+class FinalQuestionReviewer(Protocol):
+    async def final_review_batch(
+        self,
+        candidates: Sequence[QuestionGateCandidate],
+    ) -> dict[str, ScopeAssessment]:
+        """Keep, rewrite, drop, or merge extracted questions without raw chat."""
 
 
 class ScopeAssessmentError(RuntimeError):

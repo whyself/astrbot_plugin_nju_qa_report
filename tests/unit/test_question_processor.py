@@ -6,6 +6,8 @@ from datetime import date
 from pathlib import Path
 
 from nju_report.models import (
+    Clarity,
+    KnowledgeValue,
     ScopeAssessment,
     ScopeDecision,
     ScopeResolution,
@@ -13,7 +15,7 @@ from nju_report.models import (
 )
 from nju_report.question_export import QuestionCsvExporter
 from nju_report.question_processor import DailyQuestionProcessor, _screening_chunks
-from nju_report.scope_classifier import ScopeBatchMessage
+from nju_report.scope_classifier import QuestionGateCandidate, ScopeBatchMessage
 from nju_report.storage import ReportStorage
 from nju_report.time_windows import natural_day_window
 
@@ -69,6 +71,66 @@ class FakeScopeService:
             message_id: await self.resolve(by_id[message_id].content)
             for message_id in target_ids
         }
+
+
+class GateScopeService:
+    async def resolve_batch(
+        self,
+        messages: list[ScopeBatchMessage] | tuple[ScopeBatchMessage, ...],
+        target_ids: list[str] | tuple[str, ...],
+    ) -> dict[str, ScopeResolution]:
+        by_id = {item.message_id: item for item in messages}
+        return {
+            message_id: ScopeResolution(
+                ScopeAssessment(
+                    decision=ScopeDecision.INCLUDE,
+                    reason="初筛纳入",
+                    confidence=0.9,
+                    canonical_question=by_id[message_id].content,
+                    category="测试分类",
+                    clarity=Clarity.CLEAR,
+                    knowledge_value=KnowledgeValue.HIGH,
+                ),
+                review_rounds=0,
+            )
+            for message_id in target_ids
+        }
+
+
+class FakeFinalQuestionGate:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.seen: list[QuestionGateCandidate] = []
+
+    async def final_review_batch(
+        self,
+        candidates: list[QuestionGateCandidate],
+    ) -> dict[str, ScopeAssessment]:
+        self.seen.extend(candidates)
+        if self.fail:
+            raise TimeoutError("final gate timeout")
+        result: dict[str, ScopeAssessment] = {}
+        for item in candidates:
+            if "好吃" in item.canonical_question:
+                result[item.candidate_id] = ScopeAssessment(
+                    decision=ScopeDecision.DROP,
+                    reason="主观口味问题不进入知识库",
+                    confidence=0.98,
+                    clarity=Clarity.CLEAR,
+                    knowledge_value=KnowledgeValue.LOW,
+                )
+            else:
+                result[item.candidate_id] = ScopeAssessment(
+                    decision=ScopeDecision.INCLUDE,
+                    reason="合并为同一项宿舍分配规则",
+                    confidence=0.96,
+                    canonical_question="南京大学2026级本科生大二宿舍如何分配？",
+                    category="住宿宿舍",
+                    clarity=Clarity.CLEAR,
+                    knowledge_value=KnowledgeValue.HIGH,
+                    time_sensitive=True,
+                )
+        return result
 
 
 def _stored(message_id: str, text: str, timestamp: int) -> StoredMessage:
@@ -147,6 +209,70 @@ def test_daily_processor_retains_include_drop_and_error_and_skips_rerun(
     second = asyncio.run(processor.process_date(report_date))
     assert second.status == "RETRY_PENDING"
     assert storage.question_candidate_count() == 3
+    storage.close()
+
+
+def test_final_question_gate_drops_subjective_and_merges_duplicate_questions(
+    tmp_path: Path,
+) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    report_date = date(2026, 7, 12)
+    window = natural_day_window(report_date, "Asia/Shanghai")
+    storage.insert_message(
+        _stored("m-1", "南京大学鼓楼校区哪些窗口比较好吃？", window.start_timestamp + 1)
+    )
+    storage.insert_message(
+        _stored("m-2", "2026级大二宿舍怎么分配？", window.start_timestamp + 2)
+    )
+    storage.insert_message(
+        _stored("m-3", "26级大二会继承23级宿舍吗？", window.start_timestamp + 3)
+    )
+    gate = FakeFinalQuestionGate()
+    processor = DailyQuestionProcessor(
+        storage,
+        GateScopeService(),  # type: ignore[arg-type]
+        final_question_reviewer=gate,
+        timezone_name="Asia/Shanghai",
+    )
+
+    result = asyncio.run(processor.process_date(report_date))
+
+    assert result.status == "COMPLETED"
+    assert result.included_count == 2
+    assert result.dropped_count == 1
+    assert len(gate.seen) == 3
+    candidates, total = storage.list_question_candidates(limit=None)
+    assert total == 3
+    assert candidates[0].final_decision == "DROP"
+    assert candidates[1].canonical_question == candidates[2].canonical_question
+    assert candidates[1].canonical_question == "南京大学2026级本科生大二宿舍如何分配？"
+    storage.close()
+
+
+def test_final_question_gate_failure_marks_only_selected_questions_retryable(
+    tmp_path: Path,
+) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    report_date = date(2026, 7, 12)
+    window = natural_day_window(report_date, "Asia/Shanghai")
+    storage.insert_message(_stored("m-1", "校园卡如何补办？", window.start_timestamp + 1))
+    processor = DailyQuestionProcessor(
+        storage,
+        GateScopeService(),  # type: ignore[arg-type]
+        final_question_reviewer=FakeFinalQuestionGate(fail=True),
+        timezone_name="Asia/Shanghai",
+    )
+
+    result = asyncio.run(processor.process_date(report_date))
+
+    assert result.status == "RETRY_PENDING"
+    assert result.error_count == 1
+    candidates, total = storage.list_question_candidates(limit=None)
+    assert total == 1
+    assert candidates[0].final_decision == "AUTO_REVIEW_ERROR"
+    assert "最终问题 AI 闸门" in candidates[0].reason
     storage.close()
 
 

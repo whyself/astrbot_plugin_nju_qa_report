@@ -169,7 +169,7 @@ OPERATOR_COMMAND_HELP: dict[str, CommandHelp] = {
     ),
     "test scope": CommandHelp(
         "/nju_collect test scope <问题>",
-        "单独测试一条文本是否会被 AI 判定为需要收集的问题。",
+        "单独测试一条文本能否通过 AI 初筛、自动复核和最终问题闸门。",
         ("会调用对话模型", "不会写入日报候选或生成报告"),
         ("/nju_collect test scope 一卡通丢了去哪里补办？",),
     ),

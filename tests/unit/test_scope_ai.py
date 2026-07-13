@@ -11,10 +11,11 @@ from nju_report.scope_ai import (
     AstrBotScopeAiClient,
     ScopeAiError,
     ScopeAiResponseError,
+    parse_final_question_gate,
     parse_scope_assessment,
     parse_scope_batch,
 )
-from nju_report.scope_classifier import ScopeBatchMessage
+from nju_report.scope_classifier import QuestionGateCandidate, ScopeBatchMessage
 
 
 def test_parse_scope_assessment_accepts_fenced_json() -> None:
@@ -141,6 +142,60 @@ def test_parse_scope_batch_still_rejects_non_json_response() -> None:
         parse_scope_batch("不是 JSON", ["m1"])
 
 
+def test_final_question_gate_can_keep_rewrite_merge_and_drop() -> None:
+    payload = json.dumps(
+        {
+            "questions": [
+                {
+                    "candidate_ids": ["c1", "c2"],
+                    "reason": "两个候选询问同一项宿舍分配规则，合并并补足学校名称",
+                    "confidence": 0.96,
+                    "canonical_question": "南京大学2026级本科生大二宿舍如何分配？",
+                    "category": "住宿宿舍",
+                    "knowledge_value": "HIGH",
+                    "time_sensitive": True,
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    result = parse_final_question_gate(payload, ["c1", "c2", "c3"])
+
+    assert result["c1"].decision is ScopeDecision.INCLUDE
+    assert result["c2"].canonical_question == result["c1"].canonical_question
+    assert result["c3"].decision is ScopeDecision.DROP
+    assert "未保留" in result["c3"].reason
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"questions":"not-an-array"}',
+        '{"questions":[{"candidate_ids":["unknown"]}]}',
+        json.dumps(
+            {
+                "questions": [
+                    {
+                        "candidate_ids": ["c1"],
+                        "reason": "低价值却被保留",
+                        "confidence": 0.9,
+                        "canonical_question": "哪里最好吃？",
+                        "category": "娱乐",
+                        "knowledge_value": "LOW",
+                        "time_sensitive": False,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+    ],
+)
+def test_final_question_gate_rejects_invalid_contract(payload: str) -> None:
+    with pytest.raises(ScopeAiResponseError):
+        parse_final_question_gate(payload, ["c1"])
+
+
 def test_scope_input_is_redacted_and_bounded() -> None:
     prepared = prepare_scope_input(
         "我叫张三，QQ:12345678，手机号13800138000，邮箱a@example.com，宿舍1A23",
@@ -242,6 +297,73 @@ def test_batch_client_sends_every_target_and_redacts_content() -> None:
     assert "哪个窗口好吃" in context.system_prompt
     assert "社团或同好群的推荐与群号" in context.system_prompt
     assert "独立可读" in context.system_prompt
+
+
+def test_final_gate_sends_only_concise_candidate_questions() -> None:
+    completion = json.dumps({"questions": []}, ensure_ascii=False)
+
+    class Response:
+        completion_text = completion
+
+    class Context:
+        prompt = ""
+        system_prompt = ""
+
+        async def llm_generate(self, **kwargs):
+            self.prompt = kwargs["prompt"]
+            self.system_prompt = kwargs["system_prompt"]
+            return Response()
+
+    context = Context()
+    client = AstrBotScopeAiClient(context, provider_id="provider", max_retries=0)
+    result = asyncio.run(
+        client.final_review_batch(
+            [
+                QuestionGateCandidate(
+                    candidate_id="c1",
+                    canonical_question="南京大学鼓楼校区哪些窗口比较好吃？",
+                    category="住宿食堂",
+                    source_count=2,
+                )
+            ]
+        )
+    )
+
+    assert result["c1"].decision is ScopeDecision.DROP
+    assert "ordered_messages" not in context.prompt
+    assert "哪些窗口比较好吃" in context.prompt
+    assert "最终问题编辑" in context.system_prompt
+    assert "保留、改写、删除和合并" not in context.prompt
+    assert "绝不搜索、生成或评价答案" in context.system_prompt
+
+
+def test_final_gate_returns_format_error_to_model_for_repair() -> None:
+    class Response:
+        def __init__(self, text: str) -> None:
+            self.completion_text = text
+
+    class Context:
+        def __init__(self) -> None:
+            self.responses = [Response("不是 JSON"), Response('{"questions":[]}')]
+            self.prompts: list[str] = []
+
+        async def llm_generate(self, **kwargs):
+            self.prompts.append(kwargs["prompt"])
+            return self.responses.pop(0)
+
+    context = Context()
+    client = AstrBotScopeAiClient(context, provider_id="provider", max_retries=3)
+    result = asyncio.run(
+        client.final_review_batch(
+            [QuestionGateCandidate("c1", "南京大学校园卡如何补办？")]
+        )
+    )
+
+    assert result["c1"].decision is ScopeDecision.DROP
+    assert len(context.prompts) == 2
+    assert "具体格式错误：JSON 解析失败" in context.prompts[1]
+    assert "上一次原始响应：\n不是 JSON" in context.prompts[1]
+    assert "修复重试：1/3" in context.prompts[1]
 
 
 def test_batch_client_returns_format_error_to_model_for_repair() -> None:
