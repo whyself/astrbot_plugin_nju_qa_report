@@ -56,21 +56,43 @@ class QceImportResult:
 class QceHistoryImporter:
     """Validate configured QCE files and import them idempotently in batches."""
 
-    def __init__(self, config: PluginConfig, storage: ReportStorage) -> None:
+    def __init__(
+        self,
+        config: PluginConfig,
+        storage: ReportStorage,
+        *,
+        base_dir: Path | None = None,
+    ) -> None:
         self._config = config
         self._storage = storage
+        self._base_dir = base_dir.resolve() if base_dir is not None else None
         self._timezone = ZoneInfo(config.timezone)
         self._bot_ids = frozenset(config.history_import_bot_qq_ids)
 
     def inspect_all(self) -> list[QceSourceInfo]:
         if not self._config.history_import_files:
             raise QceImportError("尚未在插件配置中上传 QCE JSON/ZIP 文件")
-        return [self._inspect_one(Path(item)) for item in self._config.history_import_files]
+        return [
+            self._inspect_one(self._source_path(item)) for item in self._config.history_import_files
+        ]
 
     def import_all(self) -> list[QceImportResult]:
         if not self._config.history_import_files:
             raise QceImportError("尚未在插件配置中上传 QCE JSON/ZIP 文件")
-        return [self._import_one(Path(item)) for item in self._config.history_import_files]
+        return [
+            self._import_one(self._source_path(item)) for item in self._config.history_import_files
+        ]
+
+    def _source_path(self, configured_path: str) -> Path:
+        path = Path(configured_path).expanduser()
+        if path.is_absolute() or self._base_dir is None:
+            return path
+        candidate = (self._base_dir / path).resolve(strict=False)
+        try:
+            candidate.relative_to(self._base_dir)
+        except ValueError as exc:
+            raise QceImportError("历史记录文件路径越出插件数据目录") from exc
+        return candidate
 
     def _inspect_one(self, path: Path) -> QceSourceInfo:
         with _open_qce_source(path) as (chat_info, messages):

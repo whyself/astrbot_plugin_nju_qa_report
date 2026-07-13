@@ -38,7 +38,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.1.2",
+    "0.1.3",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -83,7 +83,11 @@ class NjuQaReportPlugin(Star):
             self._data_dir / "exports",
             timezone_name=self.runtime_config.timezone,
         )
-        self.history_importer = QceHistoryImporter(self.runtime_config, self.storage)
+        self.history_importer = QceHistoryImporter(
+            self.runtime_config,
+            self.storage,
+            base_dir=self._data_dir,
+        )
         self.startup_checks = StartupCheckService(
             config=self.runtime_config,
             storage=self.storage,

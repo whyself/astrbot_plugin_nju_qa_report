@@ -200,3 +200,45 @@ def test_qce_5579_filename_group_id_and_reply_field_are_supported(tmp_path: Path
     stored = storage.messages_in_window(window)
     assert stored[1].reply_to_message_id == "826811581:original"
     storage.close()
+
+
+def test_astrbot_relative_file_path_resolves_from_plugin_data_dir(tmp_path: Path) -> None:
+    relative = Path("files/history_import_files/group_826811581_20260713.json")
+    export_path = tmp_path / relative
+    export_path.parent.mkdir(parents=True)
+    export_path.write_text(
+        json.dumps(
+            _single_export([_message("relative", "宿舍床尺寸是多少？", 1_783_958_400_000)]),
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    config = PluginConfig.from_mapping(
+        {
+            "target_group_ids": ["826811581"],
+            "history_import_files": [relative.as_posix()],
+        }
+    )
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+
+    result = QceHistoryImporter(config, storage, base_dir=tmp_path).import_all()[0]
+
+    assert result.imported == 1
+    assert storage.message_count() == 1
+    storage.close()
+
+
+def test_relative_file_path_cannot_escape_plugin_data_dir(tmp_path: Path) -> None:
+    config = PluginConfig.from_mapping(
+        {
+            "target_group_ids": ["826811581"],
+            "history_import_files": ["../outside.json"],
+        }
+    )
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+
+    with pytest.raises(QceImportError, match="越出插件数据目录"):
+        QceHistoryImporter(config, storage, base_dir=tmp_path).inspect_all()
+    storage.close()
