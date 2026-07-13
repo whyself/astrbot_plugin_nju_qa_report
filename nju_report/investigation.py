@@ -42,6 +42,14 @@ _SYSTEM_PROMPT = """
   "evidence_indices": [1],
   "flags": ["TIME_SENSITIVE | STALE_RISK | COMMUNITY_CONFLICT"]
 }
+字段含义：
+- status：知识库证据对核心问题的覆盖程度，不是群聊回答的可信度。
+- summary：证据已经能够支持的结论，不能超出引用段落。
+- missing_information：证据仍未覆盖的关键部分；完整覆盖时写“无”。
+- recommendation：面向知识库维护者的下一步建议，不是直接给学生的操作指令。
+- evidence_indices：真正支撑 summary 的证据编号；相关但未被采用的材料不要引用。
+- flags：TIME_SENSITIVE 表示答案随时间变化，STALE_RISK 表示资料可能过期，
+  COMMUNITY_CONFLICT 表示群聊说法与知识库证据存在冲突；没有则返回空数组。
 evidence_indices 必须引用实际支持结论的证据编号，不能引用群友说法。
 NO_USABLE_EVIDENCE 的 evidence_indices 必须是空数组。
 """.strip()

@@ -44,6 +44,20 @@ answer_summary 必须只概括 answer_message_ids 对应消息中实际出现的
   "answer_summary": "已去除身份信息的简短中文摘要；无回答时为空字符串",
   "reason": "简短判断说明"
 }
+
+字段含义：
+- question_message_ids：真正提出、追问或共同补全当前问题的候选锚点 ID，用来修正上游可能混入的回答。
+- answer_message_ids：语义上明确回答、补充或纠正当前问题的消息 ID，
+  是 answer_summary 的唯一事实来源。
+- answer_summary：仅对 answer_message_ids 的内容做合并、去重、脱敏后的第三人称摘要；
+  不是原文摘抄，也不是模型自行作答。
+- reason：简述消息划分依据，不能在这里补充答案或外部知识。
+
+示例：q1“大一允许校外租房吗”，a1“退宿后可以申请”，a2“也有人说不退宿也行”，x1“今晚吃什么”。
+应输出 question_message_ids=["q1"]、answer_message_ids=["a1","a2"]，
+answer_summary 写“群聊中存在不同说法：一种说法是退宿后可以申请，
+另一种说法是不退宿也可能可行，均未经核实”；
+x1 不得选择，摘要中也不得出现发言人姓名或昵称。
 question_message_ids 至少保留一条，且只能取自 question_anchors。
 answer_message_ids 只能选择输入 messages 中实际存在的编号，不能与 question_message_ids 重叠。
 """.strip()

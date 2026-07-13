@@ -16,6 +16,7 @@ class ScopeBatchMessage:
     context_only: bool = False
     speaker_id: str = ""
     reply_to_id: str = ""
+    conversation_date: str = ""
 
 
 class ScopeClassifier(Protocol):

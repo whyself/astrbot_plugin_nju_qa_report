@@ -129,7 +129,11 @@ class DailyQuestionProcessor:
                 self._storage.messages_in_window,
                 window,
             )
-            chunks = _screening_chunks(messages, context_radius=self._context_radius)
+            chunks = _screening_chunks(
+                messages,
+                context_radius=self._context_radius,
+                conversation_date=report_date.isoformat(),
+            )
             semaphore = asyncio.Semaphore(self._concurrency)
 
             async def screen(chunk: _ScreeningChunk) -> list[ScopeDecision]:
@@ -270,6 +274,7 @@ def _screening_chunks(
     messages: list[StoredMessage],
     *,
     context_radius: int,
+    conversation_date: str = "",
 ) -> list[_ScreeningChunk]:
     groups: dict[str, list[tuple[int, StoredMessage]]] = {}
     for index, item in enumerate(messages):
@@ -319,6 +324,7 @@ def _screening_chunks(
                         context_only=not is_target,
                         speaker_id=speaker_aliases[speaker_key],
                         reply_to_id=external_to_internal.get(message.reply_to_message_id, ""),
+                        conversation_date=conversation_date,
                     )
                 )
                 if is_target:

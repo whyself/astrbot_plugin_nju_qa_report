@@ -14,6 +14,7 @@ from nju_report.investigation import (
 )
 from nju_report.models import (
     CoverageStatus,
+    EvidenceItem,
     InvestigationResult,
     KnowledgeChunk,
     KnowledgeDocument,
@@ -24,6 +25,8 @@ from nju_report.models import (
 )
 from nju_report.reporting import (
     ReportService,
+    _display_excerpt,
+    _visible_evidence,
     coverage_counts,
     format_coverage_counts,
     format_question_detail,
@@ -165,6 +168,27 @@ def test_evidence_combines_multiple_relevant_chunks_from_same_document(tmp_path:
     assert "南园二舍" in evidence[0].excerpt
     assert "相关段落 2" in evidence[0].excerpt
     storage.close()
+
+
+def test_public_report_evidence_is_deduplicated_and_excerpt_is_bounded() -> None:
+    first = EvidenceItem(
+        namespace="qc19gt/guide",
+        document_id="one",
+        title="宿舍总览",
+        source_url="https://example.test/one",
+        updated_at="2025-08-20",
+        excerpt="甲" * 500,
+    )
+    duplicate_copy = replace(
+        first,
+        document_id="two",
+        source_url="https://example.test/two",
+    )
+
+    assert _visible_evidence((first, duplicate_copy)) == (first,)
+    excerpt = _display_excerpt(first.excerpt)
+    assert len(excerpt) == 420
+    assert excerpt.endswith("…")
 
 
 def test_model_failure_is_error_not_knowledge_gap(tmp_path: Path) -> None:

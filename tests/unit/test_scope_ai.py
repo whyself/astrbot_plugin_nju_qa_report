@@ -188,10 +188,17 @@ def test_batch_client_sends_every_target_and_redacts_content() -> None:
     client = AstrBotScopeAiClient(context, provider_id="provider", max_retries=0)
     result = asyncio.run(
         client.classify_batch(
-            [ScopeBatchMessage("m1", "手机号 13800138000，这是回答")],
+            [
+                ScopeBatchMessage(
+                    "m1",
+                    "手机号 13800138000，这是回答",
+                    conversation_date="2026-07-12",
+                )
+            ],
             ["m1"],
         )
     )
     assert list(result) == ["m1"]
     assert "13800138000" not in context.prompt
     assert "[手机号]" in context.prompt
+    assert '"conversation_date": "2026-07-12"' in context.prompt

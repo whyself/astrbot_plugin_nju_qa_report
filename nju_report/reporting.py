@@ -18,7 +18,13 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .config import PluginConfig
-from .models import CoverageStatus, InvestigationResult, QuestionCluster, ReportArtifact
+from .models import (
+    CoverageStatus,
+    EvidenceItem,
+    InvestigationResult,
+    QuestionCluster,
+    ReportArtifact,
+)
 from .storage import ReportStorage
 
 _STATUS_LABELS = {
@@ -245,8 +251,9 @@ def format_question_detail(
     if not cluster.answers:
         lines.append("- 未发现明确回答")
     lines.append("知识库引用：")
-    lines.extend(f"- {item.title}｜{item.source_url}" for item in result.evidence)
-    if not result.evidence:
+    visible_evidence = _visible_evidence(result.evidence)
+    lines.extend(f"- {item.title}｜{item.source_url}" for item in visible_evidence)
+    if not visible_evidence:
         lines.append("- 无")
     return "\n".join(lines)
 
@@ -308,10 +315,11 @@ def _render_html(
         questions = "".join(
             f"<li>{html.escape(item)}</li>" for item in cluster.representative_questions[:5]
         )
+        visible_evidence = _visible_evidence(result.evidence)
         evidence = (
             "".join(
-                f'<li><a href="{html.escape(item.source_url, quote=True)}">{html.escape(item.title)}</a><br><span>{html.escape(item.excerpt)}</span></li>'
-                for item in result.evidence
+                f'<li><a href="{html.escape(item.source_url, quote=True)}">{html.escape(item.title)}</a><br><span>{html.escape(_display_excerpt(item.excerpt))}</span></li>'
+                for item in visible_evidence
             )
             or "<li>无</li>"
         )
@@ -347,3 +355,31 @@ def _write_once(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text(content, encoding="utf-8")
+
+
+def _visible_evidence(
+    evidence: tuple[EvidenceItem, ...],
+    *,
+    maximum: int = 5,
+) -> tuple[EvidenceItem, ...]:
+    """Hide duplicate document copies and bound citations in the public report."""
+
+    result: list[EvidenceItem] = []
+    seen: set[tuple[str, str]] = set()
+    for item in evidence:
+        normalized_title = "".join(item.title.split()).casefold()
+        key = (item.namespace.casefold(), normalized_title or item.document_id.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= maximum:
+            break
+    return tuple(result)
+
+
+def _display_excerpt(value: str, *, maximum: int = 420) -> str:
+    compact = " ".join(value.split()).strip()
+    if len(compact) <= maximum:
+        return compact
+    return compact[: maximum - 1].rstrip() + "…"
