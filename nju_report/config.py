@@ -56,7 +56,10 @@ class PluginConfig:
     sensitive_commands_private_only: bool = True
 
     llm_provider_id: str = ""
-    embedding_provider_id: str = ""
+    embedding_api_key: str = field(default="", repr=False)
+    embedding_base_url: str = ""
+    embedding_model: str = "text-embedding-3-small"
+    enable_vector_search: bool = True
     batch_concurrency: int = 2
     request_timeout_seconds: int = 120
     max_retries: int = 3
@@ -166,6 +169,18 @@ class PluginConfig:
         if not space_login:
             raise ConfigError("yuque_space_login 不能为空")
 
+        embedding_base_url = _string(raw, "embedding_base_url", "").rstrip("/")
+        if embedding_base_url:
+            parsed_embedding_url = urlparse(embedding_base_url)
+            if (
+                parsed_embedding_url.scheme not in {"http", "https"}
+                or not parsed_embedding_url.netloc
+            ):
+                raise ConfigError("embedding_base_url 必须是有效的 HTTP(S) URL")
+        embedding_model = _string(raw, "embedding_model", "text-embedding-3-small")
+        if not embedding_model:
+            raise ConfigError("embedding_model 不能为空")
+
         return cls(
             capture_enabled=capture_enabled,
             capture_mode=capture_mode,
@@ -191,7 +206,10 @@ class PluginConfig:
                 _boolean(raw, "report_commands_private_only", True),
             ),
             llm_provider_id=_string(raw, "llm_provider_id", ""),
-            embedding_provider_id=_string(raw, "embedding_provider_id", ""),
+            embedding_api_key=_string(raw, "embedding_api_key", ""),
+            embedding_base_url=embedding_base_url,
+            embedding_model=embedding_model,
+            enable_vector_search=_boolean(raw, "enable_vector_search", True),
             batch_concurrency=batch_concurrency,
             request_timeout_seconds=request_timeout,
             max_retries=max_retries,

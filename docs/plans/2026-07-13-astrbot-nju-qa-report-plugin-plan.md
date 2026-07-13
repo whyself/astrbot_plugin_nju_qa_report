@@ -26,7 +26,7 @@
 - 新插件不导入、不调用、不依赖现有 `nju_qa` 插件实例。
 - 从现有插件复制并改造必要的语雀同步、文档存储、分块、向量索引、检索工具和 Agent 调用思路。
 - 新插件维护自己的配置、Markdown 文档、SQLite 数据库、分块索引和向量索引。
-- 可以选择与现有插件相同的 AstrBot LLM/Embedding Provider，但拥有独立的并发、重试、超时和批处理限制。
+- 对话模型默认复用 AstrBot 当前默认 Provider；Embedding 使用与现有插件同名的 OpenAI-compatible 配置，但本插件拥有独立的并发、重试、超时和批处理限制。
 - 现有插件的群聊限流不作用于新插件；两者只可能共同受到上游模型供应商总额度限制。
 
 ### 2.2 知识范围与数据来源
@@ -142,7 +142,10 @@ raw_message_retention_days = 90
 
 ```text
 llm_provider_id
-embedding_provider_id
+embedding_api_key
+embedding_base_url
+embedding_model = "text-embedding-3-small"
+enable_vector_search = true
 batch_concurrency
 request_timeout_seconds
 max_retries
@@ -624,7 +627,7 @@ investigate_for_report(question, context, allowed_repositories, snapshot_id)
 - 目标 QQ 群号及群别名；
 - 报告查看人员 QQ 号；
 - 运维管理员 QQ 号；
-- LLM 与 Embedding Provider ID；
+- 可选的 LLM Provider ID，以及与现有问答插件一致的 Embedding API Key、Base URL 和模型名；
 - 语雀 Token、允许同步的仓库和排除仓库；
 - 每日运行时间；
 - SMTP 参数及邮件收件人；

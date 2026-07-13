@@ -111,6 +111,7 @@ class StartupCheckService:
             )
         )
         checks.append(self._check_llm_config())
+        checks.append(self._check_embedding_config())
         checks.append(self._check_yuque_config())
         checks.append(self._check_email_config())
         checks.append(self._check_export_path())
@@ -126,6 +127,27 @@ class StartupCheckService:
         if provider is None:
             return StartupCheck("FAIL", "对话模型", "未指定且 AstrBot 没有默认 Provider")
         return StartupCheck("PASS", "对话模型", "使用 AstrBot 当前默认 Provider")
+
+    def _check_embedding_config(self) -> StartupCheck:
+        if not self._config.enable_vector_search:
+            return StartupCheck("PASS", "向量检索", "已关闭，将使用本地关键词/grep")
+        if self._config.embedding_api_key and self._config.embedding_base_url:
+            return StartupCheck(
+                "PASS",
+                "向量检索",
+                f"OpenAI-compatible / {self._config.embedding_model}",
+            )
+        if self._config.embedding_api_key or self._config.embedding_base_url:
+            return StartupCheck(
+                "WARN",
+                "向量检索",
+                "Embedding API Key 与 Base URL 只填写了一项，将回退关键词检索",
+            )
+        return StartupCheck(
+            "WARN",
+            "向量检索",
+            "未配置 Embedding，将使用本地关键词/grep",
+        )
 
     def _check_yuque_config(self) -> StartupCheck:
         if not self._config.yuque_token:

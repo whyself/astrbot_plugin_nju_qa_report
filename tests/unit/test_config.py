@@ -31,6 +31,8 @@ def test_defaults_are_safe_and_exclude_qa_repository() -> None:
     assert config.daily_report_time == "00:00"
     assert config.scope_auto_review_enabled is True
     assert config.scope_auto_review_max_rounds == 2
+    assert config.embedding_model == "text-embedding-3-small"
+    assert config.enable_vector_search is True
     assert [item.namespace for item in config.excluded_repositories] == ["qc19gt/ogaye8"]
 
 
@@ -100,11 +102,32 @@ def test_exclusion_is_configurable_not_hard_coded() -> None:
 
 def test_secrets_are_not_in_dataclass_repr() -> None:
     config = PluginConfig.from_mapping(
-        {"yuque_token": "yuque-secret", "smtp_password": "smtp-secret"}
+        {
+            "yuque_token": "yuque-secret",
+            "smtp_password": "smtp-secret",
+            "embedding_api_key": "embedding-secret",
+        }
     )
     rendered = repr(config)
     assert "yuque-secret" not in rendered
     assert "smtp-secret" not in rendered
+    assert "embedding-secret" not in rendered
+
+
+def test_reference_plugin_embedding_configuration_is_accepted() -> None:
+    config = PluginConfig.from_mapping(
+        {
+            "embedding_api_key": "secret",
+            "embedding_base_url": "https://api.example.com/v1/",
+            "embedding_model": "text-embedding-3-large",
+            "enable_vector_search": True,
+        }
+    )
+    assert config.embedding_base_url == "https://api.example.com/v1"
+    assert config.embedding_model == "text-embedding-3-large"
+
+    with pytest.raises(ConfigError, match="embedding_base_url"):
+        PluginConfig.from_mapping({"embedding_base_url": "not-a-url"})
 
 
 def test_group_alias_falls_back_to_masked_group_id() -> None:

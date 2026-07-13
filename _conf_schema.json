@@ -78,10 +78,27 @@
     "_special": "select_provider",
     "hint": "留空时使用 AstrBot 当前默认对话模型。"
   },
-  "embedding_provider_id": {
-    "description": "向量检索使用的 Embedding Provider ID",
+  "embedding_api_key": {
+    "description": "OpenAI-compatible Embedding API Key（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "与 astrbot_plugin_nju_qa 使用相同配置；只在本机 WebUI 填写。",
+    "obvious_hint": true
+  },
+  "embedding_base_url": {
+    "description": "OpenAI-compatible Embedding API 根地址（可选）",
     "type": "string",
     "default": ""
+  },
+  "embedding_model": {
+    "description": "Embedding 模型",
+    "type": "string",
+    "default": "text-embedding-3-small"
+  },
+  "enable_vector_search": {
+    "description": "启用向量检索；配置不完整时自动回退本地关键词/grep",
+    "type": "bool",
+    "default": true
   },
   "batch_concurrency": {
     "description": "本插件批处理并发数",
