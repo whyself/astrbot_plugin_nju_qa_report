@@ -178,9 +178,11 @@ def test_ai_client_never_sends_raw_identifiers_to_provider() -> None:
 
     class Context:
         prompt = ""
+        system_prompt = ""
 
         async def llm_generate(self, **kwargs):
             self.prompt = kwargs["prompt"]
+            self.system_prompt = kwargs["system_prompt"]
             return Response()
 
     context = Context()
@@ -207,9 +209,11 @@ def test_batch_client_sends_every_target_and_redacts_content() -> None:
 
     class Context:
         prompt = ""
+        system_prompt = ""
 
         async def llm_generate(self, **kwargs):
             self.prompt = kwargs["prompt"]
+            self.system_prompt = kwargs["system_prompt"]
             return Response()
 
     context = Context()
@@ -230,6 +234,14 @@ def test_batch_client_sends_every_target_and_redacts_content() -> None:
     assert "13800138000" not in context.prompt
     assert "[手机号]" in context.prompt
     assert '"conversation_date": "2026-07-12"' in context.prompt
+    assert "筛选对象只能是“问题”，不是答案" in context.system_prompt
+    assert "本阶段不得搜索、评价、摘录或生成问题的答案" in context.system_prompt
+    assert "不是群聊话题档案、校园趣闻合集" in context.system_prompt
+    assert "仍无法可靠还原，应直接排除" in context.system_prompt
+    assert "录取通知书是否好看" in context.system_prompt
+    assert "哪个窗口好吃" in context.system_prompt
+    assert "社团或同好群的推荐与群号" in context.system_prompt
+    assert "独立可读" in context.system_prompt
 
 
 def test_batch_client_returns_format_error_to_model_for_repair() -> None:
