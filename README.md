@@ -43,6 +43,8 @@
 /南哪日报 列表 all error
 /南哪日报 查看 20260712-Q001
 /南哪日报 导出
+/南哪日报 导出 missing
+/南哪日报 导出 2026-07-12 missing
 ```
 
 `列表` 开头会显示明确回答、部分覆盖、未找到可用信息和程序执行异常的数量。
@@ -52,6 +54,8 @@
 
 ```text
 /nju_collect help
+/nju_collect help report rerun
+/nju_collect help 南哪日报 导出
 /nju_collect report run 2026-07-12
 /nju_collect report run all
 /nju_collect report status 2026-07-12
@@ -67,7 +71,12 @@
 /nju_collect investigate 20260712-Q001
 /nju_collect report preview 2026-07-12
 /nju_collect report send 2026-07-12
+/nju_collect export questions all missing
 ```
+
+`/nju_collect help <指令路径>` 显示对应指令的完整参数、行为说明和示例。日报问题 CSV
+也可按日期和知识库状态筛选；例如 `missing` 只导出“知识库未找到可用信息”的问题。
+不带参数的 `导出` 保持原行为，导出全部 AI 筛选结果；填写 `all` 则导出全部聚合问题及调查结果。
 
 `report run` 会先同步允许仓库并生成本地 HTML，但不会发邮件。检查 `report preview`
 后再显式执行 `report send`。只有开启 `daily_report_enabled` 后，定时任务才会自动同步、

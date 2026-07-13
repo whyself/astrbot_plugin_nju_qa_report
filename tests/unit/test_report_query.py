@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from nju_report.models import CoverageStatus
-from nju_report.report_query import parse_list_arguments
+from nju_report.report_query import parse_export_arguments, parse_list_arguments
 
 
 @pytest.mark.parametrize(
@@ -24,3 +24,23 @@ def test_parse_list_arguments(tail: str, expected: tuple[object, ...]) -> None:
 def test_parse_list_arguments_rejects_invalid_values(tail: str) -> None:
     with pytest.raises(ValueError):
         parse_list_arguments(tail)
+
+
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        ("", (None, None)),
+        ("missing", (None, CoverageStatus.NO_USABLE_EVIDENCE)),
+        ("all missing", (None, CoverageStatus.NO_USABLE_EVIDENCE)),
+        ("2026-07-12 partial", ("2026-07-12", CoverageStatus.PARTIAL)),
+        ("2026-07-12 all", ("2026-07-12", None)),
+    ],
+)
+def test_parse_export_arguments(tail: str, expected: tuple[object, ...]) -> None:
+    assert parse_export_arguments(tail) == expected
+
+
+@pytest.mark.parametrize("tail", ["yesterday missing", "all unknown", "all missing 2"])
+def test_parse_export_arguments_rejects_invalid_values(tail: str) -> None:
+    with pytest.raises(ValueError):
+        parse_export_arguments(tail)

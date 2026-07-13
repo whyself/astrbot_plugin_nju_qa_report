@@ -18,6 +18,7 @@ from .nju_report.aggregation import QuestionAggregationService
 from .nju_report.answer_agent import AstrBotContextAnswerAgent
 from .nju_report.capture_writer import AsyncCaptureWriter
 from .nju_report.config import PluginConfig
+from .nju_report.help_text import available_help_topics, detailed_help
 from .nju_report.investigation import AstrBotInvestigationAiClient, InvestigationService
 from .nju_report.knowledge import KnowledgeError, KnowledgeService
 from .nju_report.message_capture import MessageCaptureService
@@ -29,7 +30,7 @@ from .nju_report.question_processor import (
     DailyQuestionProcessor,
     today_in_timezone,
 )
-from .nju_report.report_query import parse_list_arguments
+from .nju_report.report_query import parse_export_arguments, parse_list_arguments
 from .nju_report.reporting import (
     ReportService,
     coverage_counts,
@@ -53,7 +54,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.5.5",
+    "0.5.6",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -243,9 +244,10 @@ class NjuQaReportPlugin(Star):
             "南哪日报查询指令：\n"
             "/南哪日报 列表 [YYYY-MM-DD|all] [状态] [页码]\n"
             "/南哪日报 查看 YYYYMMDD-QNNN\n"
-            "/南哪日报 导出\n"
+            "/南哪日报 导出 [YYYY-MM-DD|all] [状态]\n"
             "/南哪日报 关于\n\n"
-            "状态可填 answerable、partial、missing、error 或 all；请私聊机器人使用。"
+            "状态可填 answerable、partial、missing、error 或 all；请私聊机器人使用。\n"
+            "指令详情：/nju_collect help <指令路径>"
         )
 
     @nju_report.command("列表")
@@ -383,14 +385,38 @@ class NjuQaReportPlugin(Star):
         if not authorization.allowed:
             yield event.plain_result(authorization.user_message)
             return
-        path, total = await asyncio.to_thread(self.question_exporter.export_all)
+        tail = _command_tail(event.get_message_str(), "南哪日报 导出")
+        if not tail:
+            path, total = await asyncio.to_thread(self.question_exporter.export_all)
+            try:
+                await _send_local_file(event, path)
+            except Exception as exc:
+                logger.exception("NJU public question export file delivery failed")
+                yield event.plain_result(f"问题简表已生成，但文件发送失败：{_file_error(exc)}")
+                return
+            yield event.plain_result(f"已导出并发送全部 {total} 条筛选结果。")
+            return
+        try:
+            report_date, status_filter = parse_export_arguments(tail)
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        path, total = await asyncio.to_thread(
+            self.question_exporter.export_report_questions,
+            report_date=report_date,
+            status=status_filter,
+        )
         try:
             await _send_local_file(event, path)
         except Exception as exc:
             logger.exception("NJU public question export file delivery failed")
             yield event.plain_result(f"问题简表已生成，但文件发送失败：{_file_error(exc)}")
             return
-        yield event.plain_result(f"已导出并发送全部 {total} 条问题简表。")
+        scope = report_date or "全部日期"
+        status_name = coverage_label(status_filter) if status_filter else "全部状态"
+        yield event.plain_result(
+            f"已导出并发送 {total} 条日报问题。\n范围：{scope}｜状态：{status_name}"
+        )
 
     @nju_report.command("关于")
     async def report_about(self, event: AstrMessageEvent):
@@ -421,9 +447,21 @@ class NjuQaReportPlugin(Star):
         if not viewer.allowed and not operator.allowed:
             yield event.plain_result(viewer.user_message or operator.user_message)
             return
+        topic = _command_tail(event.get_message_str(), "nju_collect help")
+        if topic:
+            detail = detailed_help(topic, include_operator=operator.allowed)
+            if detail is None:
+                yield event.plain_result(
+                    "没有找到该指令，或你没有查看该运维指令的权限。\n"
+                    "可查询：" + available_help_topics(include_operator=operator.allowed)
+                )
+                return
+            yield event.plain_result(detail)
+            return
         lines = [
             "日报查看：/南哪日报 列表 [日期|all] [状态] [页码]（浏览问题）｜"
-            "/南哪日报 查看 <问题编号>（查看详情）｜/南哪日报 导出（下载简表）｜"
+            "/南哪日报 查看 <问题编号>（查看详情）｜"
+            "/南哪日报 导出 [日期|all] [状态]（下载简表）｜"
             "/南哪日报 关于（插件信息）",
         ]
         if operator.allowed:
@@ -442,6 +480,13 @@ class NjuQaReportPlugin(Star):
                     "investigate <问题编号>（重新调查）｜export questions（导出总表）",
                 )
             )
+        lines.extend(
+            (
+                "",
+                "指令详情：/nju_collect help <指令路径>，例如："
+                "/nju_collect help report rerun｜/nju_collect help 南哪日报 导出",
+            )
+        )
         yield event.plain_result("\n".join(lines))
 
     @nju_collect.command("status")
@@ -986,18 +1031,52 @@ class NjuQaReportPlugin(Star):
         if not authorization.allowed:
             yield event.plain_result(authorization.user_message)
             return
-        tail = _command_tail(event.get_message_str(), "nju_collect export").lower()
-        if tail not in {"questions", "all", "全部问题", ""}:
-            yield event.plain_result("用法：/nju_collect export questions")
+        tail = _command_tail(event.get_message_str(), "nju_collect export")
+        parts = tail.split(maxsplit=1)
+        if parts and parts[0].casefold() in {"questions", "问题", "全部问题"}:
+            tail = parts[1] if len(parts) == 2 else ""
+        elif parts:
+            yield event.plain_result(
+                "用法：/nju_collect export questions [YYYY-MM-DD|all] "
+                "[answerable|partial|missing|error|all]"
+            )
             return
-        path, total = await asyncio.to_thread(self.question_exporter.export_all)
+        if not tail:
+            path, total = await asyncio.to_thread(self.question_exporter.export_all)
+            try:
+                await _send_local_file(event, path)
+            except Exception as exc:
+                logger.exception("NJU operator question export file delivery failed")
+                yield event.plain_result(
+                    f"累计筛选结果总表已刷新，但文件发送失败：{_file_error(exc)}"
+                )
+                return
+            yield event.plain_result(f"累计筛选结果总表已刷新并发送，共 {total} 条。")
+            return
+        try:
+            report_date, status_filter = parse_export_arguments(tail)
+        except ValueError as exc:
+            yield event.plain_result(
+                str(exc).replace("/南哪日报 导出", "/nju_collect export questions")
+            )
+            return
+        path, total = await asyncio.to_thread(
+            self.question_exporter.export_report_questions,
+            report_date=report_date,
+            status=status_filter,
+        )
         try:
             await _send_local_file(event, path)
         except Exception as exc:
             logger.exception("NJU operator question export file delivery failed")
             yield event.plain_result(f"累计问题总表已刷新，但文件发送失败：{_file_error(exc)}")
             return
-        yield event.plain_result(f"累计问题总表已刷新并发送，共 {total} 条。")
+        scope = report_date or "全部日期"
+        status_name = coverage_label(status_filter) if status_filter else "全部状态"
+        yield event.plain_result(
+            f"日报问题表已生成并发送，共 {total} 条。\n"
+            f"范围：{scope}｜状态：{status_name}"
+        )
 
     @nju_collect.group("test")
     def nju_collect_test(self):

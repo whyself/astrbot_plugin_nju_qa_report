@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .models import QuestionCandidate
+from .models import CoverageStatus, InvestigationResult, QuestionCandidate, QuestionCluster
 from .storage import ReportStorage
 
 DECISION_LABELS = {
@@ -61,6 +61,55 @@ class QuestionCsvExporter:
                 temporary.unlink()
         return output.resolve(), total
 
+    def export_report_questions(
+        self,
+        *,
+        report_date: str | None = None,
+        status: CoverageStatus | None = None,
+    ) -> tuple[Path, int]:
+        """Export aggregated questions filtered by date and knowledge coverage."""
+
+        clusters = self._storage.list_question_clusters(report_date)
+        investigations = self._storage.investigations_for_date(report_date)
+        selected = [
+            cluster
+            for cluster in clusters
+            if status is None
+            or _public_status(investigations.get(cluster.question_code)) is status
+        ]
+        self._export_dir.mkdir(parents=True, exist_ok=True)
+        date_part = report_date or "全部日期"
+        status_part = _STATUS_FILE_LABELS.get(status, "全部状态")
+        output = self._export_dir / f"日报问题-{date_part}-{status_part}.csv"
+        temporary = output.with_suffix(".csv.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(
+                    (
+                        "问题编号",
+                        "日期",
+                        "知识库状态",
+                        "聚合问题",
+                        "分类",
+                        "出现次数",
+                        "群内回答（AI筛选并脱敏）",
+                        "调查结论",
+                        "仍缺少",
+                        "维护建议",
+                        "知识库引用",
+                    )
+                )
+                for cluster in selected:
+                    writer.writerow(
+                        _report_row(cluster, investigations.get(cluster.question_code))
+                    )
+            os.replace(temporary, output)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        return output.resolve(), len(selected)
+
     def _row(self, candidate: QuestionCandidate) -> tuple[str, ...]:
         sent_at = ""
         if candidate.sent_at_utc > 0:
@@ -79,3 +128,43 @@ class QuestionCsvExporter:
             candidate.group_alias,
             sent_at,
         )
+
+
+_STATUS_FILE_LABELS = {
+    CoverageStatus.ANSWERABLE: "明确回答",
+    CoverageStatus.PARTIAL: "部分覆盖",
+    CoverageStatus.NO_USABLE_EVIDENCE: "未找到可用信息",
+    CoverageStatus.ERROR: "程序执行异常",
+}
+
+
+def _public_status(result: InvestigationResult | None) -> CoverageStatus:
+    if result is None or result.status in {CoverageStatus.INCOMPLETE, CoverageStatus.ERROR}:
+        return CoverageStatus.ERROR
+    return result.status
+
+
+def _report_row(
+    cluster: QuestionCluster,
+    investigation: InvestigationResult | None,
+) -> tuple[str, ...]:
+    status = _public_status(investigation)
+    answers = "｜".join(answer.redacted_text for answer in cluster.answers)
+    evidence = (
+        "｜".join(f"{item.title} {item.source_url}" for item in investigation.evidence)
+        if investigation
+        else ""
+    )
+    return (
+        cluster.question_code,
+        cluster.report_date,
+        _STATUS_FILE_LABELS[status],
+        cluster.canonical_question,
+        cluster.category,
+        str(cluster.occurrence_count),
+        answers,
+        investigation.summary if investigation else "调查结果不存在",
+        investigation.missing_information if investigation else "调查未正常完成",
+        investigation.recommendation if investigation else "请重新调查",
+        evidence,
+    )

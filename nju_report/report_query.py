@@ -68,3 +68,37 @@ def parse_list_arguments(
         if page < 1:
             raise ValueError("页码必须是正整数。")
     return report_date, status, page
+
+
+def parse_export_arguments(tail: str) -> tuple[str | None, CoverageStatus | None]:
+    """Parse optional date and coverage filters for a report-question CSV."""
+
+    parts = tail.split()
+    if len(parts) > 2:
+        raise ValueError(
+            "用法：/南哪日报 导出 [YYYY-MM-DD|all] "
+            "[answerable|partial|missing|error|all]"
+        )
+    if not parts:
+        return None, None
+
+    report_date: str | None = None
+    status: CoverageStatus | None = None
+    first = parts[0].casefold()
+    if first in _STATUS_ALIASES and len(parts) == 1:
+        return None, _STATUS_ALIASES[first]
+    if first not in {"全部", "all"}:
+        try:
+            report_date = date.fromisoformat(parts[0]).isoformat()
+        except ValueError as exc:
+            raise ValueError(
+                "第一个参数必须是 YYYY-MM-DD、all，或单独填写一个状态。"
+            ) from exc
+    if len(parts) == 2:
+        key = parts[1].casefold()
+        if key not in _STATUS_ALIASES:
+            raise ValueError(
+                "状态必须填写 answerable、partial、missing、error 或 all。"
+            )
+        status = _STATUS_ALIASES[key]
+    return report_date, status
