@@ -388,6 +388,31 @@ class ReportStorage:
             ).fetchone()
         return str(row[0]) if row is not None else ""
 
+    def knowledge_document(self, namespace: str, yuque_id: str) -> KnowledgeDocument | None:
+        """Read one locally cached knowledge document by its stable Yuque ID."""
+
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT namespace, yuque_id, title, slug, url, updated_at, body, body_hash
+                FROM knowledge_documents
+                WHERE namespace = ? AND yuque_id = ?
+                """,
+                (namespace.strip(), yuque_id.strip()),
+            ).fetchone()
+        if row is None:
+            return None
+        return KnowledgeDocument(
+            namespace=str(row["namespace"]),
+            yuque_id=str(row["yuque_id"]),
+            title=str(row["title"]),
+            slug=str(row["slug"]),
+            url=str(row["url"]),
+            updated_at=str(row["updated_at"]),
+            body=str(row["body"]),
+            body_hash=str(row["body_hash"]),
+        )
+
     def delete_missing_knowledge_documents(self, namespace: str, seen_ids: set[str]) -> int:
         """Delete local documents no longer present in one approved repository."""
 

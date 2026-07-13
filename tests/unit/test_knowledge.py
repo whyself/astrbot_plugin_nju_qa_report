@@ -104,6 +104,8 @@ async def _sync_and_search_case(tmp_path: Path) -> None:
     first = await service.sync_all()
     second = await service.sync_all()
     hits = await service.search("校园卡怎么补办")
+    document = await service.read_document("qc19gt/guide", "7")
+    blocked_document = await service.read_document("qc19gt/ogaye8", "old")
 
     assert first.excluded_purged == {"qc19gt/ogaye8": 1}
     assert first.repositories[0].documents_changed == 1
@@ -112,6 +114,8 @@ async def _sync_and_search_case(tmp_path: Path) -> None:
     assert hits
     assert hits[0].chunk.namespace == "qc19gt/guide"
     assert "vector" in hits[0].methods
+    assert document is not None and "校园卡丢失后" in document.body
+    assert blocked_document is None
     assert all("ogaye8" not in call for call in yuque.calls)
     assert storage.knowledge_counts()[0] == 1
     records = {str(item["namespace"]): item for item in storage.repository_records()}

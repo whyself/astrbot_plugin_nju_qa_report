@@ -356,6 +356,23 @@ class KnowledgeService:
                 break
         return result
 
+    async def read_document(
+        self,
+        namespace: str,
+        document_id: str,
+    ) -> KnowledgeDocument | None:
+        """Read a full cached document, limited to the current repository allowlist."""
+
+        namespace = namespace.strip()
+        document_id = document_id.strip()
+        if not namespace or not document_id or namespace not in self._allowed_namespaces():
+            return None
+        return await asyncio.to_thread(
+            self._storage.knowledge_document,
+            namespace,
+            document_id,
+        )
+
     def _allowed_namespaces(self) -> tuple[str, ...]:
         excluded = {item.namespace for item in self._config.excluded_repositories}
         return tuple(item for item in self._config.approved_repositories if item not in excluded)

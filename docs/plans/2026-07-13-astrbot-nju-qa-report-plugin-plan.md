@@ -331,13 +331,13 @@ investigate_for_report(question, context, allowed_repositories, snapshot_id)
 
 ### 10.2 Agent 可自主使用的工具
 
-- `search_documents`：标题、正文、BM25 和向量混合检索。
-- `grep_documents`：跨允许仓库做全文关键词或安全正则检索。
-- `list_repository_tree`：查看仓库目录和相邻主题。
-- `read_document`：读取候选文档正文和元数据。
-- `find_related_documents`：根据已读文档寻找同目录、引用或相似文档。
+- `search`：标题、正文关键词和向量混合检索。
+- `grep`：跨允许仓库做全文字面检索。
+- `read`：按定位词或正文偏移量继续读取候选文档及元数据。
 
-不规定必须先 BM25、再向量、最后 grep。Agent 根据问题自主改写查询、全文 grep、阅读候选文档和追踪相关章节。混合检索用于召回语义相近内容，grep 用于找专有名词、系统名、文件名、旧称和精确表述，两者互补。
+不规定固定的领域查询词。Agent 在最多 6 轮的受控循环中，根据上一轮结果自主改写查询、全文 grep、
+阅读候选文档和追踪相关章节。混合检索用于召回语义相近内容，grep 用于找专有名词、系统名、文件名、
+旧称和精确表述，两者互补。程序只负责仓库权限、工具参数、轮次和最终证据引用校验。
 
 ### 10.3 调查完成契约
 

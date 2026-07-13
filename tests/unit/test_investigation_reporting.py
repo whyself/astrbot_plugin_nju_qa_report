@@ -7,10 +7,9 @@ from pathlib import Path
 
 from nju_report.config import PluginConfig
 from nju_report.investigation import (
+    AstrBotInvestigationAiClient,
     InvestigationService,
     _evidence_from_hits,
-    _grep_terms,
-    _queries_for,
 )
 from nju_report.models import (
     CoverageStatus,
@@ -41,6 +40,7 @@ class FakeKnowledge:
         self.hits = hits
         self.searches: list[str] = []
         self.greps: list[str] = []
+        self.reads: list[tuple[str, str]] = []
 
     async def search(self, query: str, *, limit: int = 8):
         self.searches.append(query)
@@ -50,18 +50,62 @@ class FakeKnowledge:
         self.greps.append(text)
         return self.hits[:limit] if text in "校园卡补办" else []
 
+    async def read_document(self, namespace: str, document_id: str):
+        self.reads.append((namespace, document_id))
+        for hit in self.hits:
+            if hit.chunk.namespace == namespace and hit.chunk.document_id == document_id:
+                return KnowledgeDocument(
+                    namespace=namespace,
+                    yuque_id=document_id,
+                    title=hit.chunk.title,
+                    slug=document_id,
+                    url=hit.chunk.source_url,
+                    updated_at=hit.chunk.updated_at,
+                    body=hit.chunk.content,
+                    body_hash=hit.chunk.content_hash,
+                )
+        return None
+
 
 class FakeAi:
     def __init__(self, *, fail: bool = False, status: str = "PARTIAL") -> None:
         self.fail = fail
         self.status = status
 
-    async def assess(self, cluster, evidence):
+    async def next_step(self, cluster, evidence, tool_history, *, must_finish):
+        del must_finish
         if self.fail:
             raise RuntimeError("provider down")
-        no_evidence = self.status == "NO_USABLE_EVIDENCE"
+        searches = [item for item in tool_history if item.get("tool") == "search"]
+        greps = [item for item in tool_history if item.get("tool") == "grep"]
+        reads = [item for item in tool_history if item.get("tool") == "read"]
+        if len(searches) < 2 or not greps:
+            return {
+                "action": "tools",
+                "tool_calls": [
+                    {"tool": "search", "query": cluster.canonical_question},
+                    {"tool": "search", "query": f"{cluster.category} 办理说明"},
+                    {"tool": "grep", "text": "校园卡"},
+                ],
+            }
+        if evidence and not reads:
+            return {
+                "action": "tools",
+                "tool_calls": [
+                    {
+                        "tool": "read",
+                        "namespace": evidence[0].namespace,
+                        "document_id": evidence[0].document_id,
+                        "offset": 0,
+                        "focus": "校园卡",
+                    }
+                ],
+            }
+        no_evidence = self.status == "NO_USABLE_EVIDENCE" or not evidence
+        final_status = "NO_USABLE_EVIDENCE" if no_evidence else self.status
         return {
-            "status": self.status,
+            "action": "final",
+            "status": final_status,
             "summary": (
                 "候选资料不能支持回答。"
                 if no_evidence
@@ -78,6 +122,50 @@ class FakeAi:
         }
 
 
+def test_real_agent_adapter_receives_tools_evidence_and_history() -> None:
+    class Response:
+        completion_text = '{"action":"tools","tool_calls":[{"tool":"grep","text":"校园卡"}]}'
+
+    class Context:
+        prompt = ""
+        system_prompt = ""
+
+        async def llm_generate(self, **kwargs):
+            self.prompt = kwargs["prompt"]
+            self.system_prompt = kwargs["system_prompt"]
+            return Response()
+
+    cluster = QuestionCluster(
+        question_code="20260712-Q001",
+        report_date="2026-07-12",
+        canonical_question="校园卡丢失后如何补办？",
+        category="校园服务",
+        candidate_source_keys=(),
+        representative_questions=(),
+        group_aliases=(),
+        first_sent_at_utc=1,
+        last_sent_at_utc=1,
+    )
+    context = Context()
+    client = AstrBotInvestigationAiClient(context, provider_id="provider")
+
+    result = asyncio.run(
+        client.next_step(
+            cluster,
+            (),
+            ({"tool": "search", "input": "校园卡补办", "result_count": 0},),
+            must_finish=False,
+        )
+    )
+
+    assert result["action"] == "tools"
+    assert '"tool_history"' in context.prompt
+    assert "校园卡补办" in context.prompt
+    assert "search" in context.system_prompt
+    assert "grep" in context.system_prompt
+    assert "read" in context.system_prompt
+
+
 def test_investigation_uses_search_and_grep_and_persists_evidence(tmp_path: Path) -> None:
     async def run() -> None:
         storage, config, cluster, hit = _prepared_case(tmp_path, repository_status="READY")
@@ -90,6 +178,10 @@ def test_investigation_uses_search_and_grep_and_persists_evidence(tmp_path: Path
         assert result.evidence[0].title == "校园卡补办"
         assert len(knowledge.searches) >= 2
         assert knowledge.greps
+        assert knowledge.reads == [("qc19gt/guide", "card")]
+        assert result.queries[0].startswith("search:")
+        assert any(item.startswith("grep:") for item in result.queries)
+        assert any(item.startswith("read:") for item in result.queries)
         assert storage.latest_investigation(cluster.question_code) == result
         storage.close()
 
@@ -134,22 +226,57 @@ def test_irrelevant_hits_can_be_classified_as_no_usable_evidence(tmp_path: Path)
     asyncio.run(run())
 
 
-def test_dorm_query_expands_aliases_and_specific_grep_terms(tmp_path: Path) -> None:
-    storage, _, cluster, _ = _prepared_case(tmp_path, repository_status="READY")
-    dorm_cluster = replace(
-        cluster,
-        canonical_question="南京大学南园二舍的宿舍结构是怎样的，是否有套间？",
-        category="住宿食堂",
-    )
+def test_agent_controls_domain_queries_without_programmed_dorm_rules(tmp_path: Path) -> None:
+    class DormAi(FakeAi):
+        async def next_step(self, cluster, evidence, tool_history, *, must_finish):
+            calls = [item.get("tool") for item in tool_history]
+            if "search" not in calls:
+                return {
+                    "action": "tools",
+                    "tool_calls": [
+                        {"tool": "search", "query": "仙林宿舍 2号楼 4号楼 房型"},
+                        {"tool": "grep", "text": "一组团"},
+                    ],
+                }
+            if "read" not in calls:
+                return {
+                    "action": "tools",
+                    "tool_calls": [
+                        {
+                            "tool": "read",
+                            "namespace": evidence[0].namespace,
+                            "document_id": evidence[0].document_id,
+                            "offset": 0,
+                            "focus": "2号楼",
+                        }
+                    ],
+                }
+            return await super().next_step(
+                cluster,
+                evidence,
+                tool_history,
+                must_finish=must_finish,
+            )
 
-    queries = _queries_for(dorm_cluster)
-    terms = _grep_terms(dorm_cluster.canonical_question)
+    async def run() -> None:
+        storage, config, cluster, hit = _prepared_case(tmp_path, repository_status="READY")
+        dorm_cluster = replace(
+            cluster,
+            canonical_question="仙林校区2栋和4栋宿舍的房型、结构和设施配置",
+            category="住宿食堂",
+        )
+        knowledge = FakeKnowledge([hit])
+        service = InvestigationService(config, storage, knowledge, DormAi())  # type: ignore[arg-type]
 
-    assert any("南二" in item for item in queries)
-    assert "南园二舍" in terms
-    assert "南二" in terms
-    assert "套间" in terms
-    storage.close()
+        result = await service.investigate(dorm_cluster)
+
+        assert "仙林宿舍 2号楼 4号楼 房型" in knowledge.searches
+        assert "一组团" in knowledge.greps
+        assert knowledge.reads
+        assert result.status is CoverageStatus.PARTIAL
+        storage.close()
+
+    asyncio.run(run())
 
 
 def test_evidence_combines_multiple_relevant_chunks_from_same_document(tmp_path: Path) -> None:

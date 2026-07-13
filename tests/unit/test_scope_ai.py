@@ -343,6 +343,9 @@ def test_final_gate_sends_only_concise_candidate_questions() -> None:
     assert "专业选修课是什么”必须保留" in context.system_prompt
     assert "标题不需要重复添加“南京大学”" in context.system_prompt
     assert "已有资料可能明确回答的问题仍应保留" in context.system_prompt
+    assert "脱离原聊天后语义完整、读者能独立看懂" in context.system_prompt
+    assert "陌生维护者测试" in context.system_prompt
+    assert "不要把语义不清的问题交给后续" in context.system_prompt
     assert "宁可少收" not in context.system_prompt
 
 
