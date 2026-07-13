@@ -481,7 +481,7 @@ def _render_html(
               <p><strong>仍缺少：</strong>{html.escape(result.missing_information)}</p>
               <p><strong>维护建议：</strong>{html.escape(result.recommendation)}</p>
               <h3>知识库引用</h3><ul>{evidence}</ul>
-              <p class="command">私聊机器人：/南哪日报 查看 {html.escape(cluster.question_code)}</p>
+              <p class="command">有查看权限的用户：/南哪日报 查看 {html.escape(cluster.question_code)}</p>
             </article>
             """
         )

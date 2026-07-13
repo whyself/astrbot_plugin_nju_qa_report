@@ -15,7 +15,6 @@ class PermissionAction(str, Enum):
 
 class AuthorizationStatus(str, Enum):
     ALLOWED = "ALLOWED"
-    PRIVATE_REQUIRED = "PRIVATE_REQUIRED"
     DENIED = "DENIED"
 
 
@@ -29,15 +28,13 @@ class AuthorizationResult:
 
     @property
     def user_message(self) -> str:
-        if self.status is AuthorizationStatus.PRIVATE_REQUIRED:
-            return "请私聊机器人执行该指令。"
         if self.status is AuthorizationStatus.DENIED:
             return "你没有执行该指令的权限。"
         return ""
 
 
 class PermissionService:
-    """Apply private-chat and role checks before any data lookup occurs."""
+    """Authorize commands by configured role in either private or group chats."""
 
     def __init__(self, config: PluginConfig) -> None:
         self._config = config
@@ -52,8 +49,9 @@ class PermissionService:
         is_private: bool,
         is_astrbot_admin: bool,
     ) -> AuthorizationResult:
-        if self._config.sensitive_commands_private_only and not is_private:
-            return AuthorizationResult(AuthorizationStatus.PRIVATE_REQUIRED)
+        # Keep this argument in the public API because AstrBot handlers know the
+        # conversation type, but authorization intentionally depends only on role.
+        del is_private
 
         normalized_sender = str(sender_id).strip()
         if action is PermissionAction.VIEW_REPORT:

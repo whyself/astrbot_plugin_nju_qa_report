@@ -55,7 +55,6 @@ class PluginConfig:
     operator_qq_ids: tuple[str, ...] = ()
     inherit_astrbot_admins_as_viewers: bool = True
     inherit_astrbot_admins_as_operators: bool = True
-    sensitive_commands_private_only: bool = True
 
     llm_provider_id: str = ""
     embedding_api_key: str = field(default="", repr=False)
@@ -208,11 +207,6 @@ class PluginConfig:
             ),
             inherit_astrbot_admins_as_operators=_boolean(
                 raw, "inherit_astrbot_admins_as_operators", True
-            ),
-            sensitive_commands_private_only=_boolean(
-                raw,
-                "sensitive_commands_private_only",
-                _boolean(raw, "report_commands_private_only", True),
             ),
             llm_provider_id=_string(raw, "llm_provider_id", ""),
             embedding_api_key=_string(raw, "embedding_api_key", ""),

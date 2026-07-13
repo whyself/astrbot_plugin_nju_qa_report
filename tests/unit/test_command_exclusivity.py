@@ -26,6 +26,33 @@ def test_every_command_stops_default_llm_fallthrough() -> None:
         assert call.func.attr == "stop_event", command.name
 
 
+def test_every_command_checks_its_role_before_serving() -> None:
+    """Group-chat availability must never bypass viewer/operator separation."""
+
+    source = (Path(__file__).parents[2] / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    commands = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and any(_is_command_decorator(item) for item in node.decorator_list)
+    ]
+    for command in commands:
+        actions = {
+            node.attr
+            for node in ast.walk(command)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "PermissionAction"
+        }
+        if command.name == "operator_help":
+            assert actions == {"VIEW_REPORT", "OPERATE"}
+        elif command.name.startswith("report_"):
+            assert actions == {"VIEW_REPORT"}, command.name
+        else:
+            assert actions == {"OPERATE"}, command.name
+
+
 def _is_command_decorator(node: ast.expr) -> bool:
     return (
         isinstance(node, ast.Call)

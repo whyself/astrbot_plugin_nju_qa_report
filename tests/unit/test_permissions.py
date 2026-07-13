@@ -46,15 +46,20 @@ def test_operator_includes_viewer_while_viewer_cannot_operate() -> None:
     ).allowed
 
 
-def test_private_requirement_is_checked_before_identity() -> None:
-    result = _service().authorize(
-        sender_id="unknown",
+def test_viewer_can_view_in_group_but_cannot_operate() -> None:
+    service = _service()
+    assert service.authorize(
+        sender_id="viewer",
         action=PermissionAction.VIEW_REPORT,
         is_private=False,
         is_astrbot_admin=False,
-    )
-    assert result.status is AuthorizationStatus.PRIVATE_REQUIRED
-    assert result.user_message == "请私聊机器人执行该指令。"
+    ).allowed
+    assert not service.authorize(
+        sender_id="viewer",
+        action=PermissionAction.OPERATE,
+        is_private=False,
+        is_astrbot_admin=False,
+    ).allowed
 
 
 def test_astrbot_admin_inheritance_is_configurable_per_action() -> None:
@@ -76,17 +81,19 @@ def test_astrbot_admin_inheritance_is_configurable_per_action() -> None:
     ).allowed
 
 
-def test_group_commands_can_be_enabled_but_still_require_role() -> None:
-    service = _service(sensitive_commands_private_only=False)
+def test_group_commands_still_require_the_corresponding_role() -> None:
+    service = _service()
     assert service.authorize(
-        sender_id="viewer",
-        action=PermissionAction.VIEW_REPORT,
+        sender_id="operator",
+        action=PermissionAction.OPERATE,
         is_private=False,
         is_astrbot_admin=False,
     ).allowed
-    assert not service.authorize(
+    result = service.authorize(
         sender_id="unknown",
         action=PermissionAction.VIEW_REPORT,
         is_private=False,
         is_astrbot_admin=False,
-    ).allowed
+    )
+    assert result.status is AuthorizationStatus.DENIED
+    assert result.user_message == "你没有执行该指令的权限。"

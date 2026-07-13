@@ -55,7 +55,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.5.9",
+    "0.6.0",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -268,7 +268,7 @@ class NjuQaReportPlugin(Star):
             "/南哪日报 导出 [YYYY-MM-DD|all] [状态]\n"
             "/南哪日报 关于\n\n"
             f"{COVERAGE_STATUS_HELP}\n\n"
-            "请私聊机器人使用。\n"
+            "有查看权限的用户可在私聊或群聊使用。\n"
             "指令详情：/nju_collect help <指令路径>"
         )
 
@@ -340,7 +340,7 @@ class NjuQaReportPlugin(Star):
                 f"{cluster.question_code}｜{coverage_label(status)}\n"
                 f"{_shorten(cluster.canonical_question, 80)}"
             )
-        lines.append("私聊发送 /南哪日报 查看 <问题编号> 可看详细报告。")
+        lines.append("有查看权限的用户发送 /南哪日报 查看 <问题编号> 可看详细报告。")
         yield event.plain_result("\n\n".join(lines))
 
     @nju_report.command("查看")
@@ -443,6 +443,15 @@ class NjuQaReportPlugin(Star):
     @nju_report.command("关于")
     async def report_about(self, event: AstrMessageEvent):
         event.stop_event()
+        authorization = self.permissions.authorize(
+            sender_id=event.get_sender_id(),
+            action=PermissionAction.VIEW_REPORT,
+            is_private=event.is_private_chat(),
+            is_astrbot_admin=event.is_admin(),
+        )
+        if not authorization.allowed:
+            yield event.plain_result(authorization.user_message)
+            return
         yield event.plain_result(
             f"南大知识缺口日报插件（非官方）\n源代码：{REPOSITORY_URL}\n许可证：AGPL-3.0-or-later"
         )

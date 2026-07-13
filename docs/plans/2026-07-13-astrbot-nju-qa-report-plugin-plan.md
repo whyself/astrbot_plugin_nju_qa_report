@@ -183,14 +183,14 @@ report_viewer_qq_ids = []
 operator_qq_ids = []
 inherit_astrbot_admins_as_viewers = true
 inherit_astrbot_admins_as_operators = true
-sensitive_commands_private_only = true
 ```
 
 - 报告查看人员：可以查看脱敏日报和单个问题详情。
-- 运维管理员：可以同步仓库、执行调查、重跑或发送日报、查看错误和技术状态。
+- 运维管理员：自动拥有报告查看权限，还可以同步仓库、执行调查、重跑或发送日报、查看错误和技术状态。
 - AstrBot 管理员是否自动继承两种权限分别可配。
 - 邮件收件人不会自动获得 QQ 查询权限，因为邮箱与 QQ 身份无法可靠对应。
-- 所有敏感命令默认只能私聊执行；群聊调用时只提示用户私聊机器人。
+- 查看者和运维管理员均可在私聊或群聊运行其角色对应的指令；未授权用户一律拒绝。
+- `/nju_collect help` 按角色裁剪输出，查看者只能看到中文日报指令，运维管理员可以看到完整运维指令。
 
 ### 5.5 日报与邮件
 

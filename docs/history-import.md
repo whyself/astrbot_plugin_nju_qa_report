@@ -48,7 +48,7 @@ Access Token 只用于打开本机 QCE 页面，不要上传到 AstrBot、GitHub
 
 ## 4. 检查并导入
 
-运维管理员私聊机器人运行：
+运维管理员在私聊或群聊中运行：
 
 ```text
 /nju_collect import inspect
@@ -89,7 +89,7 @@ Access Token 只用于打开本机 QCE 页面，不要上传到 AstrBot、GitHub
 
 `report run all` 会执行 AI 筛选、问题聚合、群友回答关联、知识库调查并生成 HTML，
 不会自动发邮件，并会跳过已经成功生成完整报告的日期。历史消息很多时会产生较多模型调用，
-请保持 AstrBot 运行；另开一条私聊反复发送 `/nju_collect report status` 可查询当前进度。
+请保持 AstrBot 运行；运维管理员可反复发送 `/nju_collect report status` 查询当前进度。
 
 只有确实需要重新计算某一天时才使用：
 
