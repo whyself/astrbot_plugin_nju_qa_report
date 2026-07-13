@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from difflib import SequenceMatcher
 
-from .models import CommunityAnswer, QuestionCandidate, QuestionCluster, StoredMessage
-from .privacy import redact_for_report
+from .answer_agent import CommunityAnswerAgent
+from .models import QuestionCandidate, QuestionCluster, StoredMessage
 from .storage import ReportStorage
 from .time_windows import natural_day_window
 
-_ANSWER_WINDOW_SECONDS = 20 * 60
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -30,9 +31,18 @@ class _ClusterBuilder:
 class QuestionAggregationService:
     """Group equivalent canonical questions without hiding ambiguous differences."""
 
-    def __init__(self, storage: ReportStorage, *, timezone_name: str) -> None:
+    def __init__(
+        self,
+        storage: ReportStorage,
+        answer_agent: CommunityAnswerAgent,
+        *,
+        timezone_name: str,
+        concurrency: int = 3,
+    ) -> None:
         self._storage = storage
+        self._answer_agent = answer_agent
         self._timezone_name = timezone_name
+        self._semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def aggregate_date(self, report_date: date) -> list[QuestionCluster]:
         candidates, _ = await asyncio.to_thread(
@@ -43,7 +53,32 @@ class QuestionAggregationService:
         included = [item for item in candidates if item.final_decision == "INCLUDE"]
         window = natural_day_window(report_date, self._timezone_name)
         messages = await asyncio.to_thread(self._storage.messages_in_window, window)
-        clusters = _aggregate(included, messages)
+        clusters = _aggregate(included)
+        excluded_message_ids = {
+            external_id
+            for item in included
+            if (external_id := _external_id_from_source_key(item.source_key))
+        }
+
+        async def attach(cluster: QuestionCluster) -> QuestionCluster:
+            async with self._semaphore:
+                try:
+                    answers = await self._answer_agent.collect(
+                        cluster,
+                        messages,
+                        excluded_message_ids=excluded_message_ids,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "NJU community-answer context agent failed for %s",
+                        cluster.question_code,
+                    )
+                    answers = ()
+                return replace(cluster, answers=answers)
+
+        clusters = list(await asyncio.gather(*(attach(item) for item in clusters)))
         await asyncio.to_thread(
             self._storage.save_question_clusters,
             report_date.isoformat(),
@@ -54,8 +89,9 @@ class QuestionAggregationService:
 
 def _aggregate(
     candidates: list[QuestionCandidate],
-    messages: list[StoredMessage],
+    messages: list[StoredMessage] | None = None,
 ) -> list[QuestionCluster]:
+    del messages  # Kept for compatibility; answer discovery is now Agent-driven.
     builders: list[_ClusterBuilder] = []
     for candidate in sorted(candidates, key=lambda item: (item.sent_at_utc, item.question_code)):
         match = next(
@@ -67,28 +103,12 @@ def _aggregate(
         else:
             match.candidates.append(candidate)
 
-    message_by_external = {item.external_message_id: item for item in messages}
-    candidate_message_ids = {
-        external
-        for item in candidates
-        if (external := _external_id_from_source_key(item.source_key))
-    }
     result: list[QuestionCluster] = []
     for builder in builders:
         ordered = sorted(
             builder.candidates, key=lambda item: (item.sent_at_utc, item.question_code)
         )
         representative = builder.representative
-        question_messages = [
-            message_by_external[external]
-            for item in ordered
-            if (external := _external_id_from_source_key(item.source_key)) in message_by_external
-        ]
-        answers = _answers_for_cluster(
-            question_messages,
-            messages,
-            excluded_message_ids=candidate_message_ids,
-        )
         result.append(
             QuestionCluster(
                 question_code=min(item.question_code for item in ordered),
@@ -106,7 +126,6 @@ def _aggregate(
                 ),
                 first_sent_at_utc=min(item.sent_at_utc for item in ordered),
                 last_sent_at_utc=max(item.sent_at_utc for item in ordered),
-                answers=tuple(answers),
             )
         )
     return sorted(result, key=lambda item: item.question_code)
@@ -130,50 +149,6 @@ def _same_question(left: QuestionCandidate, right: QuestionCandidate) -> bool:
     return bool(union) and len(left_terms & right_terms) / len(union) >= 0.72
 
 
-def _answers_for_cluster(
-    question_messages: list[StoredMessage],
-    messages: list[StoredMessage],
-    *,
-    excluded_message_ids: set[str],
-) -> list[CommunityAnswer]:
-    if not question_messages:
-        return []
-    question_ids = {item.external_message_id for item in question_messages}
-    group_ids = {item.group_id for item in question_messages}
-    first_time = min(item.sent_at_utc for item in question_messages)
-    last_time = max(item.sent_at_utc for item in question_messages)
-    question_senders = {item.sender_id for item in question_messages}
-    selected: dict[str, CommunityAnswer] = {}
-    for message in messages:
-        if message.external_message_id in question_ids | excluded_message_ids:
-            continue
-        if message.group_id not in group_ids or not message.text.strip():
-            continue
-        direct = message.reply_to_message_id in question_ids
-        temporal = (
-            last_time <= message.sent_at_utc <= last_time + _ANSWER_WINDOW_SECONDS
-            and message.sender_id not in question_senders
-            and not _looks_like_question(message.text)
-        )
-        if not direct and not temporal:
-            continue
-        if message.sent_at_utc < first_time:
-            continue
-        confidence = 0.98 if direct else 0.58
-        selected[message.external_message_id] = CommunityAnswer(
-            external_message_id=message.external_message_id,
-            redacted_text=redact_for_report(message.text, max_chars=800),
-            sent_at_utc=message.sent_at_utc,
-            confidence=confidence,
-            direct_reply=direct,
-        )
-    ordered = sorted(
-        selected.values(),
-        key=lambda item: (-int(item.direct_reply), -item.confidence, item.sent_at_utc),
-    )
-    return ordered[:8]
-
-
 def _external_id_from_source_key(source_key: str) -> str:
     parts = source_key.split(":", 3)
     return parts[3] if len(parts) == 4 and parts[0] == "message" else ""
@@ -187,12 +162,3 @@ def _bigrams(value: str) -> set[str]:
     if len(value) < 2:
         return {value} if value else set()
     return {value[index : index + 2] for index in range(len(value) - 1)}
-
-
-def _looks_like_question(value: str) -> bool:
-    text = value.strip()
-    return bool(
-        "?" in text
-        or "？" in text
-        or re.search(r"(吗|么|嘛|如何|怎么|哪里|何时|多少|能不能|可不可以)[啊呀呢吗]?$", text)
-    )

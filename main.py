@@ -14,6 +14,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .nju_report.aggregation import QuestionAggregationService
+from .nju_report.answer_agent import AstrBotContextAnswerAgent
 from .nju_report.capture_writer import AsyncCaptureWriter
 from .nju_report.config import PluginConfig
 from .nju_report.investigation import AstrBotInvestigationAiClient, InvestigationService
@@ -50,7 +51,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.2.4",
+    "0.2.5",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -101,9 +102,17 @@ class NjuQaReportPlugin(Star):
             base_dir=self._data_dir,
         )
         self.knowledge_service = KnowledgeService(self.runtime_config, self.storage)
+        self.answer_agent = AstrBotContextAnswerAgent(
+            context,
+            provider_id=self.runtime_config.llm_provider_id,
+            timeout_seconds=self.runtime_config.request_timeout_seconds,
+            max_retries=self.runtime_config.max_retries,
+        )
         self.aggregation_service = QuestionAggregationService(
             self.storage,
+            self.answer_agent,
             timezone_name=self.runtime_config.timezone,
+            concurrency=self.runtime_config.batch_concurrency,
         )
         investigation_ai = AstrBotInvestigationAiClient(
             context,
@@ -142,6 +151,7 @@ class NjuQaReportPlugin(Star):
             storage=self.storage,
             capture_writer=self.capture_writer,
             scope_review_service=self.scope_review_service,
+            answer_agent=self.answer_agent,
             astrbot_context=context,
             export_dir=self._data_dir / "exports",
             embedding_probe=self.knowledge_service.test_embedding,

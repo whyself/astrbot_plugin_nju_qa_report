@@ -10,9 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .answer_agent import CommunityAnswerAgent
 from .capture_writer import AsyncCaptureWriter
 from .config import PluginConfig
-from .models import ScopeDecision
+from .models import QuestionCluster, ScopeDecision, StoredMessage
 from .scope_classifier import AutoScopeReviewService
 from .storage import ReportStorage
 
@@ -34,6 +35,7 @@ class StartupCheckService:
         storage: ReportStorage,
         capture_writer: AsyncCaptureWriter,
         scope_review_service: AutoScopeReviewService,
+        answer_agent: CommunityAnswerAgent,
         astrbot_context: Any,
         export_dir: Path,
         embedding_probe: Callable[[], Awaitable[int]] | None = None,
@@ -42,6 +44,7 @@ class StartupCheckService:
         self._storage = storage
         self._capture_writer = capture_writer
         self._scope_review_service = scope_review_service
+        self._answer_agent = answer_agent
         self._context = astrbot_context
         self._export_dir = Path(export_dir)
         self._embedding_probe = embedding_probe
@@ -50,6 +53,7 @@ class StartupCheckService:
         checks = await asyncio.to_thread(self._local_checks)
         if live:
             checks.append(await self._check_llm_live())
+            checks.append(await self._check_answer_agent_live())
             checks.append(await self._check_embedding_live())
             checks.append(await asyncio.to_thread(self._check_yuque_live))
             checks.append(await asyncio.to_thread(self._check_smtp_live))
@@ -203,6 +207,44 @@ class StartupCheckService:
             return StartupCheck("FAIL", "实连：对话模型", detail)
         return StartupCheck("PASS", "实连：对话模型", "调用和结构化结果正常")
 
+    async def _check_answer_agent_live(self) -> StartupCheck:
+        cluster = QuestionCluster(
+            question_code="STARTUP-Q001",
+            report_date="2000-01-01",
+            canonical_question="校园卡丢失后如何处理？",
+            category="校园服务/校园卡",
+            candidate_source_keys=("message:qq:bot:startup-q",),
+            representative_questions=("校园卡丢了怎么办？",),
+            group_aliases=("启动测试群",),
+            first_sent_at_utc=1,
+            last_sent_at_utc=1,
+        )
+        messages = [
+            _startup_message("startup-q", 1, "校园卡丢了怎么办？"),
+            _startup_message(
+                "startup-water",
+                2,
+                "今天天气不错",
+            ),
+            _startup_message(
+                "startup-a",
+                3,
+                "先在信息门户挂失，再按学校说明前往服务点处理。",
+                reply_to_message_id="startup-q",
+            ),
+        ]
+        try:
+            answers = await self._answer_agent.collect(
+                cluster,
+                messages,
+                excluded_message_ids={"startup-q"},
+            )
+        except Exception as exc:
+            return StartupCheck("FAIL", "实连：群答上下文 Agent", type(exc).__name__)
+        if not any(item.external_message_id == "startup-a" for item in answers):
+            return StartupCheck("FAIL", "实连：群答上下文 Agent", "工具调用完成但未识别测试回答")
+        return StartupCheck("PASS", "实连：群答上下文 Agent", "工具调用、上下翻查和结果解析正常")
+
     async def _check_embedding_live(self) -> StartupCheck:
         if not self._config.enable_vector_search:
             return StartupCheck("WARN", "实连：Embedding", "向量检索已关闭，跳过")
@@ -290,3 +332,28 @@ def format_startup_checks(checks: list[StartupCheck], *, live: bool) -> str:
     if not live:
         lines.append("需要实连检查时使用：/nju_collect test startup live")
     return "\n".join(lines)
+
+
+def _startup_message(
+    external_id: str,
+    sent_at_utc: int,
+    text: str,
+    *,
+    reply_to_message_id: str = "",
+) -> StoredMessage:
+    return StoredMessage(
+        platform_id="qq",
+        bot_self_id="bot",
+        external_message_id=external_id,
+        message_fingerprint=external_id,
+        session_id="group:startup",
+        group_id="startup",
+        group_alias="启动测试群",
+        sender_id=f"sender-{external_id}",
+        sender_name="",
+        sent_at_utc=sent_at_utc,
+        text=text,
+        outline="",
+        reply_to_message_id=reply_to_message_id,
+        analyzable=True,
+    )

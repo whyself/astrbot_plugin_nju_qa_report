@@ -4,7 +4,7 @@ from nju_report.aggregation import _aggregate
 from nju_report.models import QuestionCandidate, StoredMessage
 
 
-def test_conservative_aggregation_merges_duplicates_and_links_direct_reply() -> None:
+def test_conservative_aggregation_merges_duplicates_before_agent_answer_search() -> None:
     candidates = [
         _candidate(
             "20260712-Q001",
@@ -43,8 +43,7 @@ def test_conservative_aggregation_merges_duplicates_and_links_direct_reply() -> 
     assert len(clusters) == 2
     assert clusters[0].question_code == "20260712-Q001"
     assert clusters[0].occurrence_count == 2
-    assert clusters[0].answers[0].direct_reply is True
-    assert clusters[0].answers[0].redacted_text == "先在信息门户挂失，再去服务点。"
+    assert clusters[0].answers == ()
     assert clusters[1].question_code == "20260712-Q003"
 
 

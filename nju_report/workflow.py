@@ -181,7 +181,7 @@ class DailyReportWorkflow:
         screening = await self._question_processor.process_date(report_date, force=force)
         if screening.status == "FAILED":
             return FullReportRunResult(screening, 0, None)
-        self._stage = "问题聚合与群友回答关联"
+        self._stage = "问题聚合与 Agent 上下文回答查找"
         clusters = await self._aggregation.aggregate_date(report_date)
         self._stage = "知识库调查"
         await self._investigation.investigate_date(report_date.isoformat())
