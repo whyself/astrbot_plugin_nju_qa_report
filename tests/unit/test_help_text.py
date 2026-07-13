@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from nju_report.help_text import (
+    COVERAGE_STATUS_HELP,
     available_help_topics,
     detailed_help,
     normalize_help_topic,
 )
+
+
+def test_coverage_status_help_distinguishes_gap_from_execution_error() -> None:
+    assert "answerable：知识库已有资料，可明确回答" in COVERAGE_STATUS_HELP
+    assert "missing：知识库没有足以回答问题的可用信息" in COVERAGE_STATUS_HELP
+    assert "error：程序或模型执行异常" in COVERAGE_STATUS_HELP
+    assert "不能据此判断知识库是否缺失" in COVERAGE_STATUS_HELP
 
 
 def test_operator_can_get_nested_command_help() -> None:

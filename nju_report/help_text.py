@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+COVERAGE_STATUS_HELP = (
+    "状态说明：\n"
+    "answerable：知识库已有资料，可明确回答\n"
+    "partial：知识库有相关资料，但只能回答一部分\n"
+    "missing：知识库没有足以回答问题的可用信息\n"
+    "error：程序或模型执行异常，不能据此判断知识库是否缺失\n"
+    "all：不筛选状态，显示或导出全部"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CommandHelp:
@@ -27,7 +36,7 @@ PUBLIC_COMMAND_HELP: dict[str, CommandHelp] = {
         "分页浏览日报问题，并显示各知识库覆盖状态的数量。",
         (
             "日期省略时查看全部日期，日期格式为 YYYY-MM-DD",
-            "状态可填 answerable、partial、missing、error 或 all",
+            COVERAGE_STATUS_HELP,
             "每页最多 20 条，页码默认为 1",
         ),
         (
@@ -47,7 +56,7 @@ PUBLIC_COMMAND_HELP: dict[str, CommandHelp] = {
         (
             "不带参数时保持原行为，导出全部 AI 筛选结果",
             "填写 all 时导出全部聚合问题及调查结果",
-            "状态可填 answerable、partial、missing、error 或 all",
+            COVERAGE_STATUS_HELP,
             "也可只填状态，例如“导出 missing”",
         ),
         ("/南哪日报 导出 missing", "/南哪日报 导出 2026-07-12 missing"),
@@ -176,7 +185,7 @@ OPERATOR_COMMAND_HELP: dict[str, CommandHelp] = {
         (
             "不带筛选参数时导出原有的全部 AI 筛选结果总表",
             "填写 all 时导出全部聚合问题及调查结果",
-            "状态可填 answerable、partial、missing、error 或 all",
+            COVERAGE_STATUS_HELP,
             "状态可以单独填写",
             "不会重新处理聊天记录或调查知识库",
         ),

@@ -18,7 +18,7 @@ from .nju_report.aggregation import QuestionAggregationService
 from .nju_report.answer_agent import AstrBotContextAnswerAgent
 from .nju_report.capture_writer import AsyncCaptureWriter
 from .nju_report.config import PluginConfig
-from .nju_report.help_text import available_help_topics, detailed_help
+from .nju_report.help_text import COVERAGE_STATUS_HELP, available_help_topics, detailed_help
 from .nju_report.investigation import AstrBotInvestigationAiClient, InvestigationService
 from .nju_report.knowledge import KnowledgeError, KnowledgeService
 from .nju_report.message_capture import MessageCaptureService
@@ -54,7 +54,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.5.6",
+    "0.5.7",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -246,7 +246,8 @@ class NjuQaReportPlugin(Star):
             "/南哪日报 查看 YYYYMMDD-QNNN\n"
             "/南哪日报 导出 [YYYY-MM-DD|all] [状态]\n"
             "/南哪日报 关于\n\n"
-            "状态可填 answerable、partial、missing、error 或 all；请私聊机器人使用。\n"
+            f"{COVERAGE_STATUS_HELP}\n\n"
+            "请私聊机器人使用。\n"
             "指令详情：/nju_collect help <指令路径>"
         )
 
@@ -463,6 +464,7 @@ class NjuQaReportPlugin(Star):
             "/南哪日报 查看 <问题编号>（查看详情）｜"
             "/南哪日报 导出 [日期|all] [状态]（下载简表）｜"
             "/南哪日报 关于（插件信息）",
+            COVERAGE_STATUS_HELP,
         ]
         if operator.allowed:
             lines.extend(
