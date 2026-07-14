@@ -95,6 +95,8 @@ evidence_indices 必须引用实际支持结论的证据编号，不能引用群
 NO_USABLE_EVIDENCE 的 evidence_indices 必须是空数组。
 """.strip()
 
+_MAX_AGENT_ROUNDS = 10
+
 
 class InvestigationError(RuntimeError):
     """Raised for invalid investigation model output."""
@@ -299,12 +301,24 @@ class InvestigationService:
         search_queries: set[str] = set()
         grep_terms: set[str] = set()
         read_documents: set[tuple[str, str]] = set()
-        max_tool_rounds = 6
-        max_rounds = 8
 
-        for round_no in range(1, max_rounds + 1):
+        for round_no in range(1, _MAX_AGENT_ROUNDS + 1):
             evidence = _agent_evidence(found.values(), read_sections)
-            must_finish = round_no > max_tool_rounds
+            must_finish = round_no == _MAX_AGENT_ROUNDS
+            if must_finish and found and not read_documents:
+                await self._execute_tool_call(
+                    _automatic_read_call(found),
+                    evidence=evidence,
+                    found=found,
+                    read_sections=read_sections,
+                    tool_history=tool_history,
+                    search_queries=search_queries,
+                    grep_terms=grep_terms,
+                    read_documents=read_documents,
+                    audit_queries=audit_queries,
+                    automatic=True,
+                )
+                evidence = _agent_evidence(found.values(), read_sections)
             data = await self._ai.next_step(
                 cluster,
                 evidence,
@@ -373,7 +387,9 @@ class InvestigationService:
                 )
                 continue
 
-        raise InvestigationError("调查 Agent 未在限定轮次内完成检索与核验")
+        raise InvestigationError(
+            f"调查 Agent 未在 {_MAX_AGENT_ROUNDS} 轮上限内完成检索与核验"
+        )
 
     async def _execute_tool_call(
         self,
@@ -387,6 +403,7 @@ class InvestigationService:
         grep_terms: set[str],
         read_documents: set[tuple[str, str]],
         audit_queries: list[str],
+        automatic: bool = False,
     ) -> None:
         tool = call["tool"]
         if tool == "search":
@@ -426,6 +443,7 @@ class InvestigationService:
                     "tool": "read",
                     "input": f"{namespace}/{document_id}",
                     "error": "只能读取当前可用证据中的文档",
+                    "automatic": automatic,
                 }
             )
             return
@@ -436,6 +454,7 @@ class InvestigationService:
                     "tool": "read",
                     "input": f"{namespace}/{document_id}",
                     "error": "文档不存在或不在允许仓库中",
+                    "automatic": automatic,
                 }
             )
             return
@@ -452,7 +471,7 @@ class InvestigationService:
                 sections.append(excerpt)
             read_documents.add(document_key)
         audit_queries.append(
-            f"read:{namespace}/{document_id}@{actual_offset}"
+            f"read:{'auto:' if automatic else ''}{namespace}/{document_id}@{actual_offset}"
             + (f"#{focus}" if focus else "")
         )
         tool_history.append(
@@ -464,6 +483,7 @@ class InvestigationService:
                 "focus": focus,
                 "focus_found": focus_found,
                 "characters": len(excerpt),
+                "automatic": automatic,
             }
         )
 
@@ -496,6 +516,29 @@ class InvestigationService:
     def _allowed_namespaces(self) -> tuple[str, ...]:
         excluded = {item.namespace for item in self._config.excluded_repositories}
         return tuple(item for item in self._config.approved_repositories if item not in excluded)
+
+
+def _automatic_read_call(
+    found: dict[str, KnowledgeSearchHit],
+) -> dict[str, Any]:
+    """Read the highest-scoring candidate around its matching chunk before finalization."""
+
+    top_hit = min(
+        found.values(),
+        key=lambda item: (
+            -item.score,
+            item.chunk.namespace,
+            item.chunk.document_id,
+            item.chunk.chunk_index,
+        ),
+    )
+    return {
+        "tool": "read",
+        "namespace": top_hit.chunk.namespace,
+        "document_id": top_hit.chunk.document_id,
+        "offset": 0,
+        "focus": top_hit.chunk.content.strip()[:120],
+    }
 
 
 def _parse_tool_calls(data: dict[str, Any]) -> tuple[dict[str, Any], ...]:
