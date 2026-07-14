@@ -128,14 +128,18 @@ OPERATOR_COMMAND_HELP: dict[str, CommandHelp] = {
         ("/nju_collect report run 2026-07-12", "/nju_collect report run all"),
     ),
     "report rerun": CommandHelp(
-        "/nju_collect report rerun <YYYY-MM-DD> confirm",
-        "强制重跑某个已结束日期的筛选、聚合、知识调查和报告。",
+        "/nju_collect report rerun <YYYY-MM-DD|all> confirm",
+        "强制重跑某个已结束日期，或全部有聊天记录的历史日期。",
         (
             "必须带 confirm 防止误操作",
-            "会产生新的筛选及报告版本",
+            "all 会逐日重新筛选、聚合、调查并产生新版本",
+            "只生成报告，不会自动发送邮件",
             "运行期间用 report status 查询进度",
         ),
-        ("/nju_collect report rerun 2026-07-12 confirm",),
+        (
+            "/nju_collect report rerun 2026-07-12 confirm",
+            "/nju_collect report rerun all confirm",
+        ),
     ),
     "report status": CommandHelp(
         "/nju_collect report status [YYYY-MM-DD]",

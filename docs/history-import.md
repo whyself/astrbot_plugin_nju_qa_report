@@ -91,10 +91,11 @@ Access Token 只用于打开本机 QCE 页面，不要上传到 AstrBot、GitHub
 不会自动发邮件，并会跳过已经成功生成完整报告的日期。历史消息很多时会产生较多模型调用，
 请保持 AstrBot 运行；运维管理员可反复发送 `/nju_collect report status` 查询当前进度。
 
-只有确实需要重新计算某一天时才使用：
+只有确实需要重新计算已完成结果时才使用；可指定单日，也可重跑全部历史日期：
 
 ```text
 /nju_collect report rerun 2026-07-01 confirm
+/nju_collect report rerun all confirm
 ```
 
 再按日期查看：

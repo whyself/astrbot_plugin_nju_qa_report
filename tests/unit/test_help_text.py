@@ -19,8 +19,9 @@ def test_operator_can_get_nested_command_help() -> None:
     text = detailed_help("report rerun", include_operator=True)
 
     assert text is not None
-    assert "/nju_collect report rerun <YYYY-MM-DD> confirm" in text
+    assert "/nju_collect report rerun <YYYY-MM-DD|all> confirm" in text
     assert "强制重跑" in text
+    assert "/nju_collect report rerun all confirm" in text
     assert "report status" in text
 
 

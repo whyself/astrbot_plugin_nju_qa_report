@@ -84,6 +84,55 @@ def test_normal_history_run_skips_complete_report_but_force_recomputes(tmp_path:
     asyncio.run(run())
 
 
+def test_force_all_history_recomputes_every_available_date(tmp_path: Path) -> None:
+    async def run() -> None:
+        first_date = date(2026, 7, 11)
+        second_date = date(2026, 7, 12)
+        storage = _complete_report_storage(tmp_path, first_date)
+        window = natural_day_window(second_date, "Asia/Shanghai")
+        storage.insert_message(
+            StoredMessage(
+                platform_id="qq",
+                bot_self_id="bot",
+                external_message_id="m2",
+                message_fingerprint="fp2",
+                session_id="group:1",
+                group_id="1",
+                group_alias="测试群",
+                sender_id="u2",
+                sender_name="",
+                sent_at_utc=window.start_timestamp + 1,
+                text="宿舍什么时候开放？",
+                outline="",
+                reply_to_message_id="",
+                analyzable=True,
+            )
+        )
+        existing = storage.latest_report(first_date.isoformat())
+        assert existing is not None
+        processor = FakeProcessor()
+        workflow = DailyReportWorkflow(  # type: ignore[arg-type]
+            storage,
+            processor,
+            FakeAggregation(),
+            FakeInvestigation(),
+            FakeReports(existing),
+            FakeKnowledge(),
+            timezone_name="Asia/Shanghai",
+        )
+
+        results = await workflow.run_all_history(
+            before_date=date(2026, 7, 13),
+            force=True,
+        )
+
+        assert len(results) == 2
+        assert processor.calls == [(first_date, True), (second_date, True)]
+        storage.close()
+
+    asyncio.run(run())
+
+
 def test_workflow_returns_only_this_run_provider_token_usage(tmp_path: Path) -> None:
     class UsageProcessor(FakeProcessor):
         def __init__(self, tracker: TokenUsageTracker) -> None:

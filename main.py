@@ -56,7 +56,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.6.8",
+    "0.6.9",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -530,7 +530,7 @@ class NjuQaReportPlugin(Star):
                     "仓库：repo status（同步状态）｜repo sync（同步语雀）｜"
                     "repo search <关键词>（本地检索）",
                     "报告：report run <日期|all>（正常处理）｜"
-                    "report rerun <日期> confirm（强制重跑）｜report status [日期]（进度）｜"
+                    "report rerun <日期|all> confirm（强制重跑）｜report status [日期]（进度）｜"
                     "report preview <日期>（预览 HTML）｜report send <日期>（发送邮件）",
                     "诊断：test startup [live]（配置检查）｜test scope <问题>（筛选测试）｜"
                     "investigate <问题编号>（重新调查）｜export questions（导出总表）",
@@ -832,32 +832,45 @@ class NjuQaReportPlugin(Star):
         parts = _command_tail(event.get_message_str(), "nju_collect report rerun").split()
         if len(parts) != 2 or parts[1].lower() not in {"confirm", "确认"}:
             yield event.plain_result(
-                "强制重跑会重新执行该日 AI 筛选、聚合和全部知识调查。\n"
-                "确认执行：/nju_collect report rerun YYYY-MM-DD confirm"
+                "强制重跑会重新执行指定日期或全部历史日期的 AI 筛选、聚合和知识调查。\n"
+                "确认执行：\n"
+                "/nju_collect report rerun YYYY-MM-DD confirm\n"
+                "/nju_collect report rerun all confirm"
             )
             return
-        try:
-            requested_date = date.fromisoformat(parts[0])
-        except ValueError:
-            yield event.plain_result("日期必须使用 YYYY-MM-DD。")
-            return
         current_date = today_in_timezone(self.runtime_config.timezone)
-        if requested_date >= current_date:
-            yield event.plain_result("只能强制重跑已经结束的自然日。")
-            return
+        normalized = parts[0].lower()
+        if normalized not in {"all", "全部"}:
+            try:
+                requested_date = date.fromisoformat(parts[0])
+            except ValueError:
+                yield event.plain_result("日期必须使用 YYYY-MM-DD，或填写 all/全部。")
+                return
+            if requested_date >= current_date:
+                yield event.plain_result("只能强制重跑已经结束的自然日。")
+                return
         if self.workflow.progress().running:
             yield event.plain_result("已有日报任务运行中；可用 report status 查询进度。")
             return
         try:
             await self.capture_writer.flush(timeout_seconds=30)
             await self.workflow.sync_knowledge()
-            result = await self.workflow.run_date(requested_date, force=True)
+            if normalized in {"all", "全部"}:
+                results = await self.workflow.run_all_history(
+                    before_date=current_date,
+                    force=True,
+                )
+            else:
+                results = [await self.workflow.run_date(requested_date, force=True)]
             await asyncio.to_thread(self.question_exporter.export_all)
         except Exception as exc:
             logger.exception("NJU forced report rerun failed")
             yield event.plain_result(f"强制重跑失败：{_operator_error(exc)}")
             return
-        yield event.plain_result("强制重跑完成\n" + _format_full_run_results([result]))
+        if not results:
+            yield event.plain_result("本地没有可强制重跑的历史聊天日期。")
+            return
+        yield event.plain_result("强制重跑完成\n" + _format_full_run_results(results))
 
     @nju_collect_report.command("preview")
     async def operator_report_preview(self, event: AstrMessageEvent):
