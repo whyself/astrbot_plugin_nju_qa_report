@@ -85,6 +85,7 @@ def test_storage_initialization_is_idempotent_and_uses_safety_pragmas(
         "reports",
         "mail_deliveries",
         "screening_versions",
+        "scheduled_report_runs",
     }
     storage.close()
 
@@ -145,8 +146,117 @@ def test_migrations_tolerate_indexes_left_by_an_older_partial_run(tmp_path: Path
     recovered.initialize()
     with sqlite3.connect(path) as connection:
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-    assert version == 6
+    assert version == 7
     recovered.close()
+
+
+def test_scheduled_report_run_state_is_persistent_and_retryable(tmp_path: Path) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+
+    assert storage.scheduled_report_run("2026-07-14") is None
+    first_claim = storage.begin_scheduled_report_run(
+        "2026-07-14",
+        "2026-07-13",
+        now_utc=100,
+        stale_before_utc=0,
+    )
+    assert first_claim is not None
+    running = storage.scheduled_report_run("2026-07-14")
+    assert running is not None
+    assert running.status == "RUNNING"
+    assert running.attempts == 1
+
+    storage.fail_scheduled_report_run(
+        "2026-07-14",
+        error_summary="smtp failed",
+        next_retry_at_utc=1000,
+        now_utc=101,
+        claim_token=first_claim,
+    )
+    failed = storage.scheduled_report_run("2026-07-14")
+    assert failed is not None
+    assert failed.status == "RETRY_PENDING"
+    assert failed.next_retry_at_utc == 1000
+    assert storage.begin_scheduled_report_run(
+        "2026-07-14",
+        "2026-07-13",
+        now_utc=999,
+        stale_before_utc=0,
+    ) is None
+
+    retry_claim = storage.begin_scheduled_report_run(
+        "2026-07-14",
+        "2026-07-13",
+        now_utc=1000,
+        stale_before_utc=0,
+    )
+    assert retry_claim is not None
+    retried = storage.scheduled_report_run("2026-07-14")
+    assert retried is not None
+    assert retried.status == "RUNNING"
+    assert retried.attempts == 2
+
+    storage.complete_scheduled_report_run(
+        "2026-07-14",
+        now_utc=1001,
+        claim_token=retry_claim,
+    )
+    sent = storage.scheduled_report_run("2026-07-14")
+    assert sent is not None
+    assert sent.status == "SENT"
+    assert sent.sent_at_utc == 1001
+    assert storage.begin_scheduled_report_run(
+        "2026-07-14",
+        "2026-07-13",
+        now_utc=2000,
+        stale_before_utc=0,
+    ) is None
+    storage.close()
+
+
+def test_fresh_running_schedule_claim_is_protected_until_stale(tmp_path: Path) -> None:
+    path = tmp_path / "report.sqlite3"
+    first = ReportStorage(path)
+    first.initialize()
+    second = ReportStorage(path)
+    second.initialize()
+
+    first_claim = first.begin_scheduled_report_run(
+        "2026-07-14",
+        "2026-07-13",
+        now_utc=100,
+        stale_before_utc=0,
+    )
+    assert first_claim is not None
+    assert second.begin_scheduled_report_run(
+        "2026-07-14",
+        "2026-07-13",
+        now_utc=101,
+        stale_before_utc=-1699,
+    ) is None
+
+    replacement_claim = second.begin_scheduled_report_run(
+        "2026-07-14",
+        "2026-07-13",
+        now_utc=1900,
+        stale_before_utc=100,
+    )
+    assert replacement_claim is not None
+    assert replacement_claim != first_claim
+    with pytest.raises(StorageError, match="not active"):
+        first.complete_scheduled_report_run(
+            "2026-07-14",
+            now_utc=1901,
+            claim_token=first_claim,
+        )
+    second.complete_scheduled_report_run(
+        "2026-07-14",
+        now_utc=1901,
+        claim_token=replacement_claim,
+    )
+    first.close()
+    second.close()
 
 
 def test_failed_screening_version_restores_last_completed_snapshot(tmp_path: Path) -> None:

@@ -96,6 +96,12 @@ class DeliverySummary:
     failed: int = 0
 
 
+def recipient_hash(recipient: str) -> str:
+    """Return the stable privacy-preserving key used for mail idempotency."""
+
+    return hashlib.sha256(recipient.casefold().encode("utf-8")).hexdigest()
+
+
 class ReportService:
     def __init__(
         self,
@@ -159,41 +165,81 @@ class ReportService:
         mail_html = _render_mail_html(report.report_date, clusters, investigations)
         sent = skipped = failed = 0
         for recipient in self._config.mail_recipients:
-            recipient_hash = hashlib.sha256(recipient.casefold().encode("utf-8")).hexdigest()
+            hashed_recipient = recipient_hash(recipient)
             claimed = await asyncio.to_thread(
                 self._storage.begin_mail_delivery,
                 report.report_id,
-                recipient_hash,
+                hashed_recipient,
             )
             if not claimed:
                 skipped += 1
                 continue
-            try:
-                await asyncio.to_thread(
-                    self._send_one,
-                    recipient,
-                    report.subject,
-                    mail_text,
-                    mail_html,
-                    full_html,
-                    Path(report.html_path),
-                )
-            except Exception as exc:
-                failed += 1
-                await asyncio.to_thread(
-                    self._storage.complete_mail_delivery,
-                    report.report_id,
-                    recipient_hash,
-                    error_summary=type(exc).__name__,
-                )
-            else:
+            delivered = await self._send_and_record(
+                report,
+                recipient,
+                hashed_recipient,
+                mail_text,
+                mail_html,
+                full_html,
+            )
+            if delivered:
                 sent += 1
-                await asyncio.to_thread(
-                    self._storage.complete_mail_delivery,
-                    report.report_id,
-                    recipient_hash,
-                )
+            else:
+                failed += 1
         return DeliverySummary(sent=sent, skipped=skipped, failed=failed)
+
+    async def _send_and_record(
+        self,
+        report: ReportArtifact,
+        recipient: str,
+        hashed_recipient: str,
+        mail_text: str,
+        mail_html: str,
+        full_html: str,
+    ) -> bool:
+        """Finish one SMTP attempt and persist its outcome before honoring cancellation."""
+
+        cancelled = False
+        send_error: Exception | None = None
+        send_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._send_one,
+                recipient,
+                report.subject,
+                mail_text,
+                mail_html,
+                full_html,
+                Path(report.html_path),
+            )
+        )
+        try:
+            await asyncio.shield(send_task)
+        except asyncio.CancelledError:
+            cancelled = True
+            try:
+                await send_task
+            except Exception as exc:
+                send_error = exc
+        except Exception as exc:
+            send_error = exc
+
+        complete_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._storage.complete_mail_delivery,
+                report.report_id,
+                hashed_recipient,
+                error_summary=type(send_error).__name__ if send_error is not None else "",
+            )
+        )
+        try:
+            await asyncio.shield(complete_task)
+        except asyncio.CancelledError:
+            cancelled = True
+            await complete_task
+
+        if cancelled:
+            raise asyncio.CancelledError
+        return send_error is None
 
     def _mail_configured(self) -> bool:
         return bool(

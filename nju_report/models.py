@@ -286,3 +286,19 @@ class MailDelivery:
     attempts: int
     error_summary: str
     sent_at_utc: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledReportRun:
+    """Persistent state for one calendar day's automatic report attempt."""
+
+    scheduled_date: str
+    report_date: str
+    status: str
+    attempts: int
+    claim_token: str
+    error_summary: str
+    next_retry_at_utc: int | None
+    created_at_utc: int
+    updated_at_utc: int
+    sent_at_utc: int | None

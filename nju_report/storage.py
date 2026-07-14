@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
@@ -24,6 +25,7 @@ from .models import (
     QuestionCandidate,
     QuestionCluster,
     ReportArtifact,
+    ScheduledReportRun,
     ScopeAssessment,
     ScopeResolution,
     ScreeningVersion,
@@ -31,7 +33,7 @@ from .models import (
 )
 from .time_windows import TimeWindow
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 
 class StorageError(RuntimeError):
@@ -905,6 +907,178 @@ class ReportStorage:
             for row in rows
         ]
 
+    def report_date_delivered_to(
+        self,
+        report_date: str,
+        recipient_hashes: tuple[str, ...],
+    ) -> bool:
+        """Return whether every configured recipient got any version for the date."""
+
+        required = tuple(sorted(set(recipient_hashes)))
+        if not required:
+            return False
+        placeholders = ", ".join("?" for _ in required)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT DISTINCT deliveries.recipient_hash
+                FROM mail_deliveries AS deliveries
+                JOIN reports ON reports.id = deliveries.report_id
+                WHERE reports.report_date = ?
+                    AND deliveries.status = 'SENT'
+                    AND deliveries.recipient_hash IN ({placeholders})
+                """,
+                (report_date, *required),
+            ).fetchall()
+        delivered = {str(row["recipient_hash"]) for row in rows}
+        return delivered == set(required)
+
+    def scheduled_report_run(self, scheduled_date: str) -> ScheduledReportRun | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM scheduled_report_runs WHERE scheduled_date = ?",
+                (scheduled_date,),
+            ).fetchone()
+        return _scheduled_report_run_from_row(row) if row is not None else None
+
+    def oldest_unfinished_scheduled_report_run(self) -> ScheduledReportRun | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM scheduled_report_runs
+                WHERE status != 'SENT'
+                ORDER BY scheduled_date
+                LIMIT 1
+                """
+            ).fetchone()
+        return _scheduled_report_run_from_row(row) if row is not None else None
+
+    def begin_scheduled_report_run(
+        self,
+        scheduled_date: str,
+        report_date: str,
+        *,
+        now_utc: int,
+        stale_before_utc: int,
+    ) -> str | None:
+        """Claim a due scheduled run, including a stale RUNNING attempt."""
+
+        claim_token = uuid.uuid4().hex
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM scheduled_report_runs WHERE scheduled_date = ?",
+                (scheduled_date,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO scheduled_report_runs (
+                        scheduled_date, report_date, status, attempts,
+                        claim_token, error_summary, next_retry_at_utc,
+                        created_at_utc, updated_at_utc, sent_at_utc
+                    ) VALUES (?, ?, 'RUNNING', 1, ?, '', NULL, ?, ?, NULL)
+                    """,
+                    (scheduled_date, report_date, claim_token, now_utc, now_utc),
+                )
+                return claim_token
+            if str(existing["report_date"]) != report_date:
+                raise StorageError("scheduled report date does not match persisted state")
+            status = str(existing["status"])
+            if status == "SENT":
+                return None
+            retry_at = existing["next_retry_at_utc"]
+            if status == "RETRY_PENDING" and retry_at is not None and int(retry_at) > now_utc:
+                return None
+            if status == "RUNNING" and int(existing["updated_at_utc"]) > stale_before_utc:
+                return None
+            connection.execute(
+                """
+                UPDATE scheduled_report_runs
+                SET status = 'RUNNING', attempts = attempts + 1,
+                    claim_token = ?, error_summary = '', next_retry_at_utc = NULL,
+                    updated_at_utc = ?
+                WHERE scheduled_date = ?
+                """,
+                (claim_token, now_utc, scheduled_date),
+            )
+            return claim_token
+
+    def fail_scheduled_report_run(
+        self,
+        scheduled_date: str,
+        *,
+        error_summary: str,
+        next_retry_at_utc: int,
+        now_utc: int,
+        claim_token: str,
+    ) -> None:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE scheduled_report_runs
+                SET status = 'RETRY_PENDING', error_summary = ?,
+                    next_retry_at_utc = ?, updated_at_utc = ?, claim_token = ''
+                WHERE scheduled_date = ? AND status = 'RUNNING' AND claim_token = ?
+                """,
+                (
+                    error_summary[:1000],
+                    next_retry_at_utc,
+                    now_utc,
+                    scheduled_date,
+                    claim_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError("scheduled report run is not active")
+
+    def complete_scheduled_report_run(
+        self,
+        scheduled_date: str,
+        *,
+        now_utc: int,
+        claim_token: str,
+    ) -> None:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE scheduled_report_runs
+                SET status = 'SENT', error_summary = '', next_retry_at_utc = NULL,
+                    updated_at_utc = ?, sent_at_utc = ?, claim_token = ''
+                WHERE scheduled_date = ? AND status = 'RUNNING' AND claim_token = ?
+                """,
+                (now_utc, now_utc, scheduled_date, claim_token),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError("scheduled report run is not active")
+
+    def bootstrap_scheduled_report_sent(
+        self,
+        scheduled_date: str,
+        report_date: str,
+        *,
+        now_utc: int,
+    ) -> bool:
+        """Record legacy successful deliveries without rerunning the workflow."""
+
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO scheduled_report_runs (
+                    scheduled_date, report_date, status, attempts,
+                    claim_token, error_summary, next_retry_at_utc,
+                    created_at_utc, updated_at_utc, sent_at_utc
+                ) VALUES (?, ?, 'SENT', 0, '', '', NULL, ?, ?, ?)
+                ON CONFLICT(scheduled_date) DO UPDATE SET
+                    status = 'SENT', claim_token = '', error_summary = '',
+                    next_retry_at_utc = NULL,
+                    updated_at_utc = excluded.updated_at_utc,
+                    sent_at_utc = excluded.sent_at_utc
+                WHERE scheduled_report_runs.status != 'SENT'
+                """,
+                (scheduled_date, report_date, now_utc, now_utc, now_utc),
+            )
+            return cursor.rowcount == 1
+
     def messages_in_window(
         self,
         window: TimeWindow,
@@ -1583,6 +1757,13 @@ class ReportStorage:
                     "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
                     (6, int(time.time())),
                 )
+                version = 6
+            if version < 7:
+                self._migration_v7(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+                    (7, int(time.time())),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1949,6 +2130,47 @@ class ReportStorage:
                     int(window["updated_at_utc"]) if window is not None else now,
                 ),
             )
+
+    @staticmethod
+    def _migration_v7(connection: sqlite3.Connection) -> None:
+        """Persist automatic daily report scheduling and retry state."""
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_report_runs (
+                scheduled_date TEXT PRIMARY KEY,
+                report_date TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN ('RUNNING', 'RETRY_PENDING', 'SENT')),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                claim_token TEXT NOT NULL DEFAULT '',
+                error_summary TEXT NOT NULL DEFAULT '',
+                next_retry_at_utc INTEGER,
+                created_at_utc INTEGER NOT NULL,
+                updated_at_utc INTEGER NOT NULL,
+                sent_at_utc INTEGER
+            )
+            """
+        )
+
+
+def _scheduled_report_run_from_row(row: sqlite3.Row) -> ScheduledReportRun:
+    return ScheduledReportRun(
+        scheduled_date=str(row["scheduled_date"]),
+        report_date=str(row["report_date"]),
+        status=str(row["status"]),
+        attempts=int(row["attempts"]),
+        claim_token=str(row["claim_token"]),
+        error_summary=str(row["error_summary"]),
+        next_retry_at_utc=(
+            int(row["next_retry_at_utc"])
+            if row["next_retry_at_utc"] is not None
+            else None
+        ),
+        created_at_utc=int(row["created_at_utc"]),
+        updated_at_utc=int(row["updated_at_utc"]),
+        sent_at_utc=(int(row["sent_at_utc"]) if row["sent_at_utc"] is not None else None),
+    )
 
 
 def _candidate_from_row(row: sqlite3.Row) -> QuestionCandidate:

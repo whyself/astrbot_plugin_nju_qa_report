@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from nju_report.config import PluginConfig
 from nju_report.investigation import (
@@ -547,6 +550,62 @@ def test_report_versions_and_mail_delivery_are_idempotent(
             storage.latest_investigation(cluster.question_code),
             timezone_name="Asia/Shanghai",
         )
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_cancelling_delivery_waits_for_smtp_and_persists_before_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        storage, _, cluster, _ = _prepared_case(tmp_path, repository_status="READY")
+        config = PluginConfig.from_mapping(
+            {
+                "smtp_host": "smtp.qq.com",
+                "smtp_username": "sender@qq.com",
+                "smtp_password": "secret",
+                "mail_from": "sender@qq.com",
+                "mail_recipients": ["reader@example.com"],
+            }
+        )
+        reports = ReportService(config, storage, tmp_path / "reports")
+        started = threading.Event()
+        release = threading.Event()
+        sent: list[str] = []
+
+        def delayed_send(
+            recipient: str,
+            subject: str,
+            text_body: str,
+            html_body: str,
+            full_html: str,
+            path: Path,
+        ) -> None:
+            del subject, text_body, html_body, full_html, path
+            started.set()
+            assert release.wait(timeout=5)
+            sent.append(recipient)
+
+        monkeypatch.setattr(reports, "_send_one", delayed_send)
+        report = await reports.build(cluster.report_date)
+        delivery_task = asyncio.create_task(reports.deliver(report))
+        assert await asyncio.to_thread(started.wait, 2)
+
+        delivery_task.cancel()
+        await asyncio.sleep(0)
+        assert not delivery_task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await delivery_task
+
+        deliveries = storage.mail_deliveries(report.report_id)
+        assert len(deliveries) == 1
+        assert deliveries[0].status == "SENT"
+        retry = await reports.deliver(report)
+        assert retry.skipped == 1
+        assert sent == ["reader@example.com"]
         storage.close()
 
     asyncio.run(run())
