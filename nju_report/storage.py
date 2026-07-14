@@ -33,7 +33,7 @@ from .models import (
 )
 from .time_windows import TimeWindow
 
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 
 class StorageError(RuntimeError):
@@ -536,8 +536,9 @@ class ReportStorage:
                         report_date, question_code, canonical_question, category,
                         occurrence_count, group_aliases_json,
                         representative_questions_json, first_sent_at_utc,
-                        last_sent_at_utc, updated_at_utc, created_at_utc
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        last_sent_at_utc, community_context_degraded,
+                        updated_at_utc, created_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(question_code) DO UPDATE SET
                         canonical_question = excluded.canonical_question,
                         category = excluded.category,
@@ -546,6 +547,7 @@ class ReportStorage:
                         representative_questions_json = excluded.representative_questions_json,
                         first_sent_at_utc = excluded.first_sent_at_utc,
                         last_sent_at_utc = excluded.last_sent_at_utc,
+                        community_context_degraded = excluded.community_context_degraded,
                         updated_at_utc = excluded.updated_at_utc
                     """,
                     (
@@ -558,6 +560,7 @@ class ReportStorage:
                         json.dumps(cluster.representative_questions, ensure_ascii=False),
                         cluster.first_sent_at_utc,
                         cluster.last_sent_at_utc,
+                        int(cluster.community_context_degraded),
                         now,
                         now,
                     ),
@@ -684,6 +687,7 @@ class ReportStorage:
                 )
                 for item in answer_rows
             ),
+            community_context_degraded=bool(row["community_context_degraded"]),
         )
 
     def save_investigation(self, result: InvestigationResult) -> int:
@@ -1764,6 +1768,13 @@ class ReportStorage:
                     "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
                     (7, int(time.time())),
                 )
+                version = 7
+            if version < 8:
+                self._migration_v8(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+                    (8, int(time.time())),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -2152,6 +2163,23 @@ class ReportStorage:
             )
             """
         )
+
+    @staticmethod
+    def _migration_v8(connection: sqlite3.Connection) -> None:
+        """Persist per-question community-context degradation."""
+
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(question_clusters)").fetchall()
+        }
+        if "community_context_degraded" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE question_clusters
+                ADD COLUMN community_context_degraded INTEGER NOT NULL DEFAULT 0
+                    CHECK(community_context_degraded IN (0, 1))
+                """
+            )
 
 
 def _scheduled_report_run_from_row(row: sqlite3.Row) -> ScheduledReportRun:

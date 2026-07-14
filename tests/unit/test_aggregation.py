@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -138,6 +139,57 @@ def test_answer_lookup_progress_counts_completed_clusters() -> None:
         result = await service.aggregate_date(date(2026, 7, 12))
         assert len(result) == 2
         assert service.progress == ("2026-07-12", 2, 2)
+
+    asyncio.run(run())
+
+
+def test_answer_agent_failure_marks_only_the_fallback_cluster_degraded() -> None:
+    class Storage:
+        saved: list[QuestionCluster] = []
+
+        def list_question_candidates(self, *, report_date: str, limit):
+            del report_date, limit
+            return (
+                [
+                    _candidate(
+                        "20260712-Q001",
+                        "message:qq:bot:q1",
+                        "宿舍怎么分配？",
+                        "南京大学宿舍如何分配",
+                        "住宿",
+                        100,
+                    )
+                ],
+                1,
+            )
+
+        def messages_in_window(self, window):
+            del window
+            return [_message("q1", 100, "u1", "宿舍怎么分配？")]
+
+        def save_question_clusters(self, report_date: str, clusters):
+            del report_date
+            self.saved = list(clusters)
+
+    class FailingAgent:
+        async def collect(self, cluster, messages):
+            del cluster, messages
+            raise RuntimeError("invalid model contract")
+
+    async def run() -> None:
+        storage = Storage()
+        service = QuestionAggregationService(  # type: ignore[arg-type]
+            storage,
+            FailingAgent(),
+            timezone_name="Asia/Shanghai",
+            concurrency=1,
+        )
+
+        clusters = await service.aggregate_date(date(2026, 7, 12))
+
+        assert len(clusters) == 1
+        assert clusters[0].community_context_degraded is True
+        assert storage.saved == clusters
 
     asyncio.run(run())
 
@@ -352,9 +404,15 @@ def test_reaggregation_can_move_candidate_between_existing_clusters(tmp_path: Pa
         ],
     )
 
+    stored = storage.list_question_clusters("2026-07-12")
+    storage.save_question_clusters(
+        "2026-07-12",
+        [replace(stored[0], community_context_degraded=True)],
+    )
     clusters = storage.list_question_clusters("2026-07-12")
     assert len(clusters) == 1
     assert clusters[0].candidate_source_keys == (first.source_key, second.source_key)
+    assert clusters[0].community_context_degraded is True
     storage.close()
 
 

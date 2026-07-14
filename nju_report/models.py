@@ -233,6 +233,7 @@ class QuestionCluster:
     first_sent_at_utc: int
     last_sent_at_utc: int
     answers: tuple[CommunityAnswer, ...] = ()
+    community_context_degraded: bool = False
 
     @property
     def occurrence_count(self) -> int:

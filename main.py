@@ -34,6 +34,7 @@ from .nju_report.question_processor import (
 from .nju_report.report_query import parse_export_arguments, parse_list_arguments
 from .nju_report.reporting import (
     ReportService,
+    community_context_degraded_count,
     coverage_counts,
     coverage_label,
     coverage_list_order,
@@ -330,8 +331,12 @@ class NjuQaReportPlugin(Star):
         if not shown:
             scope = report_date or "全部日期"
             status_name = coverage_label(status_filter) if status_filter else "全部状态"
+            counts_text = format_coverage_counts(
+                counts,
+                community_context_degraded=community_context_degraded_count(clusters),
+            )
             yield event.plain_result(
-                f"{format_coverage_counts(counts)}\n\n"
+                f"{counts_text}\n\n"
                 f"没有符合范围“{scope}”、状态“{status_name}”和页码 {page} 的日报问题。"
             )
             return
@@ -339,7 +344,10 @@ class NjuQaReportPlugin(Star):
         scope = report_date or "全部日期"
         status_name = coverage_label(status_filter) if status_filter else "全部状态"
         lines = [
-            format_coverage_counts(counts),
+            format_coverage_counts(
+                counts,
+                community_context_degraded=community_context_degraded_count(clusters),
+            ),
             (
                 f"日报问题（范围：{scope}｜状态：{status_name}｜"
                 f"第 {page}/{total_pages} 页，共 {len(filtered)} 条）"

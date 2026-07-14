@@ -84,6 +84,7 @@ class QuestionAggregationService:
                             cluster,
                             representative_questions=(cluster.canonical_question,),
                             answers=(),
+                            community_context_degraded=True,
                         ),
                     )
                 else:
@@ -138,6 +139,9 @@ class QuestionAggregationService:
                                     else cluster.last_sent_at_utc
                                 ),
                                 answers=question.answers,
+                                community_context_degraded=(
+                                    question.community_context_degraded
+                                ),
                             )
                         )
                     results = tuple(split_results)

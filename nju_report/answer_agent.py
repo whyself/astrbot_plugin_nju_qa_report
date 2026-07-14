@@ -95,6 +95,7 @@ class DiscoveredQuestion:
     answers: tuple[CommunityAnswer, ...]
     canonical_question: str = ""
     category: str = ""
+    community_context_degraded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +107,7 @@ class AnswerDiscoveryResult:
     canonical_question: str = ""
     category: str = ""
     additional_questions: tuple[DiscoveredQuestion, ...] = ()
+    community_context_degraded: bool = False
 
     @property
     def questions(self) -> tuple[DiscoveredQuestion, ...]:
@@ -117,6 +119,7 @@ class AnswerDiscoveryResult:
                     self.answers,
                     self.canonical_question,
                     self.category,
+                    self.community_context_degraded,
                 ),
             )
         return primary + self.additional_questions
@@ -130,6 +133,12 @@ class _AnswerAssessment:
     canonical_question: str = ""
     category: str = ""
     additional_questions: tuple[_AnswerAssessment, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _AcceptedGroup:
+    assessment: _AnswerAssessment
+    question: DiscoveredQuestion
 
 
 class CommunityAnswerAgent(Protocol):
@@ -190,6 +199,12 @@ class ChatContextLookup:
             for group in self._messages_by_group.values()
             for item in group
         }
+        self._external_to_short: dict[str, str] = {}
+        self._short_to_external: dict[str, str] = {}
+        for index, anchor in enumerate(self.anchors, start=1):
+            short_id = f"Q{index}"
+            self._external_to_short[anchor.external_message_id] = short_id
+            self._short_to_external[short_id] = anchor.external_message_id
         self.returned_message_ids: set[str] = set()
         self._sender_labels = _sender_labels(self._message_by_id.values())
 
@@ -226,12 +241,16 @@ class ChatContextLookup:
             (item[3] for item in nearest),
             key=lambda item: (item.sent_at_utc, item.external_message_id),
         )
+        for message in shown:
+            self._short_id(message.external_message_id)
         self.returned_message_ids.update(item.external_message_id for item in shown)
         return {
             "question_code": cluster.question_code,
             "canonical_question": cluster.canonical_question,
             "category": cluster.category,
             "representative_questions": list(cluster.representative_questions[:5]),
+            "allowed_question_ids": list(self.allowed_question_ids),
+            "allowed_message_ids": list(self.allowed_message_ids),
             "question_anchors": [self._message_payload(item) for item in self.anchors],
             "message_limit": limit,
             "messages": [self._message_payload(item) for item in shown],
@@ -274,11 +293,15 @@ class ChatContextLookup:
         assessment: _AnswerAssessment,
         cluster: QuestionCluster | None,
     ) -> DiscoveredQuestion:
-        question_ids = tuple(dict.fromkeys(assessment.question_message_ids))
+        question_ids = tuple(
+            dict.fromkeys(self._external_id(item) for item in assessment.question_message_ids)
+        )
         if not question_ids or any(item not in self.anchor_ids for item in question_ids):
             raise AnswerAgentError("question_message_ids 必须来自候选问题锚点且不能为空")
 
-        answer_ids = tuple(dict.fromkeys(assessment.answer_message_ids))
+        answer_ids = tuple(
+            dict.fromkeys(self._external_id(item) for item in assessment.answer_message_ids)
+        )
         if set(question_ids) & set(answer_ids):
             raise AnswerAgentError("同一消息不能同时归为问题和回答")
         if any(item not in self.returned_message_ids for item in answer_ids):
@@ -322,18 +345,48 @@ class ChatContextLookup:
     def _message_payload(self, message: StoredMessage) -> dict[str, Any]:
         visible = message.text.strip() or message.outline.strip()
         return {
-            "message_id": message.external_message_id,
+            "message_id": self._short_id(message.external_message_id),
             "sent_at_utc": message.sent_at_utc,
             "group": message.group_alias or message.group_id,
             "sender": self._sender_labels.get(message.sender_id, "U?"),
-            "reply_to_message_id": message.reply_to_message_id,
+            "reply_to_message_id": (
+                self._short_id(message.reply_to_message_id)
+                if message.reply_to_message_id in self.returned_message_ids
+                else ""
+            ),
             "is_question_anchor": message.external_message_id in self.anchor_ids,
             "text": redact_for_report(visible, max_chars=_MESSAGE_CHAR_LIMIT),
         }
 
+    @property
+    def allowed_question_ids(self) -> tuple[str, ...]:
+        return tuple(
+            self._external_to_short[item.external_message_id] for item in self.anchors
+        )
+
+    @property
+    def allowed_message_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._short_to_external, key=_short_id_order))
+
+    def _short_id(self, external_id: str) -> str:
+        existing = self._external_to_short.get(external_id)
+        if existing is not None:
+            return existing
+        short_id = f"M{1 + sum(item.startswith('M') for item in self._short_to_external)}"
+        self._external_to_short[external_id] = short_id
+        self._short_to_external[short_id] = external_id
+        return short_id
+
+    def _external_id(self, supplied_id: str) -> str:
+        if supplied_id in self._short_to_external:
+            return self._short_to_external[supplied_id]
+        if supplied_id in self._message_by_id:
+            return supplied_id
+        return ""
+
 
 class AstrBotContextAnswerAgent:
-    """Use one 50-message call and at most one 100-message fallback call."""
+    """Search bounded context and retry a failed output validation once."""
 
     def __init__(
         self,
@@ -367,15 +420,142 @@ class AstrBotContextAnswerAgent:
         if not lookup.anchors:
             return AnswerDiscoveryResult((), ())
         initial = lookup.context_payload(cluster, limit=_INITIAL_MESSAGE_LIMIT)
-        assessment = await self._assess(initial)
-        if _all_questions_have_answers(assessment) or not initial["has_more_messages"]:
-            return lookup.discovery_result(assessment, cluster)
+        discovery, retry_used = await self._assess_with_repair(
+            initial,
+            lookup,
+            cluster,
+            allow_retry=True,
+        )
+        if (
+            _discovery_has_degradation(discovery)
+            or _all_discovered_questions_have_answers(discovery)
+            or not initial["has_more_messages"]
+        ):
+            return discovery
 
         expanded = lookup.context_payload(cluster, limit=_EXPANDED_MESSAGE_LIMIT)
-        assessment = await self._assess(expanded)
-        return lookup.discovery_result(assessment, cluster)
+        discovery, _ = await self._assess_with_repair(
+            expanded,
+            lookup,
+            cluster,
+            allow_retry=not retry_used,
+        )
+        return discovery
 
-    async def _assess(self, payload: dict[str, Any]) -> _AnswerAssessment:
+    async def _assess_with_repair(
+        self,
+        payload: dict[str, Any],
+        lookup: ChatContextLookup,
+        cluster: QuestionCluster,
+        *,
+        allow_retry: bool,
+    ) -> tuple[AnswerDiscoveryResult, bool]:
+        raw = await self._generate(payload)
+        groups, parse_errors = _parse_answer_groups(raw)
+        accepted, errors = _validate_groups(
+            groups,
+            lookup,
+            cluster,
+            initial_errors=parse_errors,
+        )
+        retry_used = False
+        if errors and allow_retry:
+            retry_used = True
+            correction = {
+                "errors": list(errors),
+                "allowed_question_ids": list(lookup.allowed_question_ids),
+                "allowed_message_ids": list(lookup.allowed_message_ids),
+                "reserved_question_ids": [
+                    lookup._short_id(external_id)
+                    for item in accepted
+                    for external_id in item.question.question_message_ids
+                ],
+                "reserved_answer_ids": list(
+                    dict.fromkeys(
+                        lookup._short_id(lookup._external_id(answer_id))
+                        for item in accepted
+                        for answer_id in item.assessment.answer_message_ids
+                    )
+                ),
+                "instruction": (
+                    "Return only corrected groups that failed validation. "
+                    "Valid reserved groups are already retained in the final result, so do not "
+                    "repeat them or reuse their IDs."
+                ),
+            }
+            retry_payload = dict(payload)
+            retry_payload["validation_correction"] = correction
+            try:
+                retry_raw = await self._generate(retry_payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors = (f"validation retry failed: {type(exc).__name__}",)
+            else:
+                retry_groups, retry_parse_errors = _parse_answer_groups(retry_raw)
+                accepted_for_retry, retry_groups, conflict_errors = (
+                    _reject_repair_cross_conflicts(accepted, retry_groups, lookup)
+                )
+                repaired, retry_errors = _validate_groups(
+                    retry_groups,
+                    lookup,
+                    cluster,
+                    accepted=accepted_for_retry,
+                    initial_errors=(*retry_parse_errors, *conflict_errors),
+                )
+                accepted = (*accepted_for_retry, *repaired)
+                errors = retry_errors
+
+        questions = [item.question for item in accepted]
+        if errors or retry_used:
+            covered = {
+                external_id
+                for question in questions
+                for external_id in question.question_message_ids
+            }
+            used_as_answers = {
+                lookup._external_id(answer_id)
+                for item in accepted
+                for answer_id in item.assessment.answer_message_ids
+            }
+            uncovered = tuple(
+                anchor.external_message_id
+                for anchor in lookup.anchors
+                if anchor.external_message_id not in covered
+                and anchor.external_message_id not in used_as_answers
+            )
+            if uncovered:
+                questions.append(
+                    DiscoveredQuestion(
+                        uncovered,
+                        (),
+                        cluster.canonical_question,
+                        cluster.category,
+                        community_context_degraded=True,
+                    )
+                )
+        if not questions:
+            questions.append(
+                DiscoveredQuestion(
+                    tuple(anchor.external_message_id for anchor in lookup.anchors),
+                    (),
+                    cluster.canonical_question,
+                    cluster.category,
+                    community_context_degraded=True,
+                )
+            )
+        anchor_order = {
+            anchor.external_message_id: index
+            for index, anchor in enumerate(lookup.anchors)
+        }
+        questions.sort(
+            key=lambda item: min(
+                anchor_order[external_id] for external_id in item.question_message_ids
+            )
+        )
+        return _discovery_result_from_questions(questions), retry_used
+
+    async def _generate(self, payload: dict[str, Any]) -> str:
         prompt = "请划分问题与回答，并生成脱敏摘要：\n" + json.dumps(
             payload,
             ensure_ascii=False,
@@ -392,7 +572,7 @@ class AstrBotContextAnswerAgent:
         )
         if self._token_usage is not None:
             self._token_usage.record(response)
-        return _parse_answer_assessment(str(getattr(response, "completion_text", "") or ""))
+        return str(getattr(response, "completion_text", "") or "")
 
     def _resolve_provider_id(self) -> str:
         if self._provider_id:
@@ -404,6 +584,38 @@ class AstrBotContextAnswerAgent:
         if not provider_id:
             raise AnswerAgentError("AstrBot 默认 Provider 没有有效 ID")
         return provider_id
+
+
+def _parse_answer_groups(
+    raw: str,
+) -> tuple[tuple[_AnswerAssessment, ...], tuple[str, ...]]:
+    text = raw.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.IGNORECASE | re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return (), (f"response is not valid JSON: {exc.msg}",)
+    if not isinstance(data, dict):
+        return (), ("response must be a JSON object",)
+    raw_groups = data.get("question_groups")
+    if raw_groups is None:
+        raw_groups = [data]
+    if not isinstance(raw_groups, list) or not raw_groups:
+        return (), ("question_groups must be a non-empty array",)
+
+    parsed: list[_AnswerAssessment] = []
+    errors: list[str] = []
+    for index, raw_group in enumerate(raw_groups, start=1):
+        if not isinstance(raw_group, dict):
+            errors.append(f"group {index}: must be a JSON object")
+            continue
+        try:
+            parsed.append(_parse_question_group(raw_group))
+        except AnswerAgentError as exc:
+            errors.append(f"group {index}: {exc}")
+    return tuple(parsed), tuple(errors)
 
 
 def _parse_answer_assessment(raw: str) -> _AnswerAssessment:
@@ -466,6 +678,179 @@ def _parse_question_group(data: dict[str, Any]) -> _AnswerAssessment:
         canonical_question.strip(),
         category.strip(),
     )
+
+
+def _reject_repair_cross_conflicts(
+    accepted: Sequence[_AcceptedGroup],
+    repair_groups: Sequence[_AnswerAssessment],
+    lookup: ChatContextLookup,
+) -> tuple[
+    tuple[_AcceptedGroup, ...],
+    tuple[_AnswerAssessment, ...],
+    tuple[str, ...],
+]:
+    rejected_accepted: set[int] = set()
+    rejected_repairs: set[int] = set()
+    errors: list[str] = []
+    for repair_index, repair in enumerate(repair_groups):
+        repair_question_ids = {
+            lookup._external_id(item) for item in repair.question_message_ids
+        }
+        repair_answer_ids = {
+            lookup._external_id(item) for item in repair.answer_message_ids
+        }
+        for accepted_index, item in enumerate(accepted):
+            accepted_question_ids = set(item.question.question_message_ids)
+            accepted_answer_ids = {
+                lookup._external_id(answer_id)
+                for answer_id in item.assessment.answer_message_ids
+            }
+            overlap = (accepted_answer_ids & repair_question_ids) | (
+                accepted_question_ids & repair_answer_ids
+            )
+            if not overlap:
+                continue
+            rejected_accepted.add(accepted_index)
+            rejected_repairs.add(repair_index)
+            errors.append(
+                f"repair group {repair_index + 1}: question/answer overlap with a "
+                "reserved group; both groups require safe fallback: "
+                + ", ".join(sorted(lookup._short_id(value) for value in overlap))
+            )
+    return (
+        tuple(item for index, item in enumerate(accepted) if index not in rejected_accepted),
+        tuple(
+            item for index, item in enumerate(repair_groups) if index not in rejected_repairs
+        ),
+        tuple(errors),
+    )
+
+
+def _validate_groups(
+    groups: Sequence[_AnswerAssessment],
+    lookup: ChatContextLookup,
+    cluster: QuestionCluster,
+    *,
+    accepted: Sequence[_AcceptedGroup] = (),
+    initial_errors: Sequence[str] = (),
+) -> tuple[tuple[_AcceptedGroup, ...], tuple[str, ...]]:
+    reserved_question_ids = {
+        external_id
+        for item in accepted
+        for external_id in item.question.question_message_ids
+    }
+    reserved_answer_ids = {
+        lookup._external_id(answer_id)
+        for item in accepted
+        for answer_id in item.assessment.answer_message_ids
+    }
+    valid: list[_AcceptedGroup] = []
+    errors = list(initial_errors)
+    for index, assessment in enumerate(groups, start=1):
+        try:
+            question = lookup._discovered_question(assessment, cluster)
+            question_ids = set(question.question_message_ids)
+            answer_ids = {
+                lookup._external_id(answer_id)
+                for answer_id in assessment.answer_message_ids
+            }
+            if duplicate := reserved_question_ids & question_ids:
+                raise AnswerAgentError(
+                    "question_message_ids already belong to another group: "
+                    + ", ".join(sorted(lookup._short_id(item) for item in duplicate))
+                )
+            if duplicate := reserved_answer_ids & answer_ids:
+                raise AnswerAgentError(
+                    "answer_message_ids already belong to another group: "
+                    + ", ".join(sorted(lookup._short_id(item) for item in duplicate))
+                )
+            if overlap := reserved_answer_ids & question_ids:
+                raise AnswerAgentError(
+                    "question_message_ids were already used as answers: "
+                    + ", ".join(sorted(lookup._short_id(item) for item in overlap))
+                )
+            if overlap := reserved_question_ids & answer_ids:
+                raise AnswerAgentError(
+                    "answer_message_ids were already used as questions: "
+                    + ", ".join(sorted(lookup._short_id(item) for item in overlap))
+                )
+
+            local_question_ids = {
+                external_id
+                for item in valid
+                for external_id in item.question.question_message_ids
+            }
+            local_answer_ids = {
+                lookup._external_id(answer_id)
+                for item in valid
+                for answer_id in item.assessment.answer_message_ids
+            }
+            if duplicate := local_question_ids & question_ids:
+                raise AnswerAgentError(
+                    "question_message_ids already belong to another group: "
+                    + ", ".join(sorted(lookup._short_id(item) for item in duplicate))
+                )
+            if duplicate := local_answer_ids & answer_ids:
+                raise AnswerAgentError(
+                    "answer_message_ids already belong to another group: "
+                    + ", ".join(sorted(lookup._short_id(item) for item in duplicate))
+                )
+
+            conflicting = [
+                item
+                for item in valid
+                if (
+                    set(item.question.question_message_ids) & answer_ids
+                    or {
+                        lookup._external_id(answer_id)
+                        for answer_id in item.assessment.answer_message_ids
+                    }
+                    & question_ids
+                )
+            ]
+            if conflicting:
+                overlap = (
+                    local_question_ids & answer_ids
+                ) | (local_answer_ids & question_ids)
+                valid = [item for item in valid if item not in conflicting]
+                raise AnswerAgentError(
+                    "question/answer overlap makes both groups require repair: "
+                    + ", ".join(sorted(lookup._short_id(item) for item in overlap))
+                )
+        except AnswerAgentError as exc:
+            errors.append(f"group {index}: {exc}")
+            continue
+        valid.append(_AcceptedGroup(assessment, question))
+    return tuple(valid), tuple(errors)
+
+
+def _discovery_result_from_questions(
+    questions: Sequence[DiscoveredQuestion],
+) -> AnswerDiscoveryResult:
+    primary = questions[0]
+    return AnswerDiscoveryResult(
+        primary.question_message_ids,
+        primary.answers,
+        primary.canonical_question,
+        primary.category,
+        tuple(questions[1:]),
+        primary.community_context_degraded,
+    )
+
+
+def _discovery_has_degradation(result: AnswerDiscoveryResult) -> bool:
+    return any(item.community_context_degraded for item in result.questions)
+
+
+def _all_discovered_questions_have_answers(result: AnswerDiscoveryResult) -> bool:
+    return all(item.answers for item in result.questions)
+
+
+def _short_id_order(value: str) -> tuple[int, int, str]:
+    match = re.fullmatch(r"([QM])(\d+)", value)
+    if match is None:
+        return (2, 0, value)
+    return (0 if match.group(1) == "Q" else 1, int(match.group(2)), value)
 
 
 def _all_questions_have_answers(assessment: _AnswerAssessment) -> bool:

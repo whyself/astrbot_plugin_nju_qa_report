@@ -30,6 +30,7 @@ from nju_report.reporting import (
     _display_excerpt,
     _render_mail_html,
     _render_mail_text,
+    _summary_payload,
     _visible_evidence,
     coverage_counts,
     coverage_list_order,
@@ -630,6 +631,31 @@ def test_public_counts_fold_legacy_incomplete_into_execution_error(tmp_path: Pat
     assert counts[CoverageStatus.ERROR] == 1
     assert "程序执行异常 1" in format_coverage_counts(counts)
     assert [item.question_code for item in clusters] == [cluster.question_code]
+    storage.close()
+
+
+def test_community_context_degradation_has_separate_public_count(tmp_path: Path) -> None:
+    storage, _, cluster, _ = _prepared_case(tmp_path, repository_status="READY")
+    degraded = replace(cluster, community_context_degraded=True)
+    storage.save_question_clusters(cluster.report_date, [degraded])
+    clusters = storage.list_question_clusters(cluster.report_date)
+    investigations = storage.investigations_for_date(cluster.report_date)
+    counts = coverage_counts(clusters, investigations)
+
+    summary = _summary_payload(
+        cluster.report_date,
+        clusters,
+        investigations,
+        screening_errors=0,
+    )
+    text = format_coverage_counts(counts, community_context_degraded=1)
+    mail_text = _render_mail_text(cluster.report_date, clusters, investigations)
+    mail_html = _render_mail_html(cluster.report_date, clusters, investigations)
+
+    assert summary["community_context_degraded"] == 1
+    assert "社区上下文降级 1" in text
+    assert "社区上下文降级 1" in mail_text
+    assert "社区上下文降级 1" in mail_html
     storage.close()
 
 

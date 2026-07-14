@@ -19,7 +19,10 @@ class _FakeContext:
 
     async def llm_generate(self, **kwargs):
         self.calls.append(kwargs)
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def test_context_window_contains_only_the_question_group() -> None:
@@ -29,7 +32,7 @@ def test_context_window_contains_only_the_question_group() -> None:
     result = lookup.context_payload(cluster, limit=50)
     message_ids = [item["message_id"] for item in result["messages"]]
 
-    assert message_ids == ["q1", "water", "a1"]
+    assert message_ids == ["Q1", "M1", "M2"]
     assert "before" not in message_ids
     assert "other-group" not in message_ids
     discovery = lookup.discovery_result(
@@ -186,6 +189,403 @@ def test_agent_expands_once_to_100_messages_then_stops() -> None:
     asyncio.run(run())
 
 
+def test_agent_retries_invalid_anchor_with_allowed_short_ids() -> None:
+    async def run() -> None:
+        cluster, messages = _case()
+        context = _FakeContext(
+            [
+                SimpleNamespace(
+                    completion_text=(
+                        '{"question_message_ids":["not-an-anchor"],'
+                        '"answer_message_ids":[],"answer_summary":""}'
+                    )
+                ),
+                SimpleNamespace(
+                    completion_text=(
+                        '{"question_message_ids":["Q1"],'
+                        '"answer_message_ids":["M2"],'
+                        '"answer_summary":"应先挂失，再前往服务点办理。"}'
+                    )
+                ),
+            ]
+        )
+        agent = AstrBotContextAnswerAgent(context, provider_id="provider")
+
+        discovery = await agent.collect(cluster, messages)
+
+        assert discovery.question_message_ids == ("q1",)
+        assert discovery.answers
+        assert discovery.community_context_degraded is False
+        assert len(context.calls) == 2
+        correction = _prompt_payload(context.calls[1])["validation_correction"]
+        assert correction["allowed_question_ids"] == ["Q1"]
+        assert correction["errors"]
+
+    asyncio.run(run())
+
+
+def test_agent_keeps_valid_group_and_degrades_only_unrepaired_group() -> None:
+    async def run() -> None:
+        cluster = QuestionCluster(
+            question_code="20260712-Q001",
+            report_date="2026-07-12",
+            canonical_question="宿舍设施和分配问题",
+            category="住宿",
+            candidate_source_keys=("message:qq:bot:q1", "message:qq:bot:q2"),
+            representative_questions=("宿舍设施和分配问题",),
+            group_aliases=("测试群",),
+            first_sent_at_utc=100,
+            last_sent_at_utc=101,
+        )
+        messages = [
+            _message("q1", 100, "u1", "宿舍有哪些设施？"),
+            _message("q2", 101, "u1", "宿舍怎么分配？"),
+            _message("a1", 102, "u2", "宿舍有空调。", reply="q1"),
+        ]
+        first = {
+            "question_groups": [
+                {
+                    "question_message_ids": ["Q1"],
+                    "canonical_question": "宿舍有哪些设施",
+                    "category": "住宿",
+                    "answer_message_ids": ["M1"],
+                    "answer_summary": "群聊称宿舍有空调。",
+                },
+                {
+                    "question_message_ids": ["bad-id"],
+                    "canonical_question": "宿舍怎么分配",
+                    "category": "住宿",
+                    "answer_message_ids": [],
+                    "answer_summary": "",
+                },
+            ]
+        }
+        still_invalid = {
+            "question_groups": [
+                {
+                    "question_message_ids": ["bad-id"],
+                    "canonical_question": "宿舍怎么分配",
+                    "category": "住宿",
+                    "answer_message_ids": [],
+                    "answer_summary": "",
+                }
+            ]
+        }
+        context = _FakeContext(
+            [
+                SimpleNamespace(completion_text=json.dumps(first, ensure_ascii=False)),
+                SimpleNamespace(completion_text=json.dumps(still_invalid, ensure_ascii=False)),
+            ]
+        )
+        agent = AstrBotContextAnswerAgent(context, provider_id="provider")
+
+        discovery = await agent.collect(cluster, messages)
+
+        assert len(discovery.questions) == 2
+        assert discovery.questions[0].question_message_ids == ("q1",)
+        assert discovery.questions[0].answers
+        assert discovery.questions[0].community_context_degraded is False
+        assert discovery.questions[1].question_message_ids == ("q2",)
+        assert discovery.questions[1].answers == ()
+        assert discovery.questions[1].community_context_degraded is True
+        correction = _prompt_payload(context.calls[1])["validation_correction"]
+        assert correction["reserved_question_ids"] == ["Q1"]
+        assert correction["reserved_answer_ids"] == ["M1"]
+
+    asyncio.run(run())
+
+
+def test_agent_retries_only_the_group_that_reuses_an_answer() -> None:
+    async def run() -> None:
+        cluster = QuestionCluster(
+            question_code="20260712-Q001",
+            report_date="2026-07-12",
+            canonical_question="宿舍的设施与分配",
+            category="住宿",
+            candidate_source_keys=("message:qq:bot:q1", "message:qq:bot:q2"),
+            representative_questions=("宿舍的设施与分配",),
+            group_aliases=("测试群",),
+            first_sent_at_utc=100,
+            last_sent_at_utc=101,
+        )
+        messages = [
+            _message("q1", 100, "u1", "宿舍有什么设施？"),
+            _message("q2", 101, "u1", "宿舍怎么分配？"),
+            _message("a1", 102, "u2", "宿舍有空调。", reply="q1"),
+        ]
+        first = {
+            "question_groups": [
+                {
+                    "question_message_ids": ["Q1"],
+                    "answer_message_ids": ["M1"],
+                    "answer_summary": "群聊称宿舍有空调。",
+                },
+                {
+                    "question_message_ids": ["Q2"],
+                    "answer_message_ids": ["M1"],
+                    "answer_summary": "群聊称宿舍有空调。",
+                },
+            ]
+        }
+        repaired = {
+            "question_message_ids": ["Q2"],
+            "answer_message_ids": [],
+            "answer_summary": "",
+        }
+        context = _FakeContext(
+            [
+                SimpleNamespace(completion_text=json.dumps(first, ensure_ascii=False)),
+                SimpleNamespace(completion_text=json.dumps(repaired, ensure_ascii=False)),
+            ]
+        )
+
+        discovery = await AstrBotContextAnswerAgent(
+            context, provider_id="provider"
+        ).collect(cluster, messages)
+
+        assert [item.question_message_ids for item in discovery.questions] == [
+            ("q1",),
+            ("q2",),
+        ]
+        assert discovery.questions[0].answers
+        assert discovery.questions[1].answers == ()
+        assert all(not item.community_context_degraded for item in discovery.questions)
+        correction = _prompt_payload(context.calls[1])["validation_correction"]
+        assert correction["reserved_answer_ids"] == ["M1"]
+        assert any("already belong to another group" in item for item in correction["errors"])
+
+    asyncio.run(run())
+
+
+def test_successful_retry_degrades_an_anchor_the_repair_did_not_cover() -> None:
+    async def run() -> None:
+        cluster = _cluster_for("q1", "q2", "q3")
+        messages = [
+            _message("q1", 100, "u1", "问题一？"),
+            _message("q2", 101, "u1", "问题二？"),
+            _message("q3", 102, "u1", "问题三？"),
+            _message("a1", 103, "u2", "问题一的回答。", reply="q1"),
+        ]
+        first = {
+            "question_groups": [
+                {
+                    "question_message_ids": ["Q1"],
+                    "answer_message_ids": ["M1"],
+                    "answer_summary": "问题一已有回答。",
+                },
+                {
+                    "question_message_ids": ["bad-id"],
+                    "answer_message_ids": [],
+                    "answer_summary": "",
+                },
+            ]
+        }
+        repaired = {
+            "question_message_ids": ["Q3"],
+            "answer_message_ids": [],
+            "answer_summary": "",
+        }
+        context = _FakeContext(
+            [
+                SimpleNamespace(completion_text=json.dumps(first, ensure_ascii=False)),
+                SimpleNamespace(completion_text=json.dumps(repaired, ensure_ascii=False)),
+            ]
+        )
+
+        discovery = await AstrBotContextAnswerAgent(
+            context, provider_id="provider"
+        ).collect(cluster, messages)
+
+        assert [item.question_message_ids for item in discovery.questions] == [
+            ("q1",),
+            ("q2",),
+            ("q3",),
+        ]
+        assert discovery.questions[1].community_context_degraded is True
+        assert discovery.questions[2].community_context_degraded is False
+
+    asyncio.run(run())
+
+
+def test_cross_group_question_answer_overlap_retries_both_groups() -> None:
+    async def run() -> None:
+        cluster = _cluster_for("q1", "q2")
+        messages = [
+            _message("q1", 100, "u1", "问题一？"),
+            _message("q2", 101, "u1", "问题二？"),
+            _message("a1", 102, "u2", "问题二的回答。", reply="q2"),
+        ]
+        conflicted = {
+            "question_groups": [
+                {
+                    "question_message_ids": ["Q1"],
+                    "answer_message_ids": ["Q2"],
+                    "answer_summary": "把第二个锚点误作回答。",
+                },
+                {
+                    "question_message_ids": ["Q2"],
+                    "answer_message_ids": ["M1"],
+                    "answer_summary": "问题二已有回答。",
+                },
+            ]
+        }
+        repaired = {
+            "question_groups": [
+                {
+                    "question_message_ids": ["Q1"],
+                    "answer_message_ids": [],
+                    "answer_summary": "",
+                },
+                {
+                    "question_message_ids": ["Q2"],
+                    "answer_message_ids": ["M1"],
+                    "answer_summary": "问题二已有回答。",
+                },
+            ]
+        }
+        context = _FakeContext(
+            [
+                SimpleNamespace(completion_text=json.dumps(conflicted, ensure_ascii=False)),
+                SimpleNamespace(completion_text=json.dumps(repaired, ensure_ascii=False)),
+            ]
+        )
+
+        discovery = await AstrBotContextAnswerAgent(
+            context, provider_id="provider"
+        ).collect(cluster, messages)
+
+        assert [item.question_message_ids for item in discovery.questions] == [
+            ("q1",),
+            ("q2",),
+        ]
+        assert all(not item.community_context_degraded for item in discovery.questions)
+        correction = _prompt_payload(context.calls[1])["validation_correction"]
+        assert correction["reserved_question_ids"] == []
+        assert any("both groups require repair" in item for item in correction["errors"])
+
+    asyncio.run(run())
+
+
+def test_overlap_revealed_by_repair_degrades_both_conflicting_groups() -> None:
+    async def run() -> None:
+        cluster = _cluster_for("q1", "q2")
+        messages = [
+            _message("q1", 100, "u1", "问题一？"),
+            _message("q2", 101, "u1", "问题二？"),
+        ]
+        first = {
+            "question_groups": [
+                {
+                    "question_message_ids": ["Q1"],
+                    "answer_message_ids": ["Q2"],
+                    "answer_summary": "把第二个锚点误作回答。",
+                },
+                {
+                    "question_message_ids": ["Q2"],
+                    "answer_message_ids": [],
+                },
+            ]
+        }
+        repaired = {
+            "question_message_ids": ["Q2"],
+            "answer_message_ids": [],
+            "answer_summary": "",
+        }
+        context = _FakeContext(
+            [
+                SimpleNamespace(completion_text=json.dumps(first, ensure_ascii=False)),
+                SimpleNamespace(completion_text=json.dumps(repaired, ensure_ascii=False)),
+            ]
+        )
+
+        discovery = await AstrBotContextAnswerAgent(
+            context, provider_id="provider"
+        ).collect(cluster, messages)
+
+        assert len(discovery.questions) == 1
+        assert discovery.question_message_ids == ("q1", "q2")
+        assert discovery.answers == ()
+        assert discovery.community_context_degraded is True
+
+    asyncio.run(run())
+
+
+def test_validation_retry_budget_is_shared_by_initial_and_expanded_context() -> None:
+    async def run() -> None:
+        cluster, _ = _case()
+        messages = [_message("q1", 0, "u0", "校园卡丢了怎么办？")]
+        messages.extend(
+            _message(f"m{index}", index, f"u{index}", f"普通消息 {index}")
+            for index in range(1, 120)
+        )
+        invalid = SimpleNamespace(
+            completion_text=(
+                '{"question_message_ids":["bad-id"],'
+                '"answer_message_ids":[],"answer_summary":""}'
+            )
+        )
+        repaired_without_answer = SimpleNamespace(
+            completion_text=(
+                '{"question_message_ids":["Q1"],'
+                '"answer_message_ids":[],"answer_summary":""}'
+            )
+        )
+        context = _FakeContext([invalid, repaired_without_answer, invalid])
+
+        discovery = await AstrBotContextAnswerAgent(
+            context, provider_id="provider"
+        ).collect(cluster, messages)
+
+        assert len(context.calls) == 3
+        assert sum(
+            "validation_correction" in _prompt_payload(call) for call in context.calls
+        ) == 1
+        assert discovery.community_context_degraded is True
+
+    asyncio.run(run())
+
+
+def test_retry_failure_preserves_valid_groups_and_degrades_only_uncovered_anchors() -> None:
+    async def run() -> None:
+        cluster = _cluster_for("q1", "q2")
+        messages = [
+            _message("q1", 100, "u1", "问题一？"),
+            _message("q2", 101, "u1", "问题二？"),
+            _message("a1", 102, "u2", "问题一的回答。", reply="q1"),
+        ]
+        first = {
+            "question_groups": [
+                {
+                    "question_message_ids": ["Q1"],
+                    "answer_message_ids": ["M1"],
+                    "answer_summary": "问题一已有回答。",
+                },
+                {
+                    "question_message_ids": ["bad-id"],
+                    "answer_message_ids": [],
+                    "answer_summary": "",
+                },
+            ]
+        }
+        context = _FakeContext(
+            [
+                SimpleNamespace(completion_text=json.dumps(first, ensure_ascii=False)),
+                TimeoutError("provider timeout"),
+            ]
+        )
+
+        discovery = await AstrBotContextAnswerAgent(
+            context, provider_id="provider"
+        ).collect(cluster, messages)
+
+        assert discovery.questions[0].question_message_ids == ("q1",)
+        assert discovery.questions[0].answers
+        assert discovery.questions[1].question_message_ids == ("q2",)
+        assert discovery.questions[1].community_context_degraded is True
+
+    asyncio.run(run())
+
+
 def _prompt_payload(call: dict) -> dict:
     return json.loads(call["prompt"].split("\n", 1)[1])
 
@@ -209,6 +609,22 @@ def _case() -> tuple[QuestionCluster, list[StoredMessage]]:
         _message("a1", 102, "u3", "先在信息门户挂失，再去服务点。", reply="q1"),
         _message("other-group", 103, "u4", "另一个群的消息", group_id="2"),
     ]
+
+
+def _cluster_for(*external_ids: str) -> QuestionCluster:
+    return QuestionCluster(
+        question_code="20260712-Q001",
+        report_date="2026-07-12",
+        canonical_question="多个测试问题",
+        category="测试",
+        candidate_source_keys=tuple(
+            f"message:qq:bot:{external_id}" for external_id in external_ids
+        ),
+        representative_questions=("多个测试问题",),
+        group_aliases=("测试群",),
+        first_sent_at_utc=100,
+        last_sent_at_utc=100 + len(external_ids) - 1,
+    )
 
 
 def _message(

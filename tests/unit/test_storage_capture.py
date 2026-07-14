@@ -146,7 +146,7 @@ def test_migrations_tolerate_indexes_left_by_an_older_partial_run(tmp_path: Path
     recovered.initialize()
     with sqlite3.connect(path) as connection:
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-    assert version == 7
+    assert version == 8
     recovered.close()
 
 
