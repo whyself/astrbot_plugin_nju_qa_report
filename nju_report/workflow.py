@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -13,11 +14,13 @@ from .investigation import InvestigationService
 from .knowledge import KnowledgeService
 from .models import ReportArtifact
 from .question_processor import DailyQuestionProcessor, DailyRunResult
-from .reporting import DeliverySummary, ReportService
+from .reporting import DeliverySummary, ReportService, recipient_hash
 from .storage import ReportStorage
 from .token_usage import TokenUsage, TokenUsageTracker
 
 logger = logging.getLogger(__name__)
+
+_RUNNING_STALE_AFTER_SECONDS = 6 * 60 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,16 +260,22 @@ class DailyScheduler:
     def __init__(
         self,
         workflow: DailyReportWorkflow,
+        storage: ReportStorage,
         *,
+        mail_recipients: tuple[str, ...],
         timezone_name: str,
         report_time: str,
         enabled: bool,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._workflow = workflow
+        self._storage = storage
+        self._recipient_hashes = tuple(recipient_hash(item) for item in mail_recipients)
         self._timezone = ZoneInfo(timezone_name)
         hour, minute = (int(item) for item in report_time.split(":", 1))
         self._time = time(hour, minute)
         self._enabled = enabled
+        self._clock = clock or (lambda: datetime.now(self._timezone))
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -282,31 +291,145 @@ class DailyScheduler:
         self._task = None
 
     async def _run(self) -> None:
-        last_run: date | None = None
-        retry_not_before: datetime | None = None
         while not self._stop.is_set():
-            now = datetime.now(self._timezone)
-            scheduled = datetime.combine(now.date(), self._time, self._timezone)
-            retry_due = retry_not_before is None or now >= retry_not_before
-            if now >= scheduled and last_run != now.date() and retry_due:
-                report_date = now.date() - timedelta(days=1)
-                try:
-                    await self._workflow.sync_knowledge()
-                    result = await self._workflow.run_date(report_date, deliver=True)
-                    if result.report is None:
-                        raise RuntimeError("daily report was not generated")
-                    if result.delivery is not None and result.delivery.failed:
-                        raise RuntimeError("one or more report recipients failed")
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    # The workflow persists stage state; the next manual or scheduled run can retry.
-                    logger.exception("NJU scheduled daily report failed")
-                    retry_not_before = now + timedelta(minutes=15)
-                else:
-                    last_run = now.date()
-                    retry_not_before = None
+            now = self._clock()
+            try:
+                await self._tick(now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("NJU daily scheduler tick failed")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=60)
             except TimeoutError:
                 continue
+
+    async def _tick(self, now: datetime) -> None:
+        """Process one deterministic scheduler tick using persistent state."""
+
+        if not self._enabled:
+            return
+        now_utc = int(now.timestamp())
+        state = await asyncio.to_thread(
+            self._storage.oldest_unfinished_scheduled_report_run,
+        )
+        if state is None:
+            scheduled = datetime.combine(now.date(), self._time, self._timezone)
+            if now < scheduled:
+                return
+            scheduled_date = now.date().isoformat()
+            report_date = (now.date() - timedelta(days=1)).isoformat()
+            state = await asyncio.to_thread(
+                self._storage.scheduled_report_run,
+                scheduled_date,
+            )
+            if state is not None and state.status == "SENT":
+                return
+        else:
+            scheduled_date = state.scheduled_date
+            report_date = state.report_date
+
+        already_delivered = await asyncio.to_thread(
+            self._storage.report_date_delivered_to,
+            report_date,
+            self._recipient_hashes,
+        )
+        if already_delivered:
+            await asyncio.to_thread(
+                self._storage.bootstrap_scheduled_report_sent,
+                scheduled_date,
+                report_date,
+                now_utc=now_utc,
+            )
+            return
+
+        if state is not None:
+            if (
+                state.status == "RETRY_PENDING"
+                and state.next_retry_at_utc is not None
+                and state.next_retry_at_utc > now_utc
+            ):
+                return
+            stale_before_utc = now_utc - _RUNNING_STALE_AFTER_SECONDS
+            if state.status == "RUNNING" and state.updated_at_utc > stale_before_utc:
+                return
+        else:
+            stale_before_utc = now_utc - _RUNNING_STALE_AFTER_SECONDS
+
+        claim_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._storage.begin_scheduled_report_run,
+                scheduled_date,
+                report_date,
+                now_utc=now_utc,
+                stale_before_utc=stale_before_utc,
+            )
+        )
+        try:
+            claim_token = await asyncio.shield(claim_task)
+        except asyncio.CancelledError:
+            claim_token = await claim_task
+            if claim_token is not None:
+                cancelled_utc = int(self._clock().timestamp())
+                await asyncio.shield(
+                    asyncio.to_thread(
+                        self._storage.fail_scheduled_report_run,
+                        scheduled_date,
+                        error_summary="CancelledError: scheduler stopped while claiming",
+                        next_retry_at_utc=cancelled_utc,
+                        now_utc=cancelled_utc,
+                        claim_token=claim_token,
+                    )
+                )
+            raise
+        if claim_token is None:
+            return
+
+        try:
+            await self._workflow.sync_knowledge()
+            result = await self._workflow.run_date(
+                date.fromisoformat(report_date),
+                deliver=True,
+            )
+            if result.report is None:
+                raise RuntimeError("daily report was not generated")
+            if result.delivery is None:
+                raise RuntimeError("daily report delivery was not attempted")
+            if result.delivery.failed:
+                raise RuntimeError("one or more report recipients failed")
+        except asyncio.CancelledError:
+            cancelled_at = self._clock()
+            cancelled_utc = int(cancelled_at.timestamp())
+            await asyncio.shield(
+                asyncio.to_thread(
+                    self._storage.fail_scheduled_report_run,
+                    scheduled_date,
+                    error_summary="CancelledError: scheduler stopped",
+                    next_retry_at_utc=cancelled_utc,
+                    now_utc=cancelled_utc,
+                    claim_token=claim_token,
+                )
+            )
+            raise
+        except Exception as exc:
+            failed_at = self._clock()
+            failed_utc = int(failed_at.timestamp())
+            retry_at = int((failed_at + timedelta(minutes=15)).timestamp())
+            await asyncio.to_thread(
+                self._storage.fail_scheduled_report_run,
+                scheduled_date,
+                error_summary=f"{type(exc).__name__}: {exc}",
+                next_retry_at_utc=retry_at,
+                now_utc=failed_utc,
+                claim_token=claim_token,
+            )
+            logger.exception("NJU scheduled daily report failed")
+            return
+
+        completed_utc = int(self._clock().timestamp())
+        await asyncio.to_thread(
+            self._storage.complete_scheduled_report_run,
+            scheduled_date,
+            now_utc=completed_utc,
+            claim_token=claim_token,
+        )

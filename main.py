@@ -158,6 +158,8 @@ class NjuQaReportPlugin(Star):
         )
         self.scheduler = DailyScheduler(
             self.workflow,
+            self.storage,
+            mail_recipients=self.runtime_config.mail_recipients,
             timezone_name=self.runtime_config.timezone,
             report_time=self.runtime_config.daily_report_time,
             enabled=self.runtime_config.daily_report_enabled,

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from collections.abc import Callable
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from nju_report.models import ReportArtifact, StoredMessage
 from nju_report.question_processor import DailyRunResult
+from nju_report.reporting import DeliverySummary, recipient_hash
 from nju_report.storage import ReportStorage
 from nju_report.time_windows import natural_day_window
 from nju_report.token_usage import TokenUsageTracker
-from nju_report.workflow import DailyReportWorkflow
+from nju_report.workflow import DailyReportWorkflow, DailyScheduler
 
 
 class FakeProcessor:
@@ -53,6 +56,222 @@ class FakeKnowledge:
 
     async def sync_all(self):
         return None
+
+
+class FakeScheduledWorkflow:
+    def __init__(
+        self,
+        *,
+        failures: int = 0,
+        on_run: Callable[[], None] | None = None,
+    ) -> None:
+        self.failures = failures
+        self.on_run = on_run
+        self.sync_calls = 0
+        self.run_calls: list[date] = []
+
+    async def sync_knowledge(self) -> None:
+        self.sync_calls += 1
+
+    async def run_date(self, report_date: date, *, deliver: bool = False):
+        assert deliver is True
+        self.run_calls.append(report_date)
+        if self.on_run is not None:
+            self.on_run()
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("smtp failed")
+        return SimpleNamespace(
+            report=object(),
+            delivery=DeliverySummary(sent=1),
+        )
+
+
+def _scheduler(
+    workflow: FakeScheduledWorkflow,
+    storage: ReportStorage,
+    *,
+    recipients: tuple[str, ...] = ("reader@example.com",),
+    report_time: str = "00:00",
+    clock: Callable[[], datetime] | None = None,
+) -> DailyScheduler:
+    return DailyScheduler(  # type: ignore[arg-type]
+        workflow,
+        storage,
+        mail_recipients=recipients,
+        timezone_name="Asia/Shanghai",
+        report_time=report_time,
+        enabled=True,
+        clock=clock,
+    )
+
+
+def test_scheduler_catches_up_once_and_persists_success_across_reload(tmp_path: Path) -> None:
+    async def run() -> None:
+        storage = ReportStorage(tmp_path / "report.sqlite3")
+        storage.initialize()
+        now = datetime(2026, 7, 14, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        first_workflow = FakeScheduledWorkflow()
+
+        await _scheduler(first_workflow, storage)._tick(now)
+
+        assert first_workflow.run_calls == [date(2026, 7, 13)]
+        persisted = storage.scheduled_report_run("2026-07-14")
+        assert persisted is not None
+        assert persisted.status == "SENT"
+
+        reloaded_workflow = FakeScheduledWorkflow()
+        await _scheduler(reloaded_workflow, storage)._tick(now + timedelta(hours=1))
+        assert reloaded_workflow.run_calls == []
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_scheduler_persists_retry_deadline_and_retries_after_15_minutes(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        storage = ReportStorage(tmp_path / "report.sqlite3")
+        storage.initialize()
+        now = datetime(2026, 7, 14, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        failing = FakeScheduledWorkflow(failures=1)
+
+        await _scheduler(failing, storage, clock=lambda: now)._tick(now)
+
+        pending = storage.scheduled_report_run("2026-07-14")
+        assert pending is not None
+        assert pending.status == "RETRY_PENDING"
+        assert pending.next_retry_at_utc == int((now + timedelta(minutes=15)).timestamp())
+
+        reloaded = FakeScheduledWorkflow()
+        scheduler = _scheduler(reloaded, storage)
+        await scheduler._tick(now + timedelta(minutes=14, seconds=59))
+        assert reloaded.run_calls == []
+
+        await scheduler._tick(now + timedelta(minutes=15))
+        assert reloaded.run_calls == [date(2026, 7, 13)]
+        assert storage.scheduled_report_run("2026-07-14").status == "SENT"
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_scheduler_bootstraps_success_from_existing_recipient_deliveries(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        storage = ReportStorage(tmp_path / "report.sqlite3")
+        storage.initialize()
+        first = storage.save_report(
+            report_date="2026-07-13",
+            subject="first",
+            html_path=str(tmp_path / "first.html"),
+            summary_json="{}",
+        )
+        second = storage.save_report(
+            report_date="2026-07-13",
+            subject="second",
+            html_path=str(tmp_path / "second.html"),
+            summary_json='{"version":2}',
+        )
+        recipients = ("first@example.com", "second@example.com")
+        for report, recipient in zip((first, second), recipients, strict=True):
+            hashed = recipient_hash(recipient)
+            assert storage.begin_mail_delivery(report.report_id, hashed)
+            storage.complete_mail_delivery(report.report_id, hashed)
+
+        workflow = FakeScheduledWorkflow()
+        scheduler = _scheduler(workflow, storage, recipients=recipients)
+        now = datetime(2026, 7, 14, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        await scheduler._tick(now)
+
+        assert workflow.run_calls == []
+        persisted = storage.scheduled_report_run("2026-07-14")
+        assert persisted is not None
+        assert persisted.status == "SENT"
+        assert persisted.attempts == 0
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_scheduler_reclaims_a_running_attempt_left_by_reload(tmp_path: Path) -> None:
+    async def run() -> None:
+        storage = ReportStorage(tmp_path / "report.sqlite3")
+        storage.initialize()
+        claim = storage.begin_scheduled_report_run(
+            "2026-07-14",
+            "2026-07-13",
+            now_utc=1,
+            stale_before_utc=0,
+        )
+        assert claim is not None
+        workflow = FakeScheduledWorkflow()
+
+        await _scheduler(workflow, storage)._tick(
+            datetime(2026, 7, 14, 1, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        )
+
+        assert workflow.run_calls == [date(2026, 7, 13)]
+        persisted = storage.scheduled_report_run("2026-07-14")
+        assert persisted is not None
+        assert persisted.status == "SENT"
+        assert persisted.attempts == 2
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_scheduler_sets_retry_deadline_from_failure_time(tmp_path: Path) -> None:
+    async def run() -> None:
+        storage = ReportStorage(tmp_path / "report.sqlite3")
+        storage.initialize()
+        started = datetime(2026, 7, 14, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        failed_at = started + timedelta(minutes=20)
+        current = [started]
+        workflow = FakeScheduledWorkflow(
+            failures=1,
+            on_run=lambda: current.__setitem__(0, failed_at),
+        )
+
+        await _scheduler(workflow, storage, clock=lambda: current[0])._tick(started)
+
+        pending = storage.scheduled_report_run("2026-07-14")
+        assert pending is not None
+        assert pending.updated_at_utc == int(failed_at.timestamp())
+        assert pending.next_retry_at_utc == int(
+            (failed_at + timedelta(minutes=15)).timestamp()
+        )
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_scheduler_resumes_due_retry_after_midnight_before_new_day(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        storage = ReportStorage(tmp_path / "report.sqlite3")
+        storage.initialize()
+        first_tick = datetime(2026, 7, 14, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+        current = [first_tick]
+        failing = FakeScheduledWorkflow(failures=1)
+        await _scheduler(failing, storage, clock=lambda: current[0])._tick(first_tick)
+        pending = storage.scheduled_report_run("2026-07-14")
+        assert pending is not None
+
+        current[0] = first_tick + timedelta(minutes=15)
+        resumed = FakeScheduledWorkflow()
+        await _scheduler(resumed, storage, clock=lambda: current[0])._tick(current[0])
+
+        assert resumed.run_calls == [date(2026, 7, 13)]
+        assert storage.scheduled_report_run("2026-07-14").status == "SENT"
+        assert storage.scheduled_report_run("2026-07-15") is None
+        storage.close()
+
+    asyncio.run(run())
 
 
 def test_normal_history_run_skips_complete_report_but_force_recomputes(tmp_path: Path) -> None:
