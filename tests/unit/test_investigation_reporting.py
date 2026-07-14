@@ -191,7 +191,7 @@ def test_investigation_uses_search_and_grep_and_persists_evidence(tmp_path: Path
     asyncio.run(run())
 
 
-def test_agent_gets_dedicated_finalization_after_six_tool_rounds(tmp_path: Path) -> None:
+def test_tenth_round_auto_reads_top_candidate_before_finalization(tmp_path: Path) -> None:
     class LongRunningAi(FakeAi):
         def __init__(self) -> None:
             super().__init__()
@@ -208,20 +208,8 @@ def test_agent_gets_dedicated_finalization_after_six_tool_rounds(tmp_path: Path)
                         {"tool": "grep", "text": "校园卡"},
                     ],
                 }
-            if self.rounds == 2:
-                return {
-                    "action": "tools",
-                    "tool_calls": [
-                        {
-                            "tool": "read",
-                            "namespace": evidence[0].namespace,
-                            "document_id": evidence[0].document_id,
-                            "offset": 0,
-                            "focus": "挂失",
-                        }
-                    ],
-                }
-            if self.rounds <= 6:
+            if self.rounds < 10:
+                assert must_finish is False
                 return {
                     "action": "tools",
                     "tool_calls": [
@@ -229,6 +217,13 @@ def test_agent_gets_dedicated_finalization_after_six_tool_rounds(tmp_path: Path)
                     ],
                 }
             assert must_finish is True
+            automatic_reads = [
+                item
+                for item in tool_history
+                if item.get("tool") == "read" and item.get("automatic") is True
+            ]
+            assert len(automatic_reads) == 1
+            assert "继续阅读" in evidence[0].excerpt
             return await super().next_step(
                 cluster,
                 evidence,
@@ -239,17 +234,69 @@ def test_agent_gets_dedicated_finalization_after_six_tool_rounds(tmp_path: Path)
     async def run() -> None:
         storage, config, cluster, hit = _prepared_case(tmp_path, repository_status="READY")
         ai = LongRunningAi()
+        top_chunk = replace(
+            hit.chunk,
+            chunk_id="qc19gt/guide:top:0",
+            document_id="top",
+            title="校园卡服务总览",
+            content="校园卡丢失后应先挂失，并按校区查询对应服务点。",
+            content_hash="top",
+        )
+        top_hit = replace(hit, chunk=top_chunk, score=0.99)
+        knowledge = FakeKnowledge([hit, top_hit])
         service = InvestigationService(  # type: ignore[arg-type]
             config,
             storage,
-            FakeKnowledge([hit]),
+            knowledge,
             ai,
         )
 
         result = await service.investigate(cluster)
 
-        assert ai.rounds == 7
+        assert ai.rounds == 10
+        assert knowledge.reads == [("qc19gt/guide", "top")]
+        assert any(item.startswith("read:auto:") for item in result.queries)
         assert result.status is CoverageStatus.PARTIAL
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_tenth_round_failure_is_saved_as_error_after_automatic_read(tmp_path: Path) -> None:
+    class NeverFinalAi:
+        def __init__(self) -> None:
+            self.rounds = 0
+
+        async def next_step(self, cluster, evidence, tool_history, *, must_finish):
+            del evidence, tool_history
+            self.rounds += 1
+            if self.rounds == 1:
+                return {
+                    "action": "tools",
+                    "tool_calls": [
+                        {"tool": "search", "query": cluster.canonical_question},
+                        {"tool": "grep", "text": "校园卡"},
+                    ],
+                }
+            return {
+                "action": "tools",
+                "tool_calls": [
+                    {"tool": "search", "query": f"继续检索 {self.rounds} {must_finish}"}
+                ],
+            }
+
+    async def run() -> None:
+        storage, config, cluster, hit = _prepared_case(tmp_path, repository_status="READY")
+        ai = NeverFinalAi()
+        knowledge = FakeKnowledge([hit])
+        service = InvestigationService(config, storage, knowledge, ai)  # type: ignore[arg-type]
+
+        result = await service.investigate(cluster)
+
+        assert ai.rounds == 10
+        assert knowledge.reads == [("qc19gt/guide", "card")]
+        assert result.status is CoverageStatus.ERROR
+        assert "10 轮" in result.error_summary
         storage.close()
 
     asyncio.run(run())
