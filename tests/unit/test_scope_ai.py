@@ -324,6 +324,7 @@ def test_final_gate_sends_only_concise_candidate_questions() -> None:
                     canonical_question="南京大学鼓楼校区哪些窗口比较好吃？",
                     category="住宿食堂",
                     source_count=2,
+                    report_date="2026-07-12",
                 )
             ]
         )
@@ -332,6 +333,7 @@ def test_final_gate_sends_only_concise_candidate_questions() -> None:
     assert result["c1"].decision is ScopeDecision.DROP
     assert "ordered_messages" not in context.prompt
     assert "哪些窗口比较好吃" in context.prompt
+    assert '"report_date": "2026-07-12"' in context.prompt
     assert "最终问题编辑" in context.system_prompt
     assert "保留、改写、删除和合并" not in context.prompt
     assert "绝不搜索、生成或评价答案" in context.system_prompt
@@ -349,6 +351,9 @@ def test_final_gate_sends_only_concise_candidate_questions() -> None:
     assert "图片、截图、表情、视频" in context.system_prompt
     assert "图片中的建筑是什么”" in context.system_prompt
     assert "媒体问题猜测合并进去" in context.system_prompt
+    assert "相对时间的\n唯一换算基准" in context.system_prompt
+    assert "鼓楼那一大堆什么时候翻完" in context.system_prompt
+    assert ".nju.edu.cn 专业选修课是啥" in context.system_prompt
     assert "宁可少收" not in context.system_prompt
 
 

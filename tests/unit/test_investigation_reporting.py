@@ -161,10 +161,12 @@ def test_real_agent_adapter_receives_tools_evidence_and_history() -> None:
 
     assert result["action"] == "tools"
     assert '"tool_history"' in context.prompt
+    assert '"report_date": "2026-07-12"' in context.prompt
     assert "校园卡补办" in context.prompt
     assert "search" in context.system_prompt
     assert "grep" in context.system_prompt
     assert "read" in context.system_prompt
+    assert "相对时间只能根据 report_date" in context.system_prompt
 
 
 def test_investigation_uses_search_and_grep_and_persists_evidence(tmp_path: Path) -> None:

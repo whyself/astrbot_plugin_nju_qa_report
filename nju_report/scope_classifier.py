@@ -28,6 +28,7 @@ class QuestionGateCandidate:
     category: str = ""
     time_sensitive: bool = False
     source_count: int = 1
+    report_date: str = ""
 
 
 class ScopeClassifier(Protocol):

@@ -242,6 +242,7 @@ def test_final_question_gate_drops_subjective_and_merges_duplicate_questions(
     assert result.included_count == 2
     assert result.dropped_count == 1
     assert len(gate.seen) == 3
+    assert {item.report_date for item in gate.seen} == {"2026-07-12"}
     candidates, total = storage.list_question_candidates(limit=None)
     assert total == 3
     assert candidates[0].final_decision == "DROP"

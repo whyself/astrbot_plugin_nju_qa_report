@@ -51,6 +51,8 @@ _AGENT_SYSTEM_PROMPT = """
 使用 read 核对正文。准备判定完全没有可用信息时，至少要使用两个不同的 search 查询并做过 grep。
 工具返回不理想时继续改写或换工具，证据足够后立即结束，避免无意义重复。
 当输入的 must_finish_this_round 为 true 时，不得再调用工具，必须依据已有调查给出最终结论。
+report_date 是问题所属聊天日期。问题中的“今年、去年、明年、本月”等相对时间只能根据 report_date
+换算，不能根据检索文档的年份或模型当前日期猜测；summary 必须使用换算后的正确年份。
 
 最终结论的 status 只能返回 ANSWERABLE、PARTIAL 或 NO_USABLE_EVIDENCE：
 - ANSWERABLE：给定证据足以直接、明确地回答核心问题；
@@ -137,6 +139,7 @@ class AstrBotInvestigationAiClient:
     ) -> dict[str, Any]:
         payload = {
             "question": cluster.canonical_question,
+            "report_date": cluster.report_date,
             "category": cluster.category,
             "community_answers_unverified": [item.redacted_text for item in cluster.answers[:5]],
             "tool_history": list(tool_history),

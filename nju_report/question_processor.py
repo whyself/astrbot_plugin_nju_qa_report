@@ -190,7 +190,10 @@ class DailyQuestionProcessor:
                 screened_targets.extend(chunk_targets)
                 self._progress_completed += len(chunk_targets)
 
-            screened_targets = await self._apply_final_question_gate(screened_targets)
+            screened_targets = await self._apply_final_question_gate(
+                screened_targets,
+                report_date=report_date.isoformat(),
+            )
             screened_targets.sort(key=lambda item: item.index)
             for item in screened_targets:
                 await self._save_resolution(
@@ -281,10 +284,12 @@ class DailyQuestionProcessor:
     async def _apply_final_question_gate(
         self,
         targets: list[_ScreenedTarget],
+        *,
+        report_date: str,
     ) -> list[_ScreenedTarget]:
         if self._final_question_reviewer is None:
             return targets
-        groups = _final_gate_groups(targets)
+        groups = _final_gate_groups(targets, report_date=report_date)
         if not groups:
             return targets
 
@@ -357,7 +362,11 @@ class DailyQuestionProcessor:
         )
 
 
-def _final_gate_groups(targets: list[_ScreenedTarget]) -> list[_GateGroup]:
+def _final_gate_groups(
+    targets: list[_ScreenedTarget],
+    *,
+    report_date: str,
+) -> list[_GateGroup]:
     included = sorted(
         (
             item
@@ -384,6 +393,7 @@ def _final_gate_groups(targets: list[_ScreenedTarget]) -> list[_GateGroup]:
                     category=assessment.category,
                     time_sensitive=assessment.time_sensitive,
                     source_count=len(items),
+                    report_date=report_date,
                 ),
                 targets=tuple(items),
             )
