@@ -1,7 +1,7 @@
 name: astrbot_plugin_nju_qa_report
 display_name: 南大知识缺口日报
 desc: 从迎新群聊中聚合南京大学相关问题并调查知识库覆盖情况（非官方）
-version: v0.6.6
+version: v0.6.7
 author: whyself
 repo: https://github.com/whyself/astrbot_plugin_nju_qa_report
 astrbot_version: ">=4.16,<5"

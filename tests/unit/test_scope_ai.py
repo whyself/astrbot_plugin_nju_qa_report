@@ -346,6 +346,9 @@ def test_final_gate_sends_only_concise_candidate_questions() -> None:
     assert "脱离原聊天后语义完整、读者能独立看懂" in context.system_prompt
     assert "陌生维护者测试" in context.system_prompt
     assert "不要把语义不清的问题交给后续" in context.system_prompt
+    assert "图片、截图、表情、视频" in context.system_prompt
+    assert "图片中的建筑是什么”" in context.system_prompt
+    assert "媒体问题猜测合并进去" in context.system_prompt
     assert "宁可少收" not in context.system_prompt
 
 
