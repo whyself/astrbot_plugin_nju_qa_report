@@ -331,22 +331,19 @@ def test_agent_keeps_valid_group_and_degrades_only_unrepaired_group() -> None:
 
         discovery = await agent.collect(cluster, messages)
 
-        assert len(discovery.questions) == 2
+        assert len(discovery.questions) == 1
         assert discovery.questions[0].question_message_ids == ("q1",)
         assert discovery.questions[0].answers
-        assert discovery.questions[0].community_context_degraded is False
-        assert discovery.questions[1].question_message_ids == ("q2",)
-        assert discovery.questions[1].answers == ()
-        assert discovery.questions[1].community_context_degraded is True
-        assert discovery.questions[1].community_context_degradation_reason is (
+        assert discovery.questions[0].community_context_degraded is True
+        assert discovery.questions[0].community_context_degradation_reason is (
             CommunityContextDegradationReason.VALIDATION_UNRESOLVED
         )
-        audit = discovery.questions[1].community_context_audit
+        audit = discovery.questions[0].community_context_audit
         assert audit.initial_errors
         assert audit.retry_errors
         assert audit.retained_question_ids == ("Q1",)
         assert audit.degraded_question_ids == ("Q2",)
-        assert "SAFE_QUESTION_FROM_UNCOVERED_ANCHOR" in audit.fallback_actions
+        assert "DROPPED_UNRESOLVED_QUESTION_ANCHORS" in audit.fallback_actions
         retry_payload = _prompt_payload(context.calls[1])
         correction = retry_payload["validation_correction"]
         assert correction["reserved_question_count"] == 1
@@ -508,11 +505,13 @@ def test_successful_retry_degrades_an_anchor_the_repair_did_not_cover() -> None:
 
         assert [item.question_message_ids for item in discovery.questions] == [
             ("q1",),
-            ("q2",),
             ("q3",),
         ]
-        assert discovery.questions[1].community_context_degraded is True
-        assert discovery.questions[2].community_context_degraded is False
+        assert discovery.questions[0].community_context_degraded is True
+        assert discovery.questions[1].community_context_degraded is False
+        audit = discovery.questions[0].community_context_audit
+        assert audit.retained_question_ids == ("Q1", "Q3")
+        assert audit.degraded_question_ids == ("Q2",)
 
     asyncio.run(run())
 
@@ -704,13 +703,94 @@ def test_retry_failure_preserves_valid_groups_and_degrades_only_uncovered_anchor
 
         assert discovery.questions[0].question_message_ids == ("q1",)
         assert discovery.questions[0].answers
-        assert discovery.questions[1].question_message_ids == ("q2",)
-        assert discovery.questions[1].community_context_degraded is True
-        assert discovery.questions[1].community_context_degradation_reason is (
+        assert len(discovery.questions) == 1
+        assert discovery.questions[0].community_context_degraded is True
+        assert discovery.questions[0].community_context_degradation_reason is (
             CommunityContextDegradationReason.RETRY_FAILED
         )
         assert "TimeoutError" in " ".join(
-            discovery.questions[1].community_context_audit.retry_errors
+            discovery.questions[0].community_context_audit.retry_errors
+        )
+        assert "DROPPED_UNRESOLVED_QUESTION_ANCHORS" in (
+            discovery.questions[0].community_context_audit.fallback_actions
+        )
+
+    asyncio.run(run())
+
+
+def test_precision_fallback_drops_answer_like_candidate_anchors() -> None:
+    async def run() -> None:
+        cluster = QuestionCluster(
+            question_code="20260714-Q001",
+            report_date="2026-07-14",
+            canonical_question="26秉文大一住哪个宿舍",
+            category="住宿",
+            candidate_source_keys=tuple(
+                f"message:qq:bot:{item}" for item in ("q1", "a1", "a2", "a3")
+            ),
+            representative_questions=("26秉文大一住哪个宿舍",),
+            group_aliases=("测试群",),
+            first_sent_at_utc=100,
+            last_sent_at_utc=103,
+        )
+        messages = [
+            _message("q1", 100, "u1", "26秉文大一住哪个宿舍？"),
+            _message("a1", 101, "u2", "没人知道。", reply="q1"),
+            _message("a2", 102, "u3", "要看辅导员抽签的。", reply="q1"),
+            _message("a3", 103, "u4", "得临近开学才知道。", reply="q1"),
+        ]
+        malformed = SimpleNamespace(completion_text='{"question_groups": [')
+        invalid_repair = {
+            "question_message_ids": ["Q1"],
+            "answer_message_ids": ["Q2", "Q3", "Q4"],
+            "answer_summary": "仍未公布。",
+        }
+        context = _FakeContext(
+            [
+                malformed,
+                SimpleNamespace(
+                    completion_text=json.dumps(invalid_repair, ensure_ascii=False)
+                ),
+            ]
+        )
+
+        discovery = await AstrBotContextAnswerAgent(
+            context, provider_id="provider"
+        ).collect(cluster, messages)
+
+        assert len(discovery.questions) == 1
+        assert discovery.question_message_ids == ("q1",)
+        assert discovery.canonical_question == "26秉文大一住哪个宿舍"
+        assert discovery.answers == ()
+        audit = discovery.community_context_audit
+        assert audit.degraded_question_ids == ("Q1", "Q2", "Q3", "Q4")
+        assert "DROPPED_UNRESOLVED_QUESTION_ANCHORS" in audit.fallback_actions
+        assert "没人知道" not in discovery.canonical_question
+
+    asyncio.run(run())
+
+
+def test_empty_repair_uses_one_original_cluster_question_not_raw_anchors() -> None:
+    async def run() -> None:
+        cluster = _cluster_for("q1", "q2", "q3")
+        messages = [
+            _message("q1", 100, "u1", "问题一？"),
+            _message("q2", 101, "u2", "没人知道。", reply="q1"),
+            _message("q3", 102, "u3", "还没出结果。", reply="q1"),
+        ]
+        invalid = SimpleNamespace(completion_text='{"question_groups": [')
+        context = _FakeContext([invalid, invalid])
+
+        discovery = await AstrBotContextAnswerAgent(
+            context, provider_id="provider"
+        ).collect(cluster, messages)
+
+        assert len(discovery.questions) == 1
+        assert discovery.question_message_ids == ("q1", "q2", "q3")
+        assert discovery.canonical_question == cluster.canonical_question
+        assert discovery.answers == ()
+        assert "ORIGINAL_CLUSTER_SAFE_FALLBACK" in (
+            discovery.community_context_audit.fallback_actions
         )
 
     asyncio.run(run())
@@ -746,15 +826,14 @@ def test_deterministic_fallback_sanitizes_ids_overlap_duplicates_and_summary() -
         ).collect(cluster, messages)
 
         assert [item.question_message_ids for item in discovery.questions] == [
-            ("q1",),
-            ("q2",),
+            ("q1", "q2"),
         ]
         assert discovery.questions[0].answers[0].redacted_text == "问题一的可见回答。"
-        assert discovery.questions[1].answers == ()
         assert all(item.community_context_degraded for item in discovery.questions)
         audit = discovery.questions[0].community_context_audit
         assert "REBUILT_SUMMARY_FROM_VISIBLE_MESSAGES" in audit.fallback_actions
         assert "DROPPED_INVALID_ANSWERS_AND_CLEARED_SUMMARY" in audit.fallback_actions
+        assert "MERGED_OVERLAPPING_DEGRADED_QUESTIONS" in audit.fallback_actions
         assert audit.degraded_question_ids == ("Q1", "Q2")
         assert audit.event_id.startswith("ctx:")
         assert {
@@ -854,7 +933,6 @@ def test_question_anchor_cannot_be_reused_as_an_answer_in_safe_fallback() -> Non
 
         assert [item.question_message_ids for item in discovery.questions] == [
             ("q1",),
-            ("q2",),
         ]
         assert all(not item.answers for item in discovery.questions)
         assert "FILTERED_INVALID_OR_DUPLICATE_ANSWER_IDS" in (

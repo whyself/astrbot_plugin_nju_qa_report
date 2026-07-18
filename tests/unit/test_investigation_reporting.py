@@ -39,6 +39,7 @@ from nju_report.reporting import (
     coverage_list_order,
     format_coverage_counts,
     format_question_detail,
+    report_delivery_quality_issues,
 )
 from nju_report.storage import ReportStorage
 
@@ -620,6 +621,55 @@ def test_report_versions_and_mail_delivery_are_idempotent(
             storage.latest_investigation(cluster.question_code),
             timezone_name="Asia/Shanghai",
         )
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_delivery_blocks_unsafe_legacy_anchor_fallback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        storage, _, cluster, _ = _prepared_case(tmp_path, repository_status="READY")
+        unsafe = replace(
+            cluster,
+            canonical_question="[提及用户] 某群名片([编号]) 还没出结果呢",
+            community_context_degraded=True,
+            community_context_degradation_reason=(
+                CommunityContextDegradationReason.VALIDATION_UNRESOLVED
+            ),
+            community_context_audit=CommunityContextAudit(
+                degraded_question_ids=("Q1",),
+                fallback_actions=("SAFE_QUESTION_FROM_UNCOVERED_ANCHOR",),
+                event_id="ctx:unsafe",
+            ),
+        )
+        storage.save_question_clusters(cluster.report_date, [unsafe])
+        config = PluginConfig.from_mapping(
+            {
+                "smtp_host": "smtp.qq.com",
+                "smtp_username": "sender@qq.com",
+                "smtp_password": "secret",
+                "mail_from": "sender@qq.com",
+                "mail_recipients": ["reader@example.com"],
+            }
+        )
+        reports = ReportService(config, storage, tmp_path / "reports")
+        sent: list[str] = []
+        monkeypatch.setattr(
+            reports,
+            "_send_one",
+            lambda *args, **kwargs: sent.append("sent"),
+        )
+        report = await reports.build(cluster.report_date)
+
+        issues = report_delivery_quality_issues([unsafe])
+        assert len(issues) == 2
+        with pytest.raises(RuntimeError, match="日报质量检查未通过，禁止发送"):
+            await reports.deliver(report)
+        assert sent == []
+        assert storage.mail_deliveries(report.report_id) == []
         storage.close()
 
     asyncio.run(run())

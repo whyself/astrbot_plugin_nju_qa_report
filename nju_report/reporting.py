@@ -89,6 +89,23 @@ def _community_context_degradation_label(clusters: list[QuestionCluster]) -> str
     return f"社区上下文降级 {affected}（独立事件 {events}）"
 
 
+def report_delivery_quality_issues(
+    clusters: list[QuestionCluster],
+) -> tuple[str, ...]:
+    issues: list[str] = []
+    for cluster in clusters:
+        title = cluster.canonical_question
+        if "[提及用户]" in title or "[编号]" in title:
+            issues.append(f"{cluster.question_code}: 问题标题仍含用户标识")
+        if "SAFE_QUESTION_FROM_UNCOVERED_ANCHOR" in (
+            cluster.community_context_audit.fallback_actions
+        ):
+            issues.append(
+                f"{cluster.question_code}: 未解决锚点曾被直接提升为问题"
+            )
+    return tuple(dict.fromkeys(issues))
+
+
 def format_coverage_counts(
     counts: dict[CoverageStatus, int],
     *,
@@ -191,6 +208,13 @@ class ReportService:
             self._storage.list_question_clusters,
             report.report_date,
         )
+        quality_issues = report_delivery_quality_issues(clusters)
+        if quality_issues:
+            preview = "；".join(quality_issues[:5])
+            remaining = len(quality_issues) - min(len(quality_issues), 5)
+            if remaining:
+                preview += f"；另有 {remaining} 项"
+            raise RuntimeError(f"日报质量检查未通过，禁止发送：{preview}")
         investigations = await asyncio.to_thread(
             self._storage.investigations_for_date,
             report.report_date,

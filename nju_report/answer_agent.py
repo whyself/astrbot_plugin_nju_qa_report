@@ -351,7 +351,10 @@ class ChatContextLookup:
                     ),
                 ),
             )
-        canonical_question = assessment.canonical_question.strip()
+        canonical_question = redact_for_report(
+            assessment.canonical_question,
+            max_chars=300,
+        ).strip()
         category = assessment.category.strip()
         if cluster is not None:
             canonical_question = canonical_question or cluster.canonical_question
@@ -594,6 +597,7 @@ class AstrBotContextAnswerAgent:
 
         questions = [item.question for item in accepted]
         fallback_actions: list[str] = []
+        discarded_question_ids: tuple[str, ...] = ()
         if errors or retry_used:
             deterministic, actions = _deterministic_repair_groups(
                 latest_groups,
@@ -619,50 +623,55 @@ class AstrBotContextAnswerAgent:
                 if anchor.external_message_id not in covered
                 and anchor.external_message_id not in used_as_answers
             )
-            for external_id in uncovered:
-                anchor = lookup._message_by_id[external_id]
-                canonical_question = redact_for_report(
-                    anchor.text.strip() or anchor.outline.strip(),
-                    max_chars=300,
-                ).strip() or cluster.canonical_question
-                questions.append(
-                    DiscoveredQuestion(
-                        (external_id,),
-                        (),
-                        canonical_question,
-                        cluster.category,
+            if uncovered:
+                discarded_question_ids = uncovered
+                fallback_actions.append("DROPPED_UNRESOLVED_QUESTION_ANCHORS")
+                if questions and not any(
+                    item.community_context_degraded for item in questions
+                ):
+                    questions[0] = replace(
+                        questions[0],
                         community_context_degraded=True,
                     )
-                )
-                fallback_actions.append("SAFE_QUESTION_FROM_UNCOVERED_ANCHOR")
         if not questions:
-            for anchor in lookup.anchors:
-                questions.append(
-                    DiscoveredQuestion(
-                        (anchor.external_message_id,),
-                        (),
-                        redact_for_report(
-                            anchor.text.strip() or anchor.outline.strip(),
-                            max_chars=300,
-                        ).strip()
-                        or cluster.canonical_question,
-                        cluster.category,
-                        community_context_degraded=True,
-                    )
+            questions.append(
+                DiscoveredQuestion(
+                    tuple(anchor.external_message_id for anchor in lookup.anchors),
+                    (),
+                    redact_for_report(cluster.canonical_question, max_chars=300).strip(),
+                    cluster.category,
+                    community_context_degraded=True,
                 )
-            fallback_actions.append("SAFE_QUESTION_FROM_UNCOVERED_ANCHOR")
+            )
+            fallback_actions.append("ORIGINAL_CLUSTER_SAFE_FALLBACK")
 
+        questions, merged_degraded = _deduplicate_degraded_questions(questions)
+        if merged_degraded:
+            fallback_actions.append("MERGED_OVERLAPPING_DEGRADED_QUESTIONS")
+
+        retained_external_ids = {
+            external_id
+            for item in accepted
+            for external_id in item.question.question_message_ids
+        }
         degraded_ids = tuple(
+            dict.fromkeys(
+                (
+                    lookup._short_id(external_id)
+                    for question in questions
+                    if question.community_context_degraded
+                    for external_id in question.question_message_ids
+                    if external_id not in retained_external_ids
+                ),
+            )
+        ) + tuple(
             lookup._short_id(external_id)
-            for question in questions
-            if question.community_context_degraded
-            for external_id in question.question_message_ids
+            for external_id in discarded_question_ids
         )
         retained_ids = tuple(
             lookup._short_id(external_id)
-            for question in questions
-            if not question.community_context_degraded
-            for external_id in question.question_message_ids
+            for item in accepted
+            for external_id in item.question.question_message_ids
         )
         degradation_reason = CommunityContextDegradationReason.NONE
         all_errors = (*initial_errors, *retry_errors)
@@ -1175,6 +1184,66 @@ def _deterministic_repair_groups(
         used_question_ids.update(question_ids)
         used_answer_ids.update(answer_ids)
     return tuple(repaired), tuple(dict.fromkeys(actions))
+
+
+def _deduplicate_degraded_questions(
+    questions: Sequence[DiscoveredQuestion],
+) -> tuple[tuple[DiscoveredQuestion, ...], bool]:
+    result: list[DiscoveredQuestion] = []
+    merged = False
+    for question in questions:
+        if not question.community_context_degraded:
+            result.append(question)
+            continue
+        normalized = _normalized_question_text(question.canonical_question)
+        match_index = next(
+            (
+                index
+                for index, existing in enumerate(result)
+                if existing.community_context_degraded
+                and _degraded_questions_overlap(
+                    normalized,
+                    _normalized_question_text(existing.canonical_question),
+                )
+            ),
+            None,
+        )
+        if match_index is None:
+            result.append(question)
+            continue
+        existing = result[match_index]
+        preferred = (
+            question
+            if len(question.canonical_question) > len(existing.canonical_question)
+            else existing
+        )
+        answers = existing.answers or question.answers
+        result[match_index] = replace(
+            preferred,
+            question_message_ids=tuple(
+                dict.fromkeys(
+                    (*existing.question_message_ids, *question.question_message_ids)
+                )
+            ),
+            answers=answers,
+            community_context_degraded=True,
+        )
+        merged = True
+    return tuple(result), merged
+
+
+def _normalized_question_text(value: str) -> str:
+    return re.sub(r"[\s，,。！？?!；;：:、（）()]+", "", value).casefold()
+
+
+def _degraded_questions_overlap(first: str, second: str) -> bool:
+    if not first or not second:
+        return False
+    if first == second:
+        return True
+    return min(len(first), len(second)) >= 8 and (
+        first in second or second in first
+    )
 
 
 def _discovery_result_from_questions(

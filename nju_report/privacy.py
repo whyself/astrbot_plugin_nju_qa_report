@@ -11,6 +11,10 @@ _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _LONG_NUMBER_RE = re.compile(r"(?<!\d)\d{7,16}(?!\d)")
 _URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 _QQ_LABEL_RE = re.compile(r"(?i)(QQ|企鹅号)(\s*[：:]?\s*)\d{5,12}")
+_AT_WITH_ID_RE = re.compile(r"@[^\r\n()]{1,64}\(\d{5,12}\)")
+_REDACTED_AT_WITH_LABEL_RE = re.compile(
+    r"\[提及用户\][^\r\n()]{0,64}\(\[编号\]\)"
+)
 _AT_RE = re.compile(r"@[\w\-\u4e00-\u9fff]{1,32}")
 _NAME_RE = re.compile(r"(我叫|姓名\s*[是为：:]?\s*)[\u4e00-\u9fff]{2,4}")
 _ROOM_RE = re.compile(
@@ -54,7 +58,9 @@ def _redact(text: str) -> str:
     redacted = _ID_CARD_RE.sub("[身份证号]", redacted)
     redacted = _PHONE_RE.sub("[手机号]", redacted)
     redacted = _QQ_LABEL_RE.sub(r"\1\2[账号]", redacted)
+    redacted = _AT_WITH_ID_RE.sub("[提及用户]", redacted)
     redacted = _LONG_NUMBER_RE.sub("[编号]", redacted)
+    redacted = _REDACTED_AT_WITH_LABEL_RE.sub("[提及用户]", redacted)
     redacted = _AT_RE.sub("[提及用户]", redacted)
     redacted = _NAME_RE.sub(r"\1[姓名]", redacted)
     return _ROOM_RE.sub(r"\1\2[房间]", redacted)
