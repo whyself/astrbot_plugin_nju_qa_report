@@ -146,7 +146,7 @@ def test_migrations_tolerate_indexes_left_by_an_older_partial_run(tmp_path: Path
     recovered.initialize()
     with sqlite3.connect(path) as connection:
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-    assert version == 9
+    assert version == 10
     recovered.close()
 
 
@@ -184,7 +184,7 @@ def test_v9_migration_marks_legacy_degradation_audit_unknown(tmp_path: Path) -> 
                 "{}",
             ),
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = 9")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 9")
         connection.commit()
 
     recovered = ReportStorage(path)

@@ -989,9 +989,15 @@ class NjuQaReportPlugin(Star):
             if result.status is CoverageStatus.ERROR and result.error_summary
             else ""
         )
+        retry_detail = (
+            f"\n自动重跑：{result.attempts - 1} 次；"
+            f"{'已恢复' if result.status is not CoverageStatus.ERROR else '仍失败'}"
+            if result.attempts > 1
+            else ""
+        )
         yield event.plain_result(
             f"调查完成：{question_code} / {result.status.value}\n"
-            f"{result.summary}{technical_detail}"
+            f"{result.summary}{retry_detail}{technical_detail}"
         )
 
     @nju_collect_report.command("status")

@@ -12,6 +12,7 @@ from nju_report.config import PluginConfig
 from nju_report.investigation import (
     AstrBotInvestigationAiClient,
     InvestigationService,
+    _automatic_read_calls,
     _evidence_from_hits,
 )
 from nju_report.models import (
@@ -306,14 +307,108 @@ def test_twenty_rounds_and_two_final_failures_are_saved_as_error(
 
         result = await service.investigate(cluster)
 
-        assert ai.rounds == 22
-        assert knowledge.reads == [("qc19gt/guide", "card")]
+        assert ai.rounds == 44
+        assert knowledge.reads == [
+            ("qc19gt/guide", "card"),
+            ("qc19gt/guide", "card"),
+        ]
         assert result.status is CoverageStatus.ERROR
         assert "20 轮" in result.error_summary
         assert "最终结论" in result.error_summary
+        assert result.attempts == 2
+        assert len(result.retry_errors) == 2
+        assert storage.latest_investigation(cluster.question_code) == result
         storage.close()
 
     asyncio.run(run())
+
+
+def test_failed_investigation_is_automatically_retried_and_recovers(tmp_path: Path) -> None:
+    class TransientFailureAi(FakeAi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        async def next_step(self, cluster, evidence, tool_history, *, must_finish):
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("temporary provider failure")
+            return await super().next_step(
+                cluster,
+                evidence,
+                tool_history,
+                must_finish=must_finish,
+            )
+
+    async def run() -> None:
+        storage, config, cluster, hit = _prepared_case(tmp_path, repository_status="READY")
+        service = InvestigationService(  # type: ignore[arg-type]
+            config,
+            storage,
+            FakeKnowledge([hit]),
+            TransientFailureAi(),
+        )
+
+        result = await service.investigate(cluster)
+
+        assert result.status is CoverageStatus.PARTIAL
+        assert result.attempts == 2
+        assert result.retry_errors == ("RuntimeError: temporary provider failure",)
+        assert storage.latest_investigation(cluster.question_code) == result
+        summary = _summary_payload(
+            cluster.report_date,
+            storage.list_question_clusters(cluster.report_date),
+            storage.investigations_for_date(cluster.report_date),
+            screening_errors=0,
+        )
+        assert summary["investigation_auto_retries"] == 1
+        assert summary["investigation_retry_recovered"] == 1
+        assert summary["investigation_retry_failed"] == 0
+        detail = format_question_detail(cluster, result, timezone_name="Asia/Shanghai")
+        assert "调查自动重跑：1 次；已恢复" in detail
+        assert "RuntimeError: temporary provider failure" in detail
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_automatic_read_only_selects_documents_visible_to_model() -> None:
+    chunk = KnowledgeChunk(
+        chunk_id="visible:0",
+        namespace="repo",
+        document_id="visible",
+        title="可见文档",
+        source_url="https://www.yuque.com/repo/visible",
+        updated_at="2026-07-18",
+        chunk_index=0,
+        content="可见正文",
+        content_hash="visible",
+    )
+    visible_hit = KnowledgeSearchHit(
+        chunk=chunk,
+        score=1.0,
+        keyword_score=1.0,
+        vector_score=0.0,
+        methods=("keyword",),
+    )
+    hidden_hit = replace(
+        visible_hit,
+        chunk=replace(
+            chunk,
+            chunk_id="hidden:0",
+            document_id="aaa-hidden",
+            title="不可见文档",
+            content_hash="hidden",
+        ),
+    )
+    evidence = _evidence_from_hits((visible_hit,))
+
+    calls = _automatic_read_calls(
+        {hidden_hit.chunk.chunk_id: hidden_hit, visible_hit.chunk.chunk_id: visible_hit},
+        evidence,
+    )
+
+    assert [item["document_id"] for item in calls] == ["visible"]
 
 
 def test_finalization_contract_error_is_retried_once_with_existing_evidence(

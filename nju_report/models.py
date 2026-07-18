@@ -286,6 +286,8 @@ class InvestigationResult:
     flags: tuple[str, ...] = ()
     queries: tuple[str, ...] = ()
     error_summary: str = ""
+    attempts: int = 1
+    retry_errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

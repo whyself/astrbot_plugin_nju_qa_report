@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any, Protocol
 
 from .config import PluginConfig
@@ -97,6 +99,10 @@ NO_USABLE_EVIDENCE 的 evidence_indices 必须是空数组。
 
 _MAX_AGENT_ROUNDS = 20
 _FINALIZATION_ATTEMPTS = 2
+_INVESTIGATION_ATTEMPTS = 2
+_AUTOMATIC_READ_ATTEMPTS = 3
+
+logger = logging.getLogger(__name__)
 
 
 class InvestigationError(RuntimeError):
@@ -255,41 +261,78 @@ class InvestigationService:
         return result
 
     async def investigate(self, cluster: QuestionCluster) -> InvestigationResult:
-        audit_queries: list[str] = []
-        try:
-            ready, incomplete_reason = await asyncio.to_thread(self._knowledge_ready)
-            if not ready:
-                result = InvestigationResult(
-                    question_code=cluster.question_code,
-                    status=CoverageStatus.ERROR,
-                    summary="本次调查因知识库未就绪而无法执行。",
-                    missing_information=incomplete_reason,
-                    recommendation="先完成允许仓库同步，再重新调查该问题。",
-                    queries=(cluster.canonical_question,),
-                    error_summary="KNOWLEDGE_NOT_READY",
-                )
-                await asyncio.to_thread(self._storage.save_investigation, result)
-                return result
-
-            if not await asyncio.to_thread(self._repositories_complete):
-                raise InvestigationError("允许仓库未全部处于 READY，不能判定知识缺口")
-            result = await self._run_agent(cluster, audit_queries)
-            await asyncio.to_thread(self._storage.save_investigation, result)
-            return result
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+        ready, incomplete_reason = await asyncio.to_thread(self._knowledge_ready)
+        if not ready:
             result = InvestigationResult(
                 question_code=cluster.question_code,
                 status=CoverageStatus.ERROR,
-                summary="本次调查发生技术错误，不能判断知识库是否存在缺口。",
-                missing_information="调查未正常完成。",
-                recommendation="稍后重试调查；不要据此直接新增或修改知识。",
-                queries=tuple(audit_queries),
-                error_summary=f"{type(exc).__name__}: {exc}"[:1000],
+                summary="本次调查因知识库未就绪而无法执行。",
+                missing_information=incomplete_reason,
+                recommendation="先完成允许仓库同步，再重新调查该问题。",
+                queries=(cluster.canonical_question,),
+                error_summary="KNOWLEDGE_NOT_READY",
             )
             await asyncio.to_thread(self._storage.save_investigation, result)
             return result
+        if not await asyncio.to_thread(self._repositories_complete):
+            result = InvestigationResult(
+                question_code=cluster.question_code,
+                status=CoverageStatus.ERROR,
+                summary="本次调查因知识库未就绪而无法执行。",
+                missing_information="允许仓库未全部处于 READY，不能判定知识缺口。",
+                recommendation="先完成允许仓库同步，再重新调查该问题。",
+                queries=(cluster.canonical_question,),
+                error_summary="REPOSITORIES_NOT_READY",
+            )
+            await asyncio.to_thread(self._storage.save_investigation, result)
+            return result
+
+        attempt_errors: list[str] = []
+        last_queries: tuple[str, ...] = ()
+        for attempt in range(1, _INVESTIGATION_ATTEMPTS + 1):
+            audit_queries: list[str] = []
+            try:
+                result = await self._run_agent(cluster, audit_queries)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"[:1000]
+                attempt_errors.append(detail)
+                last_queries = tuple(audit_queries)
+                if attempt < _INVESTIGATION_ATTEMPTS:
+                    logger.warning(
+                        "NJU investigation failed; retrying question_code=%s "
+                        "attempt=%d/%d error=%s",
+                        cluster.question_code,
+                        attempt,
+                        _INVESTIGATION_ATTEMPTS,
+                        detail,
+                    )
+                    await asyncio.sleep(0.5)
+                    continue
+                result = InvestigationResult(
+                    question_code=cluster.question_code,
+                    status=CoverageStatus.ERROR,
+                    summary="本次调查发生技术错误，不能判断知识库是否存在缺口。",
+                    missing_information="调查自动重跑后仍未正常完成。",
+                    recommendation="不要据此直接新增或修改知识；请根据技术审计排查。",
+                    queries=last_queries,
+                    error_summary=(
+                        f"自动调查 {_INVESTIGATION_ATTEMPTS} 次均失败；最终错误：{detail}"
+                    )[:1000],
+                    attempts=attempt,
+                    retry_errors=tuple(attempt_errors),
+                )
+            else:
+                result = replace(
+                    result,
+                    attempts=attempt,
+                    retry_errors=tuple(attempt_errors),
+                )
+            await asyncio.to_thread(self._storage.save_investigation, result)
+            return result
+
+        raise AssertionError("unreachable investigation retry loop")
 
     async def _run_agent(
         self,
@@ -367,18 +410,21 @@ class InvestigationService:
 
         evidence = _agent_evidence(found.values(), read_sections)
         if found and not read_documents:
-            await self._execute_tool_call(
-                _automatic_read_call(found),
-                evidence=evidence,
-                found=found,
-                read_sections=read_sections,
-                tool_history=tool_history,
-                search_queries=search_queries,
-                grep_terms=grep_terms,
-                read_documents=read_documents,
-                audit_queries=audit_queries,
-                automatic=True,
-            )
+            for call in _automatic_read_calls(found, evidence):
+                await self._execute_tool_call(
+                    call,
+                    evidence=evidence,
+                    found=found,
+                    read_sections=read_sections,
+                    tool_history=tool_history,
+                    search_queries=search_queries,
+                    grep_terms=grep_terms,
+                    read_documents=read_documents,
+                    audit_queries=audit_queries,
+                    automatic=True,
+                )
+                if read_documents:
+                    break
             evidence = _agent_evidence(found.values(), read_sections)
 
         last_final_error = "模型未返回最终结论"
@@ -478,6 +524,10 @@ class InvestigationService:
         document_key = (namespace, document_id)
         visible_documents = {(item.namespace, item.document_id) for item in evidence}
         if document_key not in visible_documents:
+            if automatic:
+                audit_queries.append(
+                    f"read:auto_error:{namespace}/{document_id}:not_visible"
+                )
             tool_history.append(
                 {
                     "tool": "read",
@@ -489,6 +539,8 @@ class InvestigationService:
             return
         document = await self._knowledge.read_document(namespace, document_id)
         if document is None:
+            if automatic:
+                audit_queries.append(f"read:auto_error:{namespace}/{document_id}:missing")
             tool_history.append(
                 {
                     "tool": "read",
@@ -510,10 +562,12 @@ class InvestigationService:
             if excerpt not in sections:
                 sections.append(excerpt)
             read_documents.add(document_key)
-        audit_queries.append(
-            f"read:{'auto:' if automatic else ''}{namespace}/{document_id}@{actual_offset}"
-            + (f"#{focus}" if focus else "")
-        )
+            audit_queries.append(
+                f"read:{'auto:' if automatic else ''}{namespace}/{document_id}@{actual_offset}"
+                + (f"#{focus}" if focus else "")
+            )
+        elif automatic:
+            audit_queries.append(f"read:auto_error:{namespace}/{document_id}:empty")
         tool_history.append(
             {
                 "tool": "read",
@@ -558,13 +612,19 @@ class InvestigationService:
         return tuple(item for item in self._config.approved_repositories if item not in excluded)
 
 
-def _automatic_read_call(
+def _automatic_read_calls(
     found: dict[str, KnowledgeSearchHit],
-) -> dict[str, Any]:
-    """Read the highest-scoring candidate around its matching chunk before finalization."""
+    evidence: Sequence[EvidenceItem],
+) -> tuple[dict[str, Any], ...]:
+    """Read up to three highest-scoring candidates that are visible to the model."""
 
-    top_hit = min(
-        found.values(),
+    visible_documents = {(item.namespace, item.document_id) for item in evidence}
+    ranked = sorted(
+        (
+            item
+            for item in found.values()
+            if (item.chunk.namespace, item.chunk.document_id) in visible_documents
+        ),
         key=lambda item: (
             -item.score,
             item.chunk.namespace,
@@ -572,13 +632,25 @@ def _automatic_read_call(
             item.chunk.chunk_index,
         ),
     )
-    return {
-        "tool": "read",
-        "namespace": top_hit.chunk.namespace,
-        "document_id": top_hit.chunk.document_id,
-        "offset": 0,
-        "focus": top_hit.chunk.content.strip()[:120],
-    }
+    calls: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for hit in ranked:
+        document_key = (hit.chunk.namespace, hit.chunk.document_id)
+        if document_key in seen:
+            continue
+        seen.add(document_key)
+        calls.append(
+            {
+                "tool": "read",
+                "namespace": hit.chunk.namespace,
+                "document_id": hit.chunk.document_id,
+                "offset": 0,
+                "focus": hit.chunk.content.strip()[:120],
+            }
+        )
+        if len(calls) >= _AUTOMATIC_READ_ATTEMPTS:
+            break
+    return tuple(calls)
 
 
 def _parse_tool_calls(data: dict[str, Any]) -> tuple[dict[str, Any], ...]:

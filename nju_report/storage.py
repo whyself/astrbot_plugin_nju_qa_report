@@ -35,7 +35,7 @@ from .models import (
 )
 from .time_windows import TimeWindow
 
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 
 
 class StorageError(RuntimeError):
@@ -728,8 +728,8 @@ class ReportStorage:
                 INSERT INTO investigations (
                     cluster_id, version, status, summary, missing_information,
                     recommendation, evidence_json, flags_json, queries_json,
-                    error_summary, created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_summary, attempts, retry_errors_json, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cluster_id,
@@ -755,6 +755,8 @@ class ReportStorage:
                     json.dumps(result.flags, ensure_ascii=False),
                     json.dumps(result.queries, ensure_ascii=False),
                     result.error_summary[:1000],
+                    max(1, result.attempts),
+                    json.dumps(result.retry_errors, ensure_ascii=False),
                     int(time.time()),
                 ),
             )
@@ -1799,6 +1801,13 @@ class ReportStorage:
                     "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
                     (9, int(time.time())),
                 )
+                version = 9
+            if version < 10:
+                self._migration_v10(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+                    (10, int(time.time())),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -2245,6 +2254,29 @@ class ReportStorage:
             """
         )
 
+    @staticmethod
+    def _migration_v10(connection: sqlite3.Connection) -> None:
+        """Persist whole-investigation retry audit details."""
+
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(investigations)").fetchall()
+        }
+        if "attempts" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE investigations
+                ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1 CHECK(attempts >= 1)
+                """
+            )
+        if "retry_errors_json" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE investigations
+                ADD COLUMN retry_errors_json TEXT NOT NULL DEFAULT '[]'
+                """
+            )
+
 
 def _community_context_audit_json(audit: CommunityContextAudit) -> str:
     return json.dumps(
@@ -2456,6 +2488,8 @@ def _investigation_from_row(row: sqlite3.Row) -> InvestigationResult:
         flags=tuple(str(item) for item in json.loads(row["flags_json"])),
         queries=tuple(str(item) for item in json.loads(row["queries_json"])),
         error_summary=str(row["error_summary"]),
+        attempts=max(1, int(row["attempts"])),
+        retry_errors=tuple(str(item) for item in json.loads(row["retry_errors_json"])),
     )
 
 
