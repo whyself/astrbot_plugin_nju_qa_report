@@ -15,6 +15,8 @@ from nju_report.investigation import (
     _evidence_from_hits,
 )
 from nju_report.models import (
+    CommunityContextAudit,
+    CommunityContextDegradationReason,
     CoverageStatus,
     EvidenceItem,
     InvestigationResult,
@@ -195,7 +197,9 @@ def test_investigation_uses_search_and_grep_and_persists_evidence(tmp_path: Path
     asyncio.run(run())
 
 
-def test_tenth_round_auto_reads_top_candidate_before_finalization(tmp_path: Path) -> None:
+def test_twenty_rounds_then_auto_reads_top_candidate_before_finalization(
+    tmp_path: Path,
+) -> None:
     class LongRunningAi(FakeAi):
         def __init__(self) -> None:
             super().__init__()
@@ -212,7 +216,7 @@ def test_tenth_round_auto_reads_top_candidate_before_finalization(tmp_path: Path
                         {"tool": "grep", "text": "校园卡"},
                     ],
                 }
-            if self.rounds < 10:
+            if self.rounds <= 20:
                 assert must_finish is False
                 return {
                     "action": "tools",
@@ -220,6 +224,7 @@ def test_tenth_round_auto_reads_top_candidate_before_finalization(tmp_path: Path
                         {"tool": "search", "query": f"补办流程 改写 {self.rounds}"}
                     ],
                 }
+            assert self.rounds == 21
             assert must_finish is True
             automatic_reads = [
                 item
@@ -257,7 +262,7 @@ def test_tenth_round_auto_reads_top_candidate_before_finalization(tmp_path: Path
 
         result = await service.investigate(cluster)
 
-        assert ai.rounds == 10
+        assert ai.rounds == 21
         assert knowledge.reads == [("qc19gt/guide", "top")]
         assert any(item.startswith("read:auto:") for item in result.queries)
         assert result.status is CoverageStatus.PARTIAL
@@ -266,7 +271,9 @@ def test_tenth_round_auto_reads_top_candidate_before_finalization(tmp_path: Path
     asyncio.run(run())
 
 
-def test_tenth_round_failure_is_saved_as_error_after_automatic_read(tmp_path: Path) -> None:
+def test_twenty_rounds_and_two_final_failures_are_saved_as_error(
+    tmp_path: Path,
+) -> None:
     class NeverFinalAi:
         def __init__(self) -> None:
             self.rounds = 0
@@ -297,10 +304,71 @@ def test_tenth_round_failure_is_saved_as_error_after_automatic_read(tmp_path: Pa
 
         result = await service.investigate(cluster)
 
-        assert ai.rounds == 10
+        assert ai.rounds == 22
         assert knowledge.reads == [("qc19gt/guide", "card")]
         assert result.status is CoverageStatus.ERROR
-        assert "10 轮" in result.error_summary
+        assert "20 轮" in result.error_summary
+        assert "最终结论" in result.error_summary
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_finalization_contract_error_is_retried_once_with_existing_evidence(
+    tmp_path: Path,
+) -> None:
+    class FinalRetryAi(FakeAi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rounds = 0
+
+        async def next_step(self, cluster, evidence, tool_history, *, must_finish):
+            self.rounds += 1
+            if self.rounds == 1:
+                return {
+                    "action": "tools",
+                    "tool_calls": [
+                        {"tool": "search", "query": cluster.canonical_question},
+                        {"tool": "search", "query": "校园卡补办说明"},
+                        {"tool": "grep", "text": "校园卡"},
+                    ],
+                }
+            if self.rounds <= 20:
+                return {
+                    "action": "tools",
+                    "tool_calls": [
+                        {"tool": "search", "query": f"继续调查 {self.rounds}"}
+                    ],
+                }
+            assert must_finish is True
+            if self.rounds == 21:
+                return {"action": "tools", "tool_calls": []}
+            assert any(
+                item.get("tool") == "contract_error"
+                and "最终结论" in item.get("message", "")
+                for item in tool_history
+            )
+            return await super().next_step(
+                cluster,
+                evidence,
+                tool_history,
+                must_finish=must_finish,
+            )
+
+    async def run() -> None:
+        storage, config, cluster, hit = _prepared_case(tmp_path, repository_status="READY")
+        ai = FinalRetryAi()
+        service = InvestigationService(  # type: ignore[arg-type]
+            config,
+            storage,
+            FakeKnowledge([hit]),
+            ai,
+        )
+
+        result = await service.investigate(cluster)
+
+        assert ai.rounds == 22
+        assert result.status is CoverageStatus.PARTIAL
         storage.close()
 
     asyncio.run(run())
@@ -636,7 +704,19 @@ def test_public_counts_fold_legacy_incomplete_into_execution_error(tmp_path: Pat
 
 def test_community_context_degradation_has_separate_public_count(tmp_path: Path) -> None:
     storage, _, cluster, _ = _prepared_case(tmp_path, repository_status="READY")
-    degraded = replace(cluster, community_context_degraded=True)
+    degraded = replace(
+        cluster,
+        community_context_degraded=True,
+        community_context_degradation_reason=(
+            CommunityContextDegradationReason.VALIDATION_UNRESOLVED
+        ),
+        community_context_audit=CommunityContextAudit(
+            initial_errors=("invalid Q id",),
+            retry_errors=("invalid Q id",),
+            degraded_question_ids=("Q1",),
+            fallback_actions=("SAFE_QUESTION_FROM_UNCOVERED_ANCHOR",),
+        ),
+    )
     storage.save_question_clusters(cluster.report_date, [degraded])
     clusters = storage.list_question_clusters(cluster.report_date)
     investigations = storage.investigations_for_date(cluster.report_date)
@@ -651,11 +731,27 @@ def test_community_context_degradation_has_separate_public_count(tmp_path: Path)
     text = format_coverage_counts(counts, community_context_degraded=1)
     mail_text = _render_mail_text(cluster.report_date, clusters, investigations)
     mail_html = _render_mail_html(cluster.report_date, clusters, investigations)
+    detail = format_question_detail(
+        clusters[0],
+        InvestigationResult(
+            question_code=cluster.question_code,
+            status=CoverageStatus.NO_USABLE_EVIDENCE,
+            summary="未找到可用信息。",
+            missing_information="缺少正式资料。",
+            recommendation="补充知识库。",
+        ),
+        timezone_name="Asia/Shanghai",
+    )
 
     assert summary["community_context_degraded"] == 1
+    assert summary["community_context_degradation_reasons"] == {
+        "VALIDATION_UNRESOLVED": 1
+    }
     assert "社区上下文降级 1" in text
     assert "社区上下文降级 1" in mail_text
     assert "社区上下文降级 1" in mail_html
+    assert "VALIDATION_UNRESOLVED" in detail
+    assert "SAFE_QUESTION_FROM_UNCOVERED_ANCHOR" in detail
     storage.close()
 
 

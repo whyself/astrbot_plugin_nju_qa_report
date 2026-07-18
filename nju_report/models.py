@@ -212,6 +212,26 @@ class CoverageStatus(str, Enum):
     ERROR = "ERROR"
 
 
+class CommunityContextDegradationReason(str, Enum):
+    NONE = ""
+    LEGACY_UNKNOWN = "LEGACY_UNKNOWN"
+    VALIDATION_UNRESOLVED = "VALIDATION_UNRESOLVED"
+    RETRY_FAILED = "RETRY_FAILED"
+    CROSS_GROUP_CONFLICT = "CROSS_GROUP_CONFLICT"
+    MISSING_ANCHORS = "MISSING_ANCHORS"
+    AGENT_EXCEPTION = "AGENT_EXCEPTION"
+    NO_DISCOVERY = "NO_DISCOVERY"
+
+
+@dataclass(frozen=True, slots=True)
+class CommunityContextAudit:
+    initial_errors: tuple[str, ...] = ()
+    retry_errors: tuple[str, ...] = ()
+    retained_question_ids: tuple[str, ...] = ()
+    degraded_question_ids: tuple[str, ...] = ()
+    fallback_actions: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True, slots=True)
 class CommunityAnswer:
     external_message_id: str
@@ -234,6 +254,10 @@ class QuestionCluster:
     last_sent_at_utc: int
     answers: tuple[CommunityAnswer, ...] = ()
     community_context_degraded: bool = False
+    community_context_degradation_reason: CommunityContextDegradationReason = (
+        CommunityContextDegradationReason.NONE
+    )
+    community_context_audit: CommunityContextAudit = CommunityContextAudit()
 
     @property
     def occurrence_count(self) -> int:

@@ -9,6 +9,8 @@ from nju_report.aggregation import QuestionAggregationService, _aggregate
 from nju_report.answer_agent import AnswerDiscoveryResult, DiscoveredQuestion
 from nju_report.models import (
     CommunityAnswer,
+    CommunityContextAudit,
+    CommunityContextDegradationReason,
     QuestionCandidate,
     QuestionCluster,
     ScopeAssessment,
@@ -189,6 +191,10 @@ def test_answer_agent_failure_marks_only_the_fallback_cluster_degraded() -> None
 
         assert len(clusters) == 1
         assert clusters[0].community_context_degraded is True
+        assert clusters[0].community_context_degradation_reason is (
+            CommunityContextDegradationReason.AGENT_EXCEPTION
+        )
+        assert "RuntimeError" in clusters[0].community_context_audit.initial_errors[0]
         assert storage.saved == clusters
 
     asyncio.run(run())
@@ -407,12 +413,31 @@ def test_reaggregation_can_move_candidate_between_existing_clusters(tmp_path: Pa
     stored = storage.list_question_clusters("2026-07-12")
     storage.save_question_clusters(
         "2026-07-12",
-        [replace(stored[0], community_context_degraded=True)],
+        [
+            replace(
+                stored[0],
+                community_context_degraded=True,
+                community_context_degradation_reason=(
+                    CommunityContextDegradationReason.RETRY_FAILED
+                ),
+                community_context_audit=CommunityContextAudit(
+                    initial_errors=("invalid Q id",),
+                    retry_errors=("TimeoutError",),
+                    retained_question_ids=("Q1",),
+                    degraded_question_ids=("Q2",),
+                    fallback_actions=("SAFE_QUESTION_FROM_UNCOVERED_ANCHOR",),
+                ),
+            )
+        ],
     )
     clusters = storage.list_question_clusters("2026-07-12")
     assert len(clusters) == 1
     assert clusters[0].candidate_source_keys == (first.source_key, second.source_key)
     assert clusters[0].community_context_degraded is True
+    assert clusters[0].community_context_degradation_reason is (
+        CommunityContextDegradationReason.RETRY_FAILED
+    )
+    assert clusters[0].community_context_audit.retry_errors == ("TimeoutError",)
     storage.close()
 
 

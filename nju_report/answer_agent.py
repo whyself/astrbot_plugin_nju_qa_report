@@ -7,10 +7,16 @@ import hashlib
 import json
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
-from .models import CommunityAnswer, QuestionCluster, StoredMessage
+from .models import (
+    CommunityAnswer,
+    CommunityContextAudit,
+    CommunityContextDegradationReason,
+    QuestionCluster,
+    StoredMessage,
+)
 from .privacy import redact_for_report
 from .token_usage import TokenUsageTracker
 
@@ -96,6 +102,10 @@ class DiscoveredQuestion:
     canonical_question: str = ""
     category: str = ""
     community_context_degraded: bool = False
+    community_context_degradation_reason: CommunityContextDegradationReason = (
+        CommunityContextDegradationReason.NONE
+    )
+    community_context_audit: CommunityContextAudit = CommunityContextAudit()
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +118,10 @@ class AnswerDiscoveryResult:
     category: str = ""
     additional_questions: tuple[DiscoveredQuestion, ...] = ()
     community_context_degraded: bool = False
+    community_context_degradation_reason: CommunityContextDegradationReason = (
+        CommunityContextDegradationReason.NONE
+    )
+    community_context_audit: CommunityContextAudit = CommunityContextAudit()
 
     @property
     def questions(self) -> tuple[DiscoveredQuestion, ...]:
@@ -120,6 +134,8 @@ class AnswerDiscoveryResult:
                     self.canonical_question,
                     self.category,
                     self.community_context_degraded,
+                    self.community_context_degradation_reason,
+                    self.community_context_audit,
                 ),
             )
         return primary + self.additional_questions
@@ -251,6 +267,7 @@ class ChatContextLookup:
             "representative_questions": list(cluster.representative_questions[:5]),
             "allowed_question_ids": list(self.allowed_question_ids),
             "allowed_message_ids": list(self.allowed_message_ids),
+            "allowed_answer_ids": list(self.allowed_answer_ids),
             "question_anchors": [self._message_payload(item) for item in self.anchors],
             "message_limit": limit,
             "messages": [self._message_payload(item) for item in shown],
@@ -304,6 +321,8 @@ class ChatContextLookup:
         )
         if set(question_ids) & set(answer_ids):
             raise AnswerAgentError("同一消息不能同时归为问题和回答")
+        if set(answer_ids) & self.anchor_ids:
+            raise AnswerAgentError("answer_message_ids 不能使用候选问题锚点")
         if any(item not in self.returned_message_ids for item in answer_ids):
             raise AnswerAgentError("模型选择了未展示给它的回答消息")
         selected = [self._message_by_id[item] for item in answer_ids]
@@ -368,6 +387,12 @@ class ChatContextLookup:
     def allowed_message_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._short_to_external, key=_short_id_order))
 
+    @property
+    def allowed_answer_ids(self) -> tuple[str, ...]:
+        return tuple(
+            item for item in self.allowed_message_ids if item.startswith("M")
+        )
+
     def _short_id(self, external_id: str) -> str:
         existing = self._external_to_short.get(external_id)
         if existing is not None:
@@ -411,14 +436,32 @@ class AstrBotContextAnswerAgent:
         messages: Sequence[StoredMessage],
     ) -> AnswerDiscoveryResult:
         if not cluster.candidate_source_keys:
-            return AnswerDiscoveryResult((), ())
+            return AnswerDiscoveryResult(
+                (),
+                (),
+                community_context_degradation_reason=(
+                    CommunityContextDegradationReason.NO_DISCOVERY
+                ),
+                community_context_audit=CommunityContextAudit(
+                    fallback_actions=("NO_CANDIDATE_SOURCE_KEYS",),
+                ),
+            )
         lookup = ChatContextLookup(
             cluster,
             messages,
             ignored_sender_ids=self._ignored_sender_ids,
         )
         if not lookup.anchors:
-            return AnswerDiscoveryResult((), ())
+            return AnswerDiscoveryResult(
+                (),
+                (),
+                community_context_degradation_reason=(
+                    CommunityContextDegradationReason.MISSING_ANCHORS
+                ),
+                community_context_audit=CommunityContextAudit(
+                    fallback_actions=("NO_MESSAGE_ANCHORS_FOUND",),
+                ),
+            )
         initial = lookup.context_payload(cluster, limit=_INITIAL_MESSAGE_LIMIT)
         discovery, retry_used = await self._assess_with_repair(
             initial,
@@ -434,13 +477,57 @@ class AstrBotContextAnswerAgent:
             return discovery
 
         expanded = lookup.context_payload(cluster, limit=_EXPANDED_MESSAGE_LIMIT)
-        discovery, _ = await self._assess_with_repair(
-            expanded,
-            lookup,
-            cluster,
-            allow_retry=not retry_used,
+        try:
+            expanded_discovery, _ = await self._assess_with_repair(
+                expanded,
+                lookup,
+                cluster,
+                allow_retry=not retry_used,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            degraded_ids = tuple(
+                dict.fromkeys(
+                    lookup._short_id(external_id)
+                    for question in discovery.questions
+                    for external_id in question.question_message_ids
+                )
+            )
+            expanded_failure_audit = CommunityContextAudit(
+                retry_errors=(
+                    f"expanded context assessment failed: {type(exc).__name__}",
+                ),
+                degraded_question_ids=degraded_ids,
+                fallback_actions=("EXPANDED_PASS_EXCEPTION_SAFE_FALLBACK",),
+            )
+            merged_audit = _merge_community_context_audits(
+                discovery.community_context_audit,
+                expanded_failure_audit,
+            )
+            return _discovery_result_from_questions(
+                [
+                    replace(
+                        question,
+                        community_context_degraded=True,
+                        community_context_degradation_reason=(
+                            CommunityContextDegradationReason.AGENT_EXCEPTION
+                        ),
+                        community_context_audit=merged_audit,
+                    )
+                    for question in discovery.questions
+                ]
+            )
+        merged_audit = _merge_community_context_audits(
+            discovery.community_context_audit,
+            expanded_discovery.community_context_audit,
         )
-        return discovery
+        return _discovery_result_from_questions(
+            [
+                replace(question, community_context_audit=merged_audit)
+                for question in expanded_discovery.questions
+            ]
+        )
 
     async def _assess_with_repair(
         self,
@@ -458,6 +545,9 @@ class AstrBotContextAnswerAgent:
             cluster,
             initial_errors=parse_errors,
         )
+        initial_errors = errors
+        retry_errors: tuple[str, ...] = ()
+        latest_groups = groups
         retry_used = False
         if errors and allow_retry:
             retry_used = True
@@ -465,6 +555,7 @@ class AstrBotContextAnswerAgent:
                 "errors": list(errors),
                 "allowed_question_ids": list(lookup.allowed_question_ids),
                 "allowed_message_ids": list(lookup.allowed_message_ids),
+                "allowed_answer_ids": list(lookup.allowed_answer_ids),
                 "reserved_question_ids": [
                     lookup._short_id(external_id)
                     for item in accepted
@@ -490,9 +581,11 @@ class AstrBotContextAnswerAgent:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                errors = (f"validation retry failed: {type(exc).__name__}",)
+                retry_errors = (f"validation retry failed: {type(exc).__name__}",)
+                errors = retry_errors
             else:
                 retry_groups, retry_parse_errors = _parse_answer_groups(retry_raw)
+                latest_groups = retry_groups
                 accepted_for_retry, retry_groups, conflict_errors = (
                     _reject_repair_cross_conflicts(accepted, retry_groups, lookup)
                 )
@@ -505,9 +598,19 @@ class AstrBotContextAnswerAgent:
                 )
                 accepted = (*accepted_for_retry, *repaired)
                 errors = retry_errors
+                retry_errors = errors
 
         questions = [item.question for item in accepted]
+        fallback_actions: list[str] = []
         if errors or retry_used:
+            deterministic, actions = _deterministic_repair_groups(
+                latest_groups,
+                accepted,
+                lookup,
+                cluster,
+            )
+            questions.extend(deterministic)
+            fallback_actions.extend(actions)
             covered = {
                 external_id
                 for question in questions
@@ -524,26 +627,81 @@ class AstrBotContextAnswerAgent:
                 if anchor.external_message_id not in covered
                 and anchor.external_message_id not in used_as_answers
             )
-            if uncovered:
+            for external_id in uncovered:
+                anchor = lookup._message_by_id[external_id]
+                canonical_question = redact_for_report(
+                    anchor.text.strip() or anchor.outline.strip(),
+                    max_chars=300,
+                ).strip() or cluster.canonical_question
                 questions.append(
                     DiscoveredQuestion(
-                        uncovered,
+                        (external_id,),
                         (),
-                        cluster.canonical_question,
+                        canonical_question,
                         cluster.category,
                         community_context_degraded=True,
                     )
                 )
+                fallback_actions.append("SAFE_QUESTION_FROM_UNCOVERED_ANCHOR")
         if not questions:
-            questions.append(
-                DiscoveredQuestion(
-                    tuple(anchor.external_message_id for anchor in lookup.anchors),
-                    (),
-                    cluster.canonical_question,
-                    cluster.category,
-                    community_context_degraded=True,
+            for anchor in lookup.anchors:
+                questions.append(
+                    DiscoveredQuestion(
+                        (anchor.external_message_id,),
+                        (),
+                        redact_for_report(
+                            anchor.text.strip() or anchor.outline.strip(),
+                            max_chars=300,
+                        ).strip()
+                        or cluster.canonical_question,
+                        cluster.category,
+                        community_context_degraded=True,
+                    )
                 )
+            fallback_actions.append("SAFE_QUESTION_FROM_UNCOVERED_ANCHOR")
+
+        degraded_ids = tuple(
+            lookup._short_id(external_id)
+            for question in questions
+            if question.community_context_degraded
+            for external_id in question.question_message_ids
+        )
+        retained_ids = tuple(
+            lookup._short_id(external_id)
+            for question in questions
+            if not question.community_context_degraded
+            for external_id in question.question_message_ids
+        )
+        degradation_reason = CommunityContextDegradationReason.NONE
+        all_errors = (*initial_errors, *retry_errors)
+        if degraded_ids:
+            if any("retry failed" in item for item in retry_errors):
+                degradation_reason = CommunityContextDegradationReason.RETRY_FAILED
+            elif any("overlap" in item for item in all_errors):
+                degradation_reason = CommunityContextDegradationReason.CROSS_GROUP_CONFLICT
+            else:
+                degradation_reason = (
+                    CommunityContextDegradationReason.VALIDATION_UNRESOLVED
+                )
+        audit = CommunityContextAudit(
+            initial_errors=tuple(item[:500] for item in initial_errors),
+            retry_errors=tuple(item[:500] for item in retry_errors),
+            retained_question_ids=tuple(dict.fromkeys(retained_ids)),
+            degraded_question_ids=tuple(dict.fromkeys(degraded_ids)),
+            fallback_actions=tuple(dict.fromkeys(fallback_actions)),
+        )
+        questions = [
+            replace(
+                question,
+                community_context_degradation_reason=(
+                    degradation_reason
+                    if question.community_context_degraded
+                    else CommunityContextDegradationReason.NONE
+                ),
+                community_context_audit=audit,
             )
+            for question in questions
+        ]
         anchor_order = {
             anchor.external_message_id: index
             for index, anchor in enumerate(lookup.anchors)
@@ -612,7 +770,7 @@ def _parse_answer_groups(
             errors.append(f"group {index}: must be a JSON object")
             continue
         try:
-            parsed.append(_parse_question_group(raw_group))
+            parsed.append(_parse_question_group(raw_group, strict=False))
         except AnswerAgentError as exc:
             errors.append(f"group {index}: {exc}")
     return tuple(parsed), tuple(errors)
@@ -648,7 +806,11 @@ def _parse_answer_assessment(raw: str) -> _AnswerAssessment:
     )
 
 
-def _parse_question_group(data: dict[str, Any]) -> _AnswerAssessment:
+def _parse_question_group(
+    data: dict[str, Any],
+    *,
+    strict: bool = True,
+) -> _AnswerAssessment:
     questions = data.get("question_message_ids")
     answers = data.get("answer_message_ids")
     summary = data.get("answer_summary")
@@ -665,11 +827,11 @@ def _parse_question_group(data: dict[str, Any]) -> _AnswerAssessment:
     question_ids = tuple(dict.fromkeys(item.strip() for item in questions if item.strip()))
     answer_ids = tuple(dict.fromkeys(item.strip() for item in answers if item.strip()))
     normalized_summary = summary.strip()
-    if not question_ids:
+    if strict and not question_ids:
         raise AnswerAgentError("question_message_ids 不能为空")
-    if bool(answer_ids) != bool(normalized_summary):
+    if strict and bool(answer_ids) != bool(normalized_summary):
         raise AnswerAgentError("answer_summary 必须与 answer_message_ids 是否为空一致")
-    if set(question_ids) & set(answer_ids):
+    if strict and set(question_ids) & set(answer_ids):
         raise AnswerAgentError("问题消息和回答消息不能重叠")
     return _AnswerAssessment(
         question_ids,
@@ -824,6 +986,92 @@ def _validate_groups(
     return tuple(valid), tuple(errors)
 
 
+def _deterministic_repair_groups(
+    groups: Sequence[_AnswerAssessment],
+    accepted: Sequence[_AcceptedGroup],
+    lookup: ChatContextLookup,
+    cluster: QuestionCluster,
+) -> tuple[tuple[DiscoveredQuestion, ...], tuple[str, ...]]:
+    used_question_ids = {
+        external_id
+        for item in accepted
+        for external_id in item.question.question_message_ids
+    }
+    used_answer_ids = {
+        lookup._external_id(answer_id)
+        for item in accepted
+        for answer_id in item.assessment.answer_message_ids
+    }
+    repaired: list[DiscoveredQuestion] = []
+    actions: list[str] = []
+    for assessment in groups:
+        supplied_questions = tuple(
+            dict.fromkeys(lookup._external_id(item) for item in assessment.question_message_ids)
+        )
+        question_ids = tuple(
+            item
+            for item in supplied_questions
+            if item in lookup.anchor_ids
+            and item not in used_question_ids
+            and item not in used_answer_ids
+        )
+        if not question_ids:
+            continue
+        question_changed = question_ids != supplied_questions
+
+        supplied_answers = tuple(
+            dict.fromkeys(lookup._external_id(item) for item in assessment.answer_message_ids)
+        )
+        answer_ids = tuple(
+            item
+            for item in supplied_answers
+            if item in lookup.returned_message_ids
+            and item not in lookup.anchor_ids
+            and item not in used_question_ids
+            and item not in question_ids
+            and item not in used_answer_ids
+            and bool(
+                lookup._message_by_id[item].text.strip()
+                or lookup._message_by_id[item].outline.strip()
+            )
+        )
+        answer_changed = answer_ids != supplied_answers
+        if answer_changed:
+            actions.append("FILTERED_INVALID_OR_DUPLICATE_ANSWER_IDS")
+        if answer_ids:
+            summary = redact_for_report(
+                "；".join(
+                    lookup._message_by_id[item].text.strip()
+                    or lookup._message_by_id[item].outline.strip()
+                    for item in answer_ids
+                ),
+                max_chars=_SUMMARY_CHAR_LIMIT,
+            ).strip()
+            actions.append("REBUILT_SUMMARY_FROM_VISIBLE_MESSAGES")
+        else:
+            if supplied_answers or assessment.answer_summary.strip():
+                actions.append("DROPPED_INVALID_ANSWERS_AND_CLEARED_SUMMARY")
+            summary = ""
+        if question_changed:
+            actions.append("FILTERED_INVALID_OR_DUPLICATE_QUESTION_IDS")
+
+        normalized = _AnswerAssessment(
+            question_ids,
+            answer_ids,
+            summary,
+            assessment.canonical_question,
+            assessment.category,
+        )
+        try:
+            question = lookup._discovered_question(normalized, cluster)
+        except AnswerAgentError:
+            continue
+        repaired.append(replace(question, community_context_degraded=True))
+        used_question_ids.update(question_ids)
+        used_answer_ids.update(answer_ids)
+    return tuple(repaired), tuple(dict.fromkeys(actions))
+
+
 def _discovery_result_from_questions(
     questions: Sequence[DiscoveredQuestion],
 ) -> AnswerDiscoveryResult:
@@ -835,6 +1083,23 @@ def _discovery_result_from_questions(
         primary.category,
         tuple(questions[1:]),
         primary.community_context_degraded,
+        primary.community_context_degradation_reason,
+        primary.community_context_audit,
+    )
+
+
+def _merge_community_context_audits(
+    first: CommunityContextAudit,
+    second: CommunityContextAudit,
+) -> CommunityContextAudit:
+    return CommunityContextAudit(
+        initial_errors=tuple(dict.fromkeys((*first.initial_errors, *second.initial_errors))),
+        retry_errors=tuple(dict.fromkeys((*first.retry_errors, *second.retry_errors))),
+        retained_question_ids=second.retained_question_ids,
+        degraded_question_ids=second.degraded_question_ids,
+        fallback_actions=tuple(
+            dict.fromkeys((*first.fallback_actions, *second.fallback_actions))
+        ),
     )
 
 

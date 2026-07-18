@@ -95,7 +95,8 @@ evidence_indices 必须引用实际支持结论的证据编号，不能引用群
 NO_USABLE_EVIDENCE 的 evidence_indices 必须是空数组。
 """.strip()
 
-_MAX_AGENT_ROUNDS = 10
+_MAX_AGENT_ROUNDS = 20
+_FINALIZATION_ATTEMPTS = 2
 
 
 class InvestigationError(RuntimeError):
@@ -302,39 +303,16 @@ class InvestigationService:
         grep_terms: set[str] = set()
         read_documents: set[tuple[str, str]] = set()
 
-        for round_no in range(1, _MAX_AGENT_ROUNDS + 1):
+        for _round_no in range(1, _MAX_AGENT_ROUNDS + 1):
             evidence = _agent_evidence(found.values(), read_sections)
-            must_finish = round_no == _MAX_AGENT_ROUNDS
-            if must_finish and found and not read_documents:
-                await self._execute_tool_call(
-                    _automatic_read_call(found),
-                    evidence=evidence,
-                    found=found,
-                    read_sections=read_sections,
-                    tool_history=tool_history,
-                    search_queries=search_queries,
-                    grep_terms=grep_terms,
-                    read_documents=read_documents,
-                    audit_queries=audit_queries,
-                    automatic=True,
-                )
-                evidence = _agent_evidence(found.values(), read_sections)
             data = await self._ai.next_step(
                 cluster,
                 evidence,
                 tool_history,
-                must_finish=must_finish,
+                must_finish=False,
             )
             action = str(data.get("action", "")).strip().lower()
             if action == "tools":
-                if must_finish:
-                    tool_history.append(
-                        {
-                            "tool": "contract_error",
-                            "message": "工具调查阶段已结束；现在必须依据已有证据返回 final",
-                        }
-                    )
-                    continue
                 try:
                     calls = _parse_tool_calls(data)
                 except InvestigationError as exc:
@@ -387,8 +365,70 @@ class InvestigationService:
                 )
                 continue
 
+        evidence = _agent_evidence(found.values(), read_sections)
+        if found and not read_documents:
+            await self._execute_tool_call(
+                _automatic_read_call(found),
+                evidence=evidence,
+                found=found,
+                read_sections=read_sections,
+                tool_history=tool_history,
+                search_queries=search_queries,
+                grep_terms=grep_terms,
+                read_documents=read_documents,
+                audit_queries=audit_queries,
+                automatic=True,
+            )
+            evidence = _agent_evidence(found.values(), read_sections)
+
+        last_final_error = "模型未返回最终结论"
+        for attempt in range(1, _FINALIZATION_ATTEMPTS + 1):
+            try:
+                data = await self._ai.next_step(
+                    cluster,
+                    evidence,
+                    tool_history,
+                    must_finish=True,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_final_error = f"{type(exc).__name__}: {exc}"[:500]
+            else:
+                action = str(data.get("action", "")).strip().lower()
+                if action != "final":
+                    last_final_error = "调查阶段已结束，最终结论只能返回 action=final"
+                else:
+                    last_final_error = _agent_completion_error(
+                        data,
+                        evidence=evidence,
+                        search_queries=search_queries,
+                        grep_terms=grep_terms,
+                        read_documents=read_documents,
+                    )
+                    if not last_final_error:
+                        try:
+                            return _parse_assessment(
+                                cluster.question_code,
+                                data,
+                                evidence,
+                                tuple(audit_queries),
+                            )
+                        except InvestigationError as exc:
+                            last_final_error = str(exc)
+            tool_history.append(
+                {
+                    "tool": "contract_error",
+                    "message": (
+                        f"最终结论第 {attempt} 次输出无效：{last_final_error}；"
+                        "不得继续调用工具，必须依据现有证据完整返回 final"
+                    )[:500],
+                }
+            )
+
         raise InvestigationError(
-            f"调查 Agent 未在 {_MAX_AGENT_ROUNDS} 轮上限内完成检索与核验"
+            f"调查 Agent 经过 {_MAX_AGENT_ROUNDS} 轮调查后，最终结论纠错仍失败："
+            f"{last_final_error}"
         )
 
     async def _execute_tool_call(

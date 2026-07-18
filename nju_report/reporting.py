@@ -334,6 +334,16 @@ def format_question_detail(
     ]
     if cluster.community_context_degraded:
         lines.append("社区上下文：降级（已使用安全回退）")
+        if cluster.community_context_degradation_reason.value:
+            lines.append(
+                "社区上下文降级原因："
+                f"{cluster.community_context_degradation_reason.value}"
+            )
+        if cluster.community_context_audit.fallback_actions:
+            lines.append(
+                "社区上下文兜底动作："
+                + "、".join(cluster.community_context_audit.fallback_actions)
+            )
     lines.extend(f"- {item}" for item in cluster.representative_questions[:5])
     lines.append("群聊回答摘要（AI 已归纳脱敏，未经核实）：")
     lines.extend(f"- {item.redacted_text}" for item in cluster.answers[:5])
@@ -364,6 +374,15 @@ def _summary_payload(
         "groups": sorted({alias for item in clusters for alias in item.group_aliases}),
         "screening_errors": screening_errors,
         "community_context_degraded": community_context_degraded_count(clusters),
+        "community_context_degradation_reasons": dict(
+            sorted(
+                Counter(
+                    item.community_context_degradation_reason.value
+                    for item in clusters
+                    if item.community_context_degradation_reason.value
+                ).items()
+            )
+        ),
     }
 
 

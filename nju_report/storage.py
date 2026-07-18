@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 from .models import (
     CommunityAnswer,
+    CommunityContextAudit,
+    CommunityContextDegradationReason,
     CoverageStatus,
     EvidenceItem,
     InvestigationResult,
@@ -33,7 +35,7 @@ from .models import (
 )
 from .time_windows import TimeWindow
 
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 
 
 class StorageError(RuntimeError):
@@ -537,8 +539,10 @@ class ReportStorage:
                         occurrence_count, group_aliases_json,
                         representative_questions_json, first_sent_at_utc,
                         last_sent_at_utc, community_context_degraded,
+                        community_context_degradation_reason,
+                        community_context_audit_json,
                         updated_at_utc, created_at_utc
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(question_code) DO UPDATE SET
                         canonical_question = excluded.canonical_question,
                         category = excluded.category,
@@ -548,6 +552,9 @@ class ReportStorage:
                         first_sent_at_utc = excluded.first_sent_at_utc,
                         last_sent_at_utc = excluded.last_sent_at_utc,
                         community_context_degraded = excluded.community_context_degraded,
+                        community_context_degradation_reason =
+                            excluded.community_context_degradation_reason,
+                        community_context_audit_json = excluded.community_context_audit_json,
                         updated_at_utc = excluded.updated_at_utc
                     """,
                     (
@@ -561,6 +568,8 @@ class ReportStorage:
                         cluster.first_sent_at_utc,
                         cluster.last_sent_at_utc,
                         int(cluster.community_context_degraded),
+                        cluster.community_context_degradation_reason.value,
+                        _community_context_audit_json(cluster.community_context_audit),
                         now,
                         now,
                     ),
@@ -688,6 +697,14 @@ class ReportStorage:
                 for item in answer_rows
             ),
             community_context_degraded=bool(row["community_context_degraded"]),
+            community_context_degradation_reason=(
+                CommunityContextDegradationReason(
+                    str(row["community_context_degradation_reason"])
+                )
+            ),
+            community_context_audit=_community_context_audit_from_json(
+                str(row["community_context_audit_json"])
+            ),
         )
 
     def save_investigation(self, result: InvestigationResult) -> int:
@@ -1775,6 +1792,13 @@ class ReportStorage:
                     "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
                     (8, int(time.time())),
                 )
+                version = 8
+            if version < 9:
+                self._migration_v9(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+                    (9, int(time.time())),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -2180,6 +2204,84 @@ class ReportStorage:
                     CHECK(community_context_degraded IN (0, 1))
                 """
             )
+
+    @staticmethod
+    def _migration_v9(connection: sqlite3.Connection) -> None:
+        """Persist structured community-context validation audit details."""
+
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(question_clusters)").fetchall()
+        }
+        if "community_context_degradation_reason" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE question_clusters
+                ADD COLUMN community_context_degradation_reason TEXT NOT NULL DEFAULT ''
+                """
+            )
+        if "community_context_audit_json" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE question_clusters
+                ADD COLUMN community_context_audit_json TEXT NOT NULL DEFAULT '{}'
+                """
+            )
+        connection.execute(
+            """
+            UPDATE question_clusters
+            SET community_context_degradation_reason = 'LEGACY_UNKNOWN'
+            WHERE community_context_degraded = 1
+              AND community_context_degradation_reason = ''
+            """
+        )
+        connection.execute(
+            """
+            UPDATE question_clusters
+            SET community_context_audit_json =
+                '{"fallback_actions":["LEGACY_AUDIT_UNAVAILABLE"]}'
+            WHERE community_context_degraded = 1
+              AND community_context_audit_json = '{}'
+            """
+        )
+
+
+def _community_context_audit_json(audit: CommunityContextAudit) -> str:
+    return json.dumps(
+        {
+            "initial_errors": list(audit.initial_errors),
+            "retry_errors": list(audit.retry_errors),
+            "retained_question_ids": list(audit.retained_question_ids),
+            "degraded_question_ids": list(audit.degraded_question_ids),
+            "fallback_actions": list(audit.fallback_actions),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _community_context_audit_from_json(raw: str) -> CommunityContextAudit:
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    def strings(key: str) -> tuple[str, ...]:
+        values = data.get(key, [])
+        if not isinstance(values, list):
+            return ()
+        return tuple(str(item)[:500] for item in values if isinstance(item, str))
+
+    return CommunityContextAudit(
+        initial_errors=strings("initial_errors"),
+        retry_errors=strings("retry_errors"),
+        retained_question_ids=strings("retained_question_ids"),
+        degraded_question_ids=strings("degraded_question_ids"),
+        fallback_actions=strings("fallback_actions"),
+    )
 
 
 def _scheduled_report_run_from_row(row: sqlite3.Row) -> ScheduledReportRun:

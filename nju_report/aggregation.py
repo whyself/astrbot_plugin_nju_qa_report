@@ -10,7 +10,13 @@ from datetime import date
 from difflib import SequenceMatcher
 
 from .answer_agent import CommunityAnswerAgent
-from .models import QuestionCandidate, QuestionCluster, StoredMessage
+from .models import (
+    CommunityContextAudit,
+    CommunityContextDegradationReason,
+    QuestionCandidate,
+    QuestionCluster,
+    StoredMessage,
+)
 from .storage import ReportStorage
 from .time_windows import natural_day_window
 
@@ -68,23 +74,40 @@ class QuestionAggregationService:
         self._progress_total = len(clusters)
         async def attach(cluster: QuestionCluster) -> tuple[QuestionCluster, ...]:
             async with self._semaphore:
+                collection_error = ""
                 try:
                     discovery = await self._answer_agent.collect(cluster, messages)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
                     logger.exception(
                         "NJU community-answer context agent failed for %s",
                         cluster.question_code,
                     )
+                    collection_error = type(exc).__name__
                     discovery = None
                 if discovery is None or not discovery.questions:
+                    degradation_reason = (
+                        discovery.community_context_degradation_reason
+                        if discovery is not None
+                        else CommunityContextDegradationReason.AGENT_EXCEPTION
+                    )
+                    audit = (
+                        discovery.community_context_audit
+                        if discovery is not None
+                        else CommunityContextAudit(
+                            initial_errors=(collection_error or "unknown agent exception",),
+                            fallback_actions=("EMPTY_CLUSTER_SAFE_FALLBACK",),
+                        )
+                    )
                     results = (
                         replace(
                             cluster,
                             representative_questions=(cluster.canonical_question,),
                             answers=(),
                             community_context_degraded=True,
+                            community_context_degradation_reason=degradation_reason,
+                            community_context_audit=audit,
                         ),
                     )
                 else:
@@ -142,6 +165,10 @@ class QuestionAggregationService:
                                 community_context_degraded=(
                                     question.community_context_degraded
                                 ),
+                                community_context_degradation_reason=(
+                                    question.community_context_degradation_reason
+                                ),
+                                community_context_audit=question.community_context_audit,
                             )
                         )
                     results = tuple(split_results)

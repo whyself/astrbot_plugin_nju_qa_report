@@ -146,7 +146,56 @@ def test_migrations_tolerate_indexes_left_by_an_older_partial_run(tmp_path: Path
     recovered.initialize()
     with sqlite3.connect(path) as connection:
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-    assert version == 8
+    assert version == 9
+    recovered.close()
+
+
+def test_v9_migration_marks_legacy_degradation_audit_unknown(tmp_path: Path) -> None:
+    path = tmp_path / "report.sqlite3"
+    storage = ReportStorage(path)
+    storage.initialize()
+    storage.close()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO question_clusters (
+                report_date, question_code, canonical_question, category,
+                occurrence_count, group_aliases_json, representative_questions_json,
+                first_sent_at_utc, last_sent_at_utc, updated_at_utc, created_at_utc,
+                community_context_degraded,
+                community_context_degradation_reason, community_context_audit_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-07-12",
+                "20260712-Q001",
+                "测试问题",
+                "测试",
+                0,
+                "[]",
+                '["测试问题"]',
+                1,
+                1,
+                1,
+                1,
+                1,
+                "",
+                "{}",
+            ),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 9")
+        connection.commit()
+
+    recovered = ReportStorage(path)
+    recovered.initialize()
+    cluster = recovered.get_question_cluster("20260712-Q001")
+
+    assert cluster is not None
+    assert cluster.community_context_degradation_reason.value == "LEGACY_UNKNOWN"
+    assert cluster.community_context_audit.fallback_actions == (
+        "LEGACY_AUDIT_UNAVAILABLE",
+    )
     recovered.close()
 
 
