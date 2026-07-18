@@ -63,7 +63,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.6.16",
+    "0.6.17",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -186,7 +186,15 @@ class NjuQaReportPlugin(Star):
         """Open local storage after AstrBot activates the plugin."""
 
         self.storage.initialize()
-        retention_cutoff = int(time()) - (self.runtime_config.raw_message_retention_days * 86400)
+        now_utc = int(time())
+        recovered = self.storage.recover_running_scheduled_report_runs(now_utc=now_utc)
+        if recovered:
+            logger.warning(
+                "NJU report recovered %s scheduled run(s) left RUNNING by the "
+                "previous plugin instance; retrying immediately",
+                recovered,
+            )
+        retention_cutoff = now_utc - (self.runtime_config.raw_message_retention_days * 86400)
         deleted = self.storage.delete_expired_messages(retention_cutoff)
         if deleted:
             logger.info("NJU report pruned %s expired raw messages", deleted)

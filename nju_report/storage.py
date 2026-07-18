@@ -976,6 +976,28 @@ class ReportStorage:
             ).fetchone()
         return _scheduled_report_run_from_row(row) if row is not None else None
 
+    def recover_running_scheduled_report_runs(
+        self,
+        *,
+        now_utc: int,
+        error_summary: str = (
+            "PluginReloadRecovery: previous plugin instance stopped before completion"
+        ),
+    ) -> int:
+        """Make RUNNING attempts inherited during startup immediately retryable."""
+
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE scheduled_report_runs
+                SET status = 'RETRY_PENDING', error_summary = ?,
+                    next_retry_at_utc = ?, updated_at_utc = ?, claim_token = ''
+                WHERE status = 'RUNNING'
+                """,
+                (error_summary[:1000], now_utc, now_utc),
+            )
+        return cursor.rowcount
+
     def begin_scheduled_report_run(
         self,
         scheduled_date: str,

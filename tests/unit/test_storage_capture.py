@@ -308,6 +308,43 @@ def test_fresh_running_schedule_claim_is_protected_until_stale(tmp_path: Path) -
     second.close()
 
 
+def test_reload_recovery_makes_running_schedule_immediately_retryable(
+    tmp_path: Path,
+) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    first_claim = storage.begin_scheduled_report_run(
+        "2026-07-19",
+        "2026-07-18",
+        now_utc=100,
+        stale_before_utc=0,
+    )
+    assert first_claim is not None
+
+    assert storage.recover_running_scheduled_report_runs(now_utc=101) == 1
+    assert storage.recover_running_scheduled_report_runs(now_utc=102) == 0
+    pending = storage.scheduled_report_run("2026-07-19")
+    assert pending is not None
+    assert pending.status == "RETRY_PENDING"
+    assert pending.next_retry_at_utc == 101
+    assert pending.claim_token == ""
+    assert "PluginReloadRecovery" in pending.error_summary
+
+    retry_claim = storage.begin_scheduled_report_run(
+        "2026-07-19",
+        "2026-07-18",
+        now_utc=101,
+        stale_before_utc=-10000,
+    )
+    assert retry_claim is not None
+    assert retry_claim != first_claim
+    retried = storage.scheduled_report_run("2026-07-19")
+    assert retried is not None
+    assert retried.status == "RUNNING"
+    assert retried.attempts == 2
+    storage.close()
+
+
 def test_failed_screening_version_restores_last_completed_snapshot(tmp_path: Path) -> None:
     storage = ReportStorage(tmp_path / "report.sqlite3")
     storage.initialize()

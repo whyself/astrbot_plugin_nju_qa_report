@@ -278,6 +278,38 @@ def test_scheduler_reclaims_a_running_attempt_left_by_reload(tmp_path: Path) -> 
     asyncio.run(run())
 
 
+def test_scheduler_immediately_resumes_run_recovered_during_reload(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        storage = ReportStorage(tmp_path / "report.sqlite3")
+        storage.initialize()
+        now = datetime(2026, 7, 19, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        claim = storage.begin_scheduled_report_run(
+            "2026-07-19",
+            "2026-07-18",
+            now_utc=int((now - timedelta(minutes=30)).timestamp()),
+            stale_before_utc=0,
+        )
+        assert claim is not None
+        assert storage.recover_running_scheduled_report_runs(
+            now_utc=int(now.timestamp())
+        ) == 1
+        workflow = FakeScheduledWorkflow()
+
+        await _scheduler(workflow, storage)._tick(now)
+
+        assert workflow.sync_calls == 1
+        assert workflow.run_calls == [date(2026, 7, 18)]
+        persisted = storage.scheduled_report_run("2026-07-19")
+        assert persisted is not None
+        assert persisted.status == "SENT"
+        assert persisted.attempts == 2
+        storage.close()
+
+    asyncio.run(run())
+
+
 def test_scheduler_sets_retry_deadline_from_failure_time(tmp_path: Path) -> None:
     async def run() -> None:
         storage = ReportStorage(tmp_path / "report.sqlite3")
