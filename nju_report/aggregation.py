@@ -22,6 +22,13 @@ from .time_windows import natural_day_window
 
 logger = logging.getLogger(__name__)
 
+_CANONICAL_RESTORED_ACTION = "CANONICAL_QUESTION_RESTORED_FROM_SCREENING"
+_CONTEXT_DEPENDENT_TITLE_RE = re.compile(
+    r"(?:这玩意|那玩意|这东西|那东西|这个(?:呢|吗|是|怎么|如何)|"
+    r"那个(?:呢|吗|是|怎么|如何)|上述|前者|后者|它(?:呢|是|怎么|如何)|"
+    r"又(?:改|调整|变)(?:了|吗|没|没有)?)"
+)
+
 
 @dataclass(slots=True)
 class _ClusterBuilder:
@@ -117,7 +124,9 @@ class QuestionAggregationService:
                         if (external_id := _external_id_from_source_key(source_key))
                     }
                     split_results: list[QuestionCluster] = []
-                    for question in discovery.questions:
+                    discovered_questions = discovery.questions
+                    is_true_split = len(discovered_questions) > 1
+                    for question in discovered_questions:
                         refined_source_keys = tuple(
                             source_by_external_id[item]
                             for item in question.question_message_ids
@@ -138,9 +147,32 @@ class QuestionAggregationService:
                             if question_candidates
                             else cluster.question_code
                         )
-                        canonical_question = (
-                            question.canonical_question or cluster.canonical_question
+                        canonical_question, canonical_restored = (
+                            _resolved_canonical_question(
+                                proposed=question.canonical_question,
+                                baseline=cluster.canonical_question,
+                                candidates=question_candidates,
+                                allow_split_refinement=is_true_split,
+                            )
                         )
+                        context_audit = question.community_context_audit
+                        if canonical_restored:
+                            logger.warning(
+                                "NJU restored screening canonical question_code=%s "
+                                "proposed=%r baseline=%r",
+                                question_code,
+                                question.canonical_question,
+                                canonical_question,
+                            )
+                            context_audit = replace(
+                                context_audit,
+                                fallback_actions=tuple(
+                                    dict.fromkeys(
+                                        context_audit.fallback_actions
+                                        + (_CANONICAL_RESTORED_ACTION,)
+                                    )
+                                ),
+                            )
                         split_results.append(
                             replace(
                                 cluster,
@@ -168,7 +200,7 @@ class QuestionAggregationService:
                                 community_context_degradation_reason=(
                                     question.community_context_degradation_reason
                                 ),
-                                community_context_audit=question.community_context_audit,
+                                community_context_audit=context_audit,
                             )
                         )
                     results = tuple(split_results)
@@ -248,6 +280,43 @@ def _same_question(left: QuestionCandidate, right: QuestionCandidate) -> bool:
     right_terms = _bigrams(right_text)
     union = left_terms | right_terms
     return bool(union) and len(left_terms & right_terms) / len(union) >= 0.72
+
+
+def _resolved_canonical_question(
+    *,
+    proposed: str,
+    baseline: str,
+    candidates: list[QuestionCandidate],
+    allow_split_refinement: bool,
+) -> tuple[str, bool]:
+    candidate_baseline = _candidate_baseline(candidates) or baseline
+    proposed = proposed.strip()
+    if not proposed:
+        return candidate_baseline, False
+    if not allow_split_refinement:
+        return candidate_baseline, _normalize(proposed) != _normalize(candidate_baseline)
+    if context_dependent_question_title(proposed):
+        return candidate_baseline, _normalize(proposed) != _normalize(candidate_baseline)
+    proposed_text = _normalize(proposed)
+    baseline_text = _normalize(candidate_baseline)
+    if len(proposed_text) < 6 or not (_bigrams(proposed_text) & _bigrams(baseline_text)):
+        return candidate_baseline, _normalize(proposed) != _normalize(candidate_baseline)
+    return proposed, False
+
+
+def _candidate_baseline(candidates: list[QuestionCandidate]) -> str:
+    if not candidates:
+        return ""
+    representative = max(
+        candidates,
+        key=lambda item: (len(item.canonical_question), -item.sent_at_utc),
+    )
+    return representative.canonical_question.strip()
+
+
+def context_dependent_question_title(value: str) -> bool:
+    normalized = re.sub(r"\s+", "", value)
+    return bool(_CONTEXT_DEPENDENT_TITLE_RE.search(normalized))
 
 
 def _external_id_from_source_key(source_key: str) -> str:

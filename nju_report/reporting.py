@@ -17,6 +17,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .aggregation import context_dependent_question_title
 from .config import PluginConfig
 from .models import (
     CoverageStatus,
@@ -97,6 +98,8 @@ def report_delivery_quality_issues(
         title = cluster.canonical_question
         if "[提及用户]" in title or "[编号]" in title:
             issues.append(f"{cluster.question_code}: 问题标题仍含用户标识")
+        if context_dependent_question_title(title):
+            issues.append(f"{cluster.question_code}: 问题标题依赖缺失上下文")
         if "SAFE_QUESTION_FROM_UNCOVERED_ANCHOR" in (
             cluster.community_context_audit.fallback_actions
         ):
@@ -401,6 +404,11 @@ def format_question_detail(
                 "社区上下文兜底动作："
                 + "、".join(cluster.community_context_audit.fallback_actions)
             )
+    elif cluster.community_context_audit.fallback_actions:
+        lines.append(
+            "社区上下文校正动作："
+            + "、".join(cluster.community_context_audit.fallback_actions)
+        )
     lines.extend(f"- {item}" for item in cluster.representative_questions[:5])
     lines.append("群聊回答摘要（AI 已归纳脱敏，未经核实）：")
     lines.extend(f"- {item.redacted_text}" for item in cluster.answers[:5])
@@ -423,6 +431,11 @@ def _summary_payload(
 ) -> dict[str, object]:
     public_counts = coverage_counts(clusters, investigations)
     retried = [item for item in investigations.values() if item.attempts > 1]
+    canonical_restored = sum(
+        "CANONICAL_QUESTION_RESTORED_FROM_SCREENING"
+        in item.community_context_audit.fallback_actions
+        for item in clusters
+    )
     return {
         "report_date": report_date,
         "question_count": len(clusters),
@@ -438,6 +451,7 @@ def _summary_payload(
         "investigation_retry_failed": sum(
             item.status is CoverageStatus.ERROR for item in retried
         ),
+        "canonical_question_restored": canonical_restored,
         "community_context_degraded": community_context_degraded_count(clusters),
         "community_context_degradation_events": (
             community_context_degradation_event_count(clusters)
@@ -659,7 +673,7 @@ def _render_html(
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;max-width:920px;margin:0 auto;padding:28px;background:#f6f7f9;color:#20242a;line-height:1.7}}
 header,article{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-bottom:18px}}h1,h2,h3{{line-height:1.35}}h2{{font-size:20px}}h3{{font-size:15px;margin-bottom:4px}}.meta{{color:#5b6472}}.stats{{display:flex;flex-wrap:wrap;gap:10px}}.stats span{{background:#eef3ff;border-radius:999px;padding:5px 11px}}a{{color:#185abd}}.command{{background:#f3f4f6;padding:9px 12px;border-radius:7px}}footer{{color:#68707d;font-size:13px;padding:12px}}</style></head>
 <body><header><h1>南大知识缺口日报</h1><p>报告日期：{html.escape(report_date)}｜群聊：{html.escape(groups)}</p>
-<div class="stats"><span>问题 {summary["question_count"]}</span><span>明确回答 {counts[CoverageStatus.ANSWERABLE.value]}</span><span>部分覆盖 {counts[CoverageStatus.PARTIAL.value]}</span><span>未找到可用信息 {counts[CoverageStatus.NO_USABLE_EVIDENCE.value]}</span><span>程序执行异常 {counts[CoverageStatus.ERROR.value]}</span><span>筛选技术错误 {summary["screening_errors"]}</span><span>调查自动重跑 {summary["investigation_auto_retries"]}（恢复 {summary["investigation_retry_recovered"]}，仍失败 {summary["investigation_retry_failed"]}）</span><span>社区上下文降级 {summary["community_context_degraded"]}（独立事件 {summary["community_context_degradation_events"]}）</span></div></header>
+<div class="stats"><span>问题 {summary["question_count"]}</span><span>明确回答 {counts[CoverageStatus.ANSWERABLE.value]}</span><span>部分覆盖 {counts[CoverageStatus.PARTIAL.value]}</span><span>未找到可用信息 {counts[CoverageStatus.NO_USABLE_EVIDENCE.value]}</span><span>程序执行异常 {counts[CoverageStatus.ERROR.value]}</span><span>筛选技术错误 {summary["screening_errors"]}</span><span>标题语义回退修复 {summary["canonical_question_restored"]}</span><span>调查自动重跑 {summary["investigation_auto_retries"]}（恢复 {summary["investigation_retry_recovered"]}，仍失败 {summary["investigation_retry_failed"]}）</span><span>社区上下文降级 {summary["community_context_degraded"]}（独立事件 {summary["community_context_degradation_events"]}）</span></div></header>
 {"".join(cards) if cards else "<article><p>本日没有纳入日报的问题。</p></article>"}
 <footer>本报告由非官方维护辅助插件生成。群聊回答由 AI 去除身份信息后归纳，内容未经核实；知识结论仅依据配置允许的语雀仓库。</footer></body></html>"""
 

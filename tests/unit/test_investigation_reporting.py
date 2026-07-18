@@ -770,6 +770,75 @@ def test_delivery_blocks_unsafe_legacy_anchor_fallback(
     asyncio.run(run())
 
 
+def test_delivery_blocks_context_dependent_question_title(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        storage, _, cluster, _ = _prepared_case(tmp_path, repository_status="READY")
+        unsafe = replace(
+            cluster,
+            canonical_question="那么接替这玩意的是什么呢",
+        )
+        storage.save_question_clusters(cluster.report_date, [unsafe])
+        config = PluginConfig.from_mapping(
+            {
+                "smtp_host": "smtp.qq.com",
+                "smtp_username": "sender@qq.com",
+                "smtp_password": "secret",
+                "mail_from": "sender@qq.com",
+                "mail_recipients": ["reader@example.com"],
+            }
+        )
+        reports = ReportService(config, storage, tmp_path / "reports")
+        sent: list[str] = []
+        monkeypatch.setattr(
+            reports,
+            "_send_one",
+            lambda *args, **kwargs: sent.append("sent"),
+        )
+        report = await reports.build(cluster.report_date)
+
+        issues = report_delivery_quality_issues([unsafe])
+        assert issues == (f"{unsafe.question_code}: 问题标题依赖缺失上下文",)
+        with pytest.raises(RuntimeError, match="日报质量检查未通过，禁止发送"):
+            await reports.deliver(report)
+        assert sent == []
+        assert storage.mail_deliveries(report.report_id) == []
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_restored_screening_title_is_counted_and_shown_in_audit(
+    tmp_path: Path,
+) -> None:
+    storage, _, cluster, _ = _prepared_case(tmp_path, repository_status="READY")
+    corrected = replace(
+        cluster,
+        community_context_audit=CommunityContextAudit(
+            fallback_actions=("CANONICAL_QUESTION_RESTORED_FROM_SCREENING",),
+        ),
+    )
+    investigations = storage.investigations_for_date(cluster.report_date)
+
+    summary = _summary_payload(
+        cluster.report_date,
+        [corrected],
+        investigations,
+        screening_errors=0,
+    )
+    detail = format_question_detail(
+        corrected,
+        investigations.get(corrected.question_code),
+        timezone_name="Asia/Shanghai",
+    )
+
+    assert summary["canonical_question_restored"] == 1
+    assert "社区上下文校正动作：CANONICAL_QUESTION_RESTORED_FROM_SCREENING" in detail
+    storage.close()
+
+
 def test_cancelling_delivery_waits_for_smtp_and_persists_before_retry(
     tmp_path: Path,
     monkeypatch,

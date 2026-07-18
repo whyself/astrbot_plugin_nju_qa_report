@@ -5,7 +5,12 @@ from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
-from nju_report.aggregation import QuestionAggregationService, _aggregate
+from nju_report.aggregation import (
+    QuestionAggregationService,
+    _aggregate,
+    _resolved_canonical_question,
+    context_dependent_question_title,
+)
 from nju_report.answer_agent import AnswerDiscoveryResult, DiscoveredQuestion
 from nju_report.models import (
     CommunityAnswer,
@@ -364,6 +369,109 @@ def test_answer_agent_can_split_one_overmerged_cluster_into_two_questions() -> N
         assert storage.saved == clusters
 
     asyncio.run(run())
+
+
+def test_single_question_keeps_screening_canonical_when_agent_regresses_to_pronoun() -> None:
+    class Storage:
+        saved: list[QuestionCluster] = []
+
+        def list_question_candidates(self, *, report_date: str, limit):
+            del report_date, limit
+            return (
+                [
+                    _candidate(
+                        "20260712-Q644",
+                        "message:qq:bot:q644",
+                        "那么接替这玩意的是什么呢",
+                        "南京大学小百合论坛关闭后的校内接替平台是什么",
+                        "校园平台/历史",
+                        100,
+                    )
+                ],
+                1,
+            )
+
+        def messages_in_window(self, window):
+            del window
+            return [_message("q644", 100, "u1", "那么接替这玩意的是什么呢")]
+
+        def save_question_clusters(self, report_date: str, clusters):
+            del report_date
+            self.saved = list(clusters)
+
+    class Agent:
+        async def collect(self, cluster, messages):
+            del cluster, messages
+            return AnswerDiscoveryResult(
+                ("q644",),
+                (),
+                "那么接替这玩意的是什么呢",
+                "校园平台/历史",
+            )
+
+    async def run() -> None:
+        storage = Storage()
+        service = QuestionAggregationService(  # type: ignore[arg-type]
+            storage,
+            Agent(),
+            timezone_name="Asia/Shanghai",
+            concurrency=1,
+        )
+
+        clusters = await service.aggregate_date(date(2026, 7, 12))
+
+        assert len(clusters) == 1
+        assert (
+            clusters[0].canonical_question
+            == "南京大学小百合论坛关闭后的校内接替平台是什么"
+        )
+        assert clusters[0].community_context_degraded is False
+        assert (
+            "CANONICAL_QUESTION_RESTORED_FROM_SCREENING"
+            in clusters[0].community_context_audit.fallback_actions
+        )
+        assert storage.saved == clusters
+
+    asyncio.run(run())
+
+
+def test_single_question_keeps_screening_canonical_when_agent_loses_subject() -> None:
+    canonical, restored = _resolved_canonical_question(
+        proposed="培养方案是否又改了",
+        baseline="南京大学软件工程（智能化软件）专业本科四年在哪个校区培养",
+        candidates=[
+            _candidate(
+                "20260717-Q188",
+                "message:qq:bot:q188",
+                "培养方案是否又改了",
+                "南京大学软件工程（智能化软件）专业本科四年在哪个校区培养",
+                "学业与培养/校区",
+                100,
+            )
+        ],
+        allow_split_refinement=False,
+    )
+
+    assert canonical == "南京大学软件工程（智能化软件）专业本科四年在哪个校区培养"
+    assert restored is True
+
+
+def test_context_dependent_question_title_detection() -> None:
+    assert context_dependent_question_title("那么接替这玩意的是什么呢") is True
+    assert context_dependent_question_title("培养方案是否又改了") is True
+    assert (
+        context_dependent_question_title(
+            "南京大学小百合论坛关闭后的校内接替平台是什么"
+        )
+        is False
+    )
+    assert (
+        context_dependent_question_title(
+            "南京大学软件工程（智能化软件）专业本科四年在哪个校区培养"
+        )
+        is False
+    )
+    assert context_dependent_question_title("南京大学这个专业在哪个校区培养") is False
 
 
 def test_reaggregation_can_move_candidate_between_existing_clusters(tmp_path: Path) -> None:
