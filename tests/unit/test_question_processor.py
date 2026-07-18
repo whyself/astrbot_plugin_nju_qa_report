@@ -134,6 +134,33 @@ class FakeFinalQuestionGate:
         return result
 
 
+class BatchAwareFinalQuestionGate:
+    def __init__(self, *, failing_batch: int) -> None:
+        self.failing_batch = failing_batch
+        self.batch_sizes: list[int] = []
+
+    async def final_review_batch(
+        self,
+        candidates: list[QuestionGateCandidate],
+    ) -> dict[str, ScopeAssessment]:
+        self.batch_sizes.append(len(candidates))
+        if len(self.batch_sizes) == self.failing_batch:
+            raise TimeoutError("selected final gate batch timeout")
+        return {
+            item.candidate_id: ScopeAssessment(
+                decision=ScopeDecision.INCLUDE,
+                reason="问题清晰且适合进入知识库",
+                confidence=0.95,
+                canonical_question=item.canonical_question,
+                category=item.category,
+                clarity=Clarity.CLEAR,
+                knowledge_value=KnowledgeValue.HIGH,
+                time_sensitive=item.time_sensitive,
+            )
+            for item in candidates
+        }
+
+
 def _stored(message_id: str, text: str, timestamp: int) -> StoredMessage:
     return StoredMessage(
         platform_id="aiocqhttp:default",
@@ -287,6 +314,43 @@ def test_final_question_gate_failure_marks_only_selected_questions_retryable(
     assert "batch_candidates=1" in error_summary
     assert "total_candidates=1" in error_summary
     assert "cause=TimeoutError: final gate timeout" in error_summary
+
+
+def test_final_question_gate_batches_progress_and_isolates_one_failed_batch(
+    tmp_path: Path,
+) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    report_date = date(2026, 7, 12)
+    window = natural_day_window(report_date, "Asia/Shanghai")
+    for index in range(45):
+        storage.insert_message(
+            _stored(
+                f"m-{index}",
+                f"第 {index} 个不同的校园问题是什么？",
+                window.start_timestamp + index,
+            )
+        )
+    gate = BatchAwareFinalQuestionGate(failing_batch=2)
+    processor = DailyQuestionProcessor(
+        storage,
+        GateScopeService(),  # type: ignore[arg-type]
+        final_question_reviewer=gate,
+        timezone_name="Asia/Shanghai",
+    )
+
+    result = asyncio.run(processor.process_date(report_date))
+
+    assert gate.batch_sizes == [20, 20, 5]
+    assert result.status == "RETRY_PENDING"
+    assert result.included_count == 25
+    assert result.error_count == 20
+    assert processor.progress == ("2026-07-12", 45, 45)
+    candidates, total = storage.list_question_candidates(limit=None)
+    assert total == 45
+    assert sum(item.final_decision == "INCLUDE" for item in candidates) == 25
+    assert sum(item.final_decision == "AUTO_REVIEW_ERROR" for item in candidates) == 20
+    storage.close()
 
 
 def test_all_history_reports_completed_dates_as_skipped(tmp_path: Path) -> None:

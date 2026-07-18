@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 _BATCH_MAX_TARGETS = 200
 _BATCH_MAX_TARGET_CHARS = 24_000
 _BATCH_MESSAGE_CHAR_LIMIT = 1_200
-_FINAL_GATE_BATCH_SIZE = 200
+_FINAL_GATE_BATCH_SIZE = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +305,7 @@ class DailyQuestionProcessor:
         self._progress_completed = 0
         self._progress_total = len(groups)
         final_assessments: dict[str, ScopeAssessment] = {}
+        failed_candidate_ids: set[str] = set()
         batches = [
             groups[start : start + _FINAL_GATE_BATCH_SIZE]
             for start in range(0, len(groups), _FINAL_GATE_BATCH_SIZE)
@@ -341,7 +342,12 @@ class DailyQuestionProcessor:
                     + (f": {detail}" if detail else "")
                 )
                 logger.warning("NJU final gate batch failed: %s", audit_error)
-                return _final_gate_error_targets(targets, groups, audit_error)
+                failed_candidate_ids.update(
+                    item.candidate.candidate_id for item in batch
+                )
+                targets = _final_gate_error_targets(targets, batch, audit_error)
+                self._progress_completed += len(batch)
+                continue
             logger.info(
                 "NJU final gate batch completed report_date=%s batch=%d/%d "
                 "batch_candidates=%d total_candidates=%d elapsed_seconds=%.3f",
@@ -354,16 +360,23 @@ class DailyQuestionProcessor:
             )
 
         by_message_id: dict[str, ScopeAssessment] = {}
+        invalid_groups: list[_GateGroup] = []
         for group in groups:
+            if group.candidate.candidate_id in failed_candidate_ids:
+                continue
             assessment = final_assessments[group.candidate.candidate_id]
             if not _valid_final_assessment(assessment):
-                return _final_gate_error_targets(
-                    targets,
-                    groups,
-                    RuntimeError("最终问题 AI 闸门返回了无效终态"),
-                )
+                invalid_groups.append(group)
+                continue
             for target in group.targets:
                 by_message_id[target.message_id] = assessment
+
+        if invalid_groups:
+            targets = _final_gate_error_targets(
+                targets,
+                invalid_groups,
+                RuntimeError("最终问题 AI 闸门返回了无效终态"),
+            )
 
         return [
             _with_final_assessment(item, by_message_id[item.message_id])
