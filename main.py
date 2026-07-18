@@ -48,7 +48,12 @@ from .nju_report.scope_classifier import AutoScopeReviewService, QuestionGateCan
 from .nju_report.startup_checks import StartupCheckService, format_startup_checks
 from .nju_report.storage import ReportStorage, StorageError
 from .nju_report.token_usage import TokenUsage, TokenUsageTracker
-from .nju_report.workflow import DailyReportWorkflow, DailyScheduler, FullReportRunResult
+from .nju_report.workflow import (
+    DailyReportWorkflow,
+    DailyScheduler,
+    FullReportRunResult,
+    format_scheduled_report_status,
+)
 
 PLUGIN_NAME = "astrbot_plugin_nju_qa_report"
 REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
@@ -58,7 +63,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.6.13",
+    "0.6.16",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -806,17 +811,23 @@ class NjuQaReportPlugin(Star):
                 pending = [
                     item for item in dates if not await self.workflow.is_report_complete(item)
                 ]
-                if pending:
-                    await self.workflow.sync_knowledge()
-                results = await self.workflow.run_all_history(before_date=current_date)
+                results = await self.workflow.run_all_history(
+                    before_date=current_date,
+                    sync_knowledge=bool(pending),
+                )
             else:
                 requested_date = date.fromisoformat(tail)
                 if requested_date >= current_date:
                     yield event.plain_result("只能处理已经结束的自然日，不能锁定今天或未来日期。")
                     return
-                if not await self.workflow.is_report_complete(requested_date):
-                    await self.workflow.sync_knowledge()
-                results = [await self.workflow.run_date(requested_date)]
+                results = [
+                    await self.workflow.run_date(
+                        requested_date,
+                        sync_knowledge=not await self.workflow.is_report_complete(
+                            requested_date
+                        ),
+                    )
+                ]
         except KnowledgeError as exc:
             yield event.plain_result(f"知识库同步失败，日报未开始：{exc}")
             return
@@ -871,14 +882,20 @@ class NjuQaReportPlugin(Star):
             return
         try:
             await self.capture_writer.flush(timeout_seconds=30)
-            await self.workflow.sync_knowledge()
             if normalized in {"all", "全部"}:
                 results = await self.workflow.run_all_history(
                     before_date=current_date,
                     force=True,
+                    sync_knowledge=True,
                 )
             else:
-                results = [await self.workflow.run_date(requested_date, force=True)]
+                results = [
+                    await self.workflow.run_date(
+                        requested_date,
+                        force=True,
+                        sync_knowledge=True,
+                    )
+                ]
             await asyncio.to_thread(self.question_exporter.export_all)
         except Exception as exc:
             logger.exception("NJU forced report rerun failed")
@@ -1014,17 +1031,38 @@ class NjuQaReportPlugin(Star):
             return
         tail = _command_tail(event.get_message_str(), "nju_collect report status")
         progress = self.workflow.progress()
+        scheduled_run = await asyncio.to_thread(
+            self.storage.oldest_unfinished_scheduled_report_run,
+        )
         if not tail:
             if not progress.running:
+                if scheduled_run is not None:
+                    headline = (
+                        "日报任务运行中（持久化状态）"
+                        if scheduled_run.status == "RUNNING"
+                        else "日报任务等待调度"
+                    )
+                    yield event.plain_result(
+                        f"{headline}\n"
+                        f"{format_scheduled_report_status(scheduled_run)}\n"
+                        "当前阶段：等待调度器继续执行"
+                    )
+                    return
                 yield event.plain_result(
                     "日报任务：空闲\n查看某日：/nju_collect report status YYYY-MM-DD"
                 )
                 return
+            scheduled_details = (
+                format_scheduled_report_status(scheduled_run) + "\n"
+                if scheduled_run is not None and scheduled_run.status == "RUNNING"
+                else ""
+            )
             knowledge_progress = self.knowledge_service.progress()
             if knowledge_progress.syncing:
                 yield event.plain_result(
                     "日报任务运行中\n"
-                    "当前阶段：同步语雀知识库\n"
+                    + scheduled_details
+                    + "当前阶段：同步语雀知识库\n"
                     f"仓库：{knowledge_progress.repository_index}/"
                     f"{knowledge_progress.repository_total}｜"
                     f"{knowledge_progress.namespace}\n"
@@ -1054,7 +1092,8 @@ class NjuQaReportPlugin(Star):
                 )
             yield event.plain_result(
                 "日报任务运行中\n"
-                f"日期进度：{progress.date_index}/{progress.date_total}\n"
+                + scheduled_details
+                + f"日期进度：{progress.date_index}/{progress.date_total}\n"
                 f"当前日期：{progress.report_date}\n"
                 f"当前阶段：{progress.stage}"
                 f"{screening}"
@@ -1072,11 +1111,23 @@ class NjuQaReportPlugin(Star):
         except ValueError:
             yield event.plain_result("请提供日期，例如：/nju_collect report status 2026-07-12")
             return
+        scheduled_for_date = (
+            scheduled_run
+            if scheduled_run is not None
+            and scheduled_run.report_date == requested_date.isoformat()
+            else None
+        )
         window = await asyncio.to_thread(
             self.storage.processing_window,
             requested_date.isoformat(),
         )
         if window is None:
+            if scheduled_for_date is not None:
+                yield event.plain_result(
+                    f"{requested_date.isoformat()} 尚未建立筛选窗口\n"
+                    + format_scheduled_report_status(scheduled_for_date)
+                )
+                return
             yield event.plain_result("该日期尚未运行。")
             return
         clusters = await asyncio.to_thread(
@@ -1100,6 +1151,9 @@ class NjuQaReportPlugin(Star):
                 )
             if progress.token_usage.calls:
                 running_details += "\n" + _format_token_usage(progress.token_usage)
+        is_running = self.workflow.running or (
+            scheduled_for_date is not None and scheduled_for_date.status == "RUNNING"
+        )
         yield event.plain_result(
             f"{window.report_date} 处理状态\n"
             f"状态：{window.status}\n"
@@ -1111,7 +1165,12 @@ class NjuQaReportPlugin(Star):
             f"聚合问题：{len(clusters)}\n"
             f"已调查：{len(investigations)}\n"
             f"HTML 日报：{('版本 ' + str(report.version)) if report else '未生成'}\n"
-            f"运行中：{'是' if self.workflow.running else '否'}"
+            f"运行中：{'是' if is_running else '否'}"
+            + (
+                "\n" + format_scheduled_report_status(scheduled_for_date)
+                if scheduled_for_date is not None
+                else ""
+            )
             + (
                 f"\n当前阶段：{progress.stage}"
                 if progress.running and progress.report_date == requested_date.isoformat()
@@ -1429,6 +1488,17 @@ def _format_full_run_results(results: list[FullReportRunResult]) -> str:
         f"新生成或更新报告：{sum(item.report is not None for item in processed)}",
         f"技术错误：{sum(item.screening.error_count for item in processed)}",
     ]
+    regression_reviews = sum(item.screening.regression_reviews for item in processed)
+    regression_preserved = sum(item.screening.regression_preserved for item in processed)
+    regression_confirmed_drops = sum(
+        item.screening.regression_confirmed_drops for item in processed
+    )
+    if regression_reviews:
+        lines.append(
+            "筛选回退复核："
+            f"{regression_reviews} 次调用｜沿用上一版 {regression_preserved}｜"
+            f"确认删除 {regression_confirmed_drops}"
+        )
     token_usage = TokenUsage(
         input_tokens=sum(item.token_usage.input_tokens for item in results),
         output_tokens=sum(item.token_usage.output_tokens for item in results),

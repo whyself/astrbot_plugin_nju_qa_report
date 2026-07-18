@@ -8,6 +8,8 @@ from typing import Protocol
 
 from .models import ScopeAssessment, ScopeDecision, ScopeResolution
 
+BATCH_OMISSION_REASON = "AI 未将该消息提取为待收录问题"
+
 
 @dataclass(frozen=True, slots=True)
 class ScopeBatchMessage:

@@ -13,7 +13,11 @@ from nju_report.reporting import DeliverySummary, recipient_hash
 from nju_report.storage import ReportStorage
 from nju_report.time_windows import natural_day_window
 from nju_report.token_usage import TokenUsageTracker
-from nju_report.workflow import DailyReportWorkflow, DailyScheduler
+from nju_report.workflow import (
+    DailyReportWorkflow,
+    DailyScheduler,
+    format_scheduled_report_status,
+)
 
 
 class FakeProcessor:
@@ -73,8 +77,16 @@ class FakeScheduledWorkflow:
     async def sync_knowledge(self) -> None:
         self.sync_calls += 1
 
-    async def run_date(self, report_date: date, *, deliver: bool = False):
+    async def run_date(
+        self,
+        report_date: date,
+        *,
+        deliver: bool = False,
+        sync_knowledge: bool = False,
+    ):
         assert deliver is True
+        assert sync_knowledge is True
+        self.sync_calls += 1
         self.run_calls.append(report_date)
         if self.on_run is not None:
             self.on_run()
@@ -126,6 +138,48 @@ def test_scheduler_catches_up_once_and_persists_success_across_reload(tmp_path: 
         storage.close()
 
     asyncio.run(run())
+
+
+def test_scheduler_waits_while_manual_report_or_knowledge_sync_is_busy(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        storage = ReportStorage(tmp_path / "report.sqlite3")
+        storage.initialize()
+        now = datetime(2026, 7, 19, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        workflow = FakeScheduledWorkflow()
+        workflow.busy = True
+
+        await _scheduler(workflow, storage)._tick(now)
+
+        assert workflow.sync_calls == 0
+        assert workflow.run_calls == []
+        assert storage.scheduled_report_run("2026-07-19") is None
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_scheduled_running_state_has_operator_status_text(tmp_path: Path) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    claim = storage.begin_scheduled_report_run(
+        "2026-07-19",
+        "2026-07-18",
+        now_utc=100,
+        stale_before_utc=0,
+    )
+    assert claim is not None
+    state = storage.oldest_unfinished_scheduled_report_run()
+    assert state is not None
+
+    text = format_scheduled_report_status(state)
+
+    assert "零点自动日报：运行中" in text
+    assert "调度日期：2026-07-19" in text
+    assert "处理日期：2026-07-18" in text
+    assert "调度尝试：1" in text
+    storage.close()
 
 
 def test_scheduler_persists_retry_deadline_and_retries_after_15_minutes(

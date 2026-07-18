@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from .aggregation import QuestionAggregationService
 from .investigation import InvestigationService
 from .knowledge import KnowledgeService
-from .models import ReportArtifact
+from .models import ReportArtifact, ScheduledReportRun
 from .question_processor import DailyQuestionProcessor, DailyRunResult
 from .reporting import DeliverySummary, ReportService, recipient_hash
 from .storage import ReportStorage
@@ -83,6 +83,12 @@ class DailyReportWorkflow:
     def running(self) -> bool:
         return self._lock.locked()
 
+    @property
+    def busy(self) -> bool:
+        """Whether a manual or scheduled stage currently owns shared report resources."""
+
+        return self.running or self._knowledge.syncing
+
     def progress(self) -> WorkflowProgress:
         screening_date, screening_completed, screening_total = self._question_processor.progress
         if screening_date != self._current_date:
@@ -112,11 +118,10 @@ class DailyReportWorkflow:
         )
 
     async def sync_knowledge(self) -> None:
-        self._stage = "同步语雀知识库"
-        try:
-            await self._knowledge.sync_all()
-        finally:
-            if not self.running:
+        async with self._lock:
+            try:
+                await self._sync_knowledge_locked()
+            finally:
                 self._stage = "空闲"
 
     async def run_date(
@@ -125,12 +130,15 @@ class DailyReportWorkflow:
         *,
         deliver: bool = False,
         force: bool = False,
+        sync_knowledge: bool = False,
     ) -> FullReportRunResult:
         async with self._lock:
             self._usage_baseline = self._token_usage.snapshot()
             self._date_index = 1
             self._date_total = 1
             try:
+                if sync_knowledge:
+                    await self._sync_knowledge_locked()
                 return await self._run_date_locked(
                     report_date,
                     deliver=deliver,
@@ -145,6 +153,7 @@ class DailyReportWorkflow:
         before_date: date,
         deliver: bool = False,
         force: bool = False,
+        sync_knowledge: bool = False,
     ) -> list[FullReportRunResult]:
         dates = await self.history_dates(before_date=before_date)
         async with self._lock:
@@ -152,6 +161,8 @@ class DailyReportWorkflow:
             self._date_total = len(dates)
             result: list[FullReportRunResult] = []
             try:
+                if sync_knowledge:
+                    await self._sync_knowledge_locked()
                 for index, current in enumerate(dates, start=1):
                     self._date_index = index
                     result.append(
@@ -164,6 +175,10 @@ class DailyReportWorkflow:
                 return result
             finally:
                 self._stage = "空闲"
+
+    async def _sync_knowledge_locked(self) -> None:
+        self._stage = "同步语雀知识库"
+        await self._knowledge.sync_all()
 
     async def history_dates(self, *, before_date: date) -> list[date]:
         raw_dates = await asyncio.to_thread(
@@ -309,6 +324,8 @@ class DailyScheduler:
 
         if not self._enabled:
             return
+        if bool(getattr(self._workflow, "busy", False)):
+            return
         now_utc = int(now.timestamp())
         state = await asyncio.to_thread(
             self._storage.oldest_unfinished_scheduled_report_run,
@@ -386,10 +403,10 @@ class DailyScheduler:
             return
 
         try:
-            await self._workflow.sync_knowledge()
             result = await self._workflow.run_date(
                 date.fromisoformat(report_date),
                 deliver=True,
+                sync_knowledge=True,
             )
             if result.report is None:
                 raise RuntimeError("daily report was not generated")
@@ -433,3 +450,20 @@ class DailyScheduler:
             now_utc=completed_utc,
             claim_token=claim_token,
         )
+
+
+def format_scheduled_report_status(state: ScheduledReportRun) -> str:
+    status_labels = {
+        "RUNNING": "运行中",
+        "RETRY_PENDING": "等待自动重试",
+        "SENT": "已发送",
+    }
+    lines = [
+        f"零点自动日报：{status_labels.get(state.status, state.status)}",
+        f"调度日期：{state.scheduled_date}",
+        f"处理日期：{state.report_date}",
+        f"调度尝试：{state.attempts}",
+    ]
+    if state.error_summary:
+        lines.append(f"上次错误：{state.error_summary}")
+    return "\n".join(lines)

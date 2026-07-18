@@ -17,7 +17,11 @@ from .models import (
     ScopeDecision,
 )
 from .privacy import prepare_scope_input
-from .scope_classifier import QuestionGateCandidate, ScopeBatchMessage
+from .scope_classifier import (
+    BATCH_OMISSION_REASON,
+    QuestionGateCandidate,
+    ScopeBatchMessage,
+)
 from .token_usage import TokenUsageTracker
 
 logger = logging.getLogger(__name__)
@@ -632,7 +636,7 @@ def parse_scope_batch(
 
     dropped = ScopeAssessment(
             decision=ScopeDecision.DROP,
-            reason="AI 未将该消息提取为待收录问题",
+            reason=BATCH_OMISSION_REASON,
             confidence=0.8,
             clarity=Clarity.CLEAR,
             knowledge_value=KnowledgeValue.LOW,
