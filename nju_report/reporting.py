@@ -194,6 +194,7 @@ class ReportService:
             subject=subject,
             html_path=str(path),
             summary_json=summary_json,
+            source_run_id=window.run_id if window is not None else "",
         )
 
     async def deliver(self, report: ReportArtifact, *, force: bool = False) -> DeliverySummary:

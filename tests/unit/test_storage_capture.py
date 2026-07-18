@@ -15,6 +15,8 @@ from nju_report.models import (
     MessageEnvelope,
     ScopeAssessment,
     ScopeDecision,
+    ScopeResolution,
+    ScopeResolutionRecord,
 )
 from nju_report.storage import ReportStorage, StorageError
 from nju_report.time_windows import natural_day_window
@@ -146,7 +148,7 @@ def test_migrations_tolerate_indexes_left_by_an_older_partial_run(tmp_path: Path
     recovered.initialize()
     with sqlite3.connect(path) as connection:
         version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-    assert version == 10
+    assert version == 11
     recovered.close()
 
 
@@ -345,7 +347,7 @@ def test_reload_recovery_makes_running_schedule_immediately_retryable(
     storage.close()
 
 
-def test_failed_screening_version_restores_last_completed_snapshot(tmp_path: Path) -> None:
+def test_retrying_screening_keeps_only_current_run_results(tmp_path: Path) -> None:
     storage = ReportStorage(tmp_path / "report.sqlite3")
     storage.initialize()
     report_date = "2026-07-12"
@@ -361,6 +363,11 @@ def test_failed_screening_version_restores_last_completed_snapshot(tmp_path: Pat
         decision=ScopeDecision.DROP,
         reason="未入选",
         confidence=0.8,
+    )
+    error = ScopeAssessment(
+        decision=ScopeDecision.AUTO_REVIEW_ERROR,
+        reason="本次复核失败",
+        confidence=0.0,
     )
 
     assert storage.begin_processing_window(window, run_id="good") is True
@@ -380,18 +387,40 @@ def test_failed_screening_version_restores_last_completed_snapshot(tmp_path: Pat
         error_count=0,
     )
 
-    assert storage.begin_processing_window(window, run_id="bad", force=True) is True
+    # Deliberately diverge the mutable row from the active v1 snapshot. Starting
+    # a forced run must not restore or otherwise read that historical snapshot.
     storage.upsert_scope_candidate(
         source_key="m1",
         report_date=report_date,
         initial=drop,
         original_question="校园卡怎么补办",
     )
-    storage.upsert_scope_candidate(
-        source_key="m2",
-        report_date=report_date,
-        initial=drop,
-        original_question="闲聊",
+    assert storage.begin_processing_window(window, run_id="bad", force=True) is True
+    current = storage.get_question_candidate("20260712-Q001")
+    assert current is not None
+    assert current.final_decision == "DROP"
+    storage.replace_scope_resolutions(
+        report_date,
+        run_id="bad",
+        records=[
+            ScopeResolutionRecord(
+                source_key="m1",
+                review_run_id="bad:1",
+                resolution=ScopeResolution(drop, review_rounds=0),
+                original_question="校园卡怎么补办",
+            ),
+            ScopeResolutionRecord(
+                source_key="m2",
+                review_run_id="bad:2",
+                resolution=ScopeResolution(
+                    error,
+                    review_rounds=1,
+                    retryable=True,
+                    error_summary="TimeoutError",
+                ),
+                original_question="本次新消息",
+            ),
+        ],
     )
     storage.complete_processing_window(
         report_date,
@@ -404,15 +433,40 @@ def test_failed_screening_version_restores_last_completed_snapshot(tmp_path: Pat
     )
 
     candidates, total = storage.list_question_candidates(report_date=report_date, limit=None)
-    assert total == 1
-    assert candidates[0].source_key == "m1"
-    assert candidates[0].final_decision == "INCLUDE"
+    assert total == 2
+    assert [(item.source_key, item.final_decision) for item in candidates] == [
+        ("m1", "DROP"),
+        ("m2", "AUTO_REVIEW_ERROR"),
+    ]
+    assert all(item.canonical_question != include.canonical_question for item in candidates)
     versions = storage.list_screening_versions(report_date)
     assert [(item.version, item.status, item.is_active) for item in versions] == [
         (2, "RETRY_PENDING", False),
         (1, "COMPLETED", True),
     ]
     assert versions[0].error_count == 1
+    storage.close()
+
+
+def test_identical_report_content_is_idempotent_only_within_current_run(
+    tmp_path: Path,
+) -> None:
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    values = {
+        "report_date": "2026-07-12",
+        "subject": "测试日报",
+        "html_path": str(tmp_path / "same.html"),
+        "summary_json": "{}",
+    }
+
+    first = storage.save_report(**values, source_run_id="run-1")
+    second = storage.save_report(**values, source_run_id="run-2")
+    repeated = storage.save_report(**values, source_run_id="run-2")
+
+    assert first.report_id != second.report_id
+    assert (first.version, second.version) == (1, 2)
+    assert repeated.report_id == second.report_id
     storage.close()
 
 

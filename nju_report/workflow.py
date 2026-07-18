@@ -243,8 +243,10 @@ class DailyReportWorkflow:
     async def _completed_result(self, report_date: date) -> FullReportRunResult | None:
         raw_date = report_date.isoformat()
         window = await asyncio.to_thread(self._storage.processing_window, raw_date)
+        if window is None or window.status != "COMPLETED":
+            return None
         report = await asyncio.to_thread(self._storage.latest_report, raw_date)
-        if window is None or window.status != "COMPLETED" or report is None:
+        if report is None:
             return None
         clusters = await asyncio.to_thread(self._storage.list_question_clusters, raw_date)
         screening = DailyRunResult(

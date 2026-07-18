@@ -30,12 +30,13 @@ from .models import (
     ScheduledReportRun,
     ScopeAssessment,
     ScopeResolution,
+    ScopeResolutionRecord,
     ScreeningVersion,
     StoredMessage,
 )
 from .time_windows import TimeWindow
 
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 11
 
 
 class StorageError(RuntimeError):
@@ -806,22 +807,23 @@ class ReportStorage:
         html_path: str,
         summary_json: str,
         status: str = "READY",
+        source_run_id: str = "",
     ) -> ReportArtifact:
-        """Freeze a new report version, or return an identical existing version."""
+        """Freeze one report per current run without comparing older runs."""
 
         now = int(time.time())
+        normalized_run_id = source_run_id.strip()
         with self._transaction() as connection:
-            identical = connection.execute(
-                """
-                SELECT * FROM reports
-                WHERE report_date = ? AND subject = ? AND html_path = ?
-                    AND summary_json = ? AND status = ?
-                ORDER BY version DESC LIMIT 1
-                """,
-                (report_date, subject, html_path, summary_json, status),
-            ).fetchone()
-            if identical is not None:
-                return _report_from_row(identical)
+            if normalized_run_id:
+                current_run = connection.execute(
+                    """
+                    SELECT * FROM reports
+                    WHERE report_date = ? AND source_run_id = ?
+                    """,
+                    (report_date, normalized_run_id),
+                ).fetchone()
+                if current_run is not None:
+                    return _report_from_row(current_run)
             row = connection.execute(
                 "SELECT COALESCE(MAX(version), 0) FROM reports WHERE report_date = ?",
                 (report_date,),
@@ -831,10 +833,19 @@ class ReportStorage:
                 """
                 INSERT INTO reports (
                     report_date, version, status, subject, html_path,
-                    summary_json, created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    summary_json, source_run_id, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (report_date, version, status, subject, html_path, summary_json, now),
+                (
+                    report_date,
+                    version,
+                    status,
+                    subject,
+                    html_path,
+                    summary_json,
+                    normalized_run_id,
+                    now,
+                ),
             )
             created = connection.execute(
                 "SELECT * FROM reports WHERE id = ?",
@@ -1236,20 +1247,6 @@ class ReportStorage:
                         report_date,
                     ),
                 )
-            active = connection.execute(
-                """
-                SELECT snapshot_json FROM screening_versions
-                WHERE report_date = ? AND is_active = 1
-                ORDER BY version DESC LIMIT 1
-                """,
-                (report_date,),
-            ).fetchone()
-            if active is not None:
-                _restore_candidate_snapshot_tx(
-                    connection,
-                    report_date,
-                    str(active["snapshot_json"]),
-                )
             version_row = connection.execute(
                 """
                 SELECT COALESCE(MAX(version), 0) + 1
@@ -1347,21 +1344,6 @@ class ReportStorage:
                     "UPDATE screening_versions SET is_active = 1 WHERE run_id = ?",
                     (run_id,),
                 )
-            else:
-                active = connection.execute(
-                    """
-                    SELECT snapshot_json FROM screening_versions
-                    WHERE report_date = ? AND is_active = 1
-                    ORDER BY version DESC LIMIT 1
-                    """,
-                    (report_date,),
-                ).fetchone()
-                if active is not None:
-                    _restore_candidate_snapshot_tx(
-                        connection,
-                        report_date,
-                        str(active["snapshot_json"]),
-                    )
 
     def fail_processing_window(
         self,
@@ -1370,11 +1352,10 @@ class ReportStorage:
         *,
         run_id: str,
     ) -> None:
-        """Mark a run failed and restore the last completed screening snapshot."""
+        """Mark a run failed without reading or restoring an older version."""
 
         with self._transaction() as connection:
             now = int(time.time())
-            snapshot_json = _candidate_snapshot_json_tx(connection, report_date)
             cursor = connection.execute(
                 """
                 UPDATE processing_windows
@@ -1388,26 +1369,12 @@ class ReportStorage:
             connection.execute(
                 """
                 UPDATE screening_versions
-                SET status = 'FAILED', snapshot_json = ?, error_summary = ?,
+                SET status = 'FAILED', error_summary = ?,
                     completed_at_utc = ?
                 WHERE report_date = ? AND run_id = ? AND status = 'RUNNING'
                 """,
-                (snapshot_json, error_summary[:1000], now, report_date, run_id),
+                (error_summary[:1000], now, report_date, run_id),
             )
-            active = connection.execute(
-                """
-                SELECT snapshot_json FROM screening_versions
-                WHERE report_date = ? AND is_active = 1
-                ORDER BY version DESC LIMIT 1
-                """,
-                (report_date,),
-            ).fetchone()
-            if active is not None:
-                _restore_candidate_snapshot_tx(
-                    connection,
-                    report_date,
-                    str(active["snapshot_json"]),
-                )
 
     def list_screening_versions(self, report_date: str) -> list[ScreeningVersion]:
         """List immutable AI screening attempts for one date, newest first."""
@@ -1577,6 +1544,89 @@ class ReportStorage:
                     error_summary=resolution.error_summary,
                 )
             return candidate_id
+
+    def replace_scope_resolutions(
+        self,
+        report_date: str,
+        *,
+        run_id: str,
+        records: list[ScopeResolutionRecord],
+    ) -> None:
+        """Atomically replace one date with results produced only by this run."""
+
+        if not run_id.strip():
+            raise ValueError("run_id 不能为空")
+        source_keys = [item.source_key for item in records]
+        if len(source_keys) != len(set(source_keys)):
+            raise ValueError("本次筛选结果包含重复来源键")
+        with self._transaction() as connection:
+            active = connection.execute(
+                """
+                SELECT 1 FROM processing_windows
+                WHERE report_date = ? AND status = 'RUNNING' AND run_id = ?
+                """,
+                (report_date, run_id),
+            ).fetchone()
+            if active is None:
+                raise StorageError("本次日报运行已被更新的任务替代，不能保存筛选结果")
+            connection.execute(
+                "DELETE FROM question_candidates WHERE report_date = ?",
+                (report_date,),
+            )
+            for record in records:
+                if not record.review_run_id.strip():
+                    raise ValueError("review_run_id 不能为空")
+                resolution = record.resolution
+                initial = resolution.initial_assessment or resolution.assessment
+                status = "AUTO_RETRY_PENDING" if resolution.retryable else "RESOLVED"
+                candidate_id = self._upsert_scope_candidate_tx(
+                    connection,
+                    source_key=record.source_key,
+                    report_date=report_date,
+                    initial=initial,
+                    final=resolution.assessment,
+                    status=status,
+                    original_question=record.original_question,
+                    group_alias=record.group_alias,
+                    sent_at_utc=record.sent_at_utc,
+                )
+                for round_no, assessment in enumerate(
+                    resolution.review_attempts,
+                    start=1,
+                ):
+                    self._record_scope_review_tx(
+                        connection,
+                        candidate_id=candidate_id,
+                        review_run_id=record.review_run_id,
+                        round_no=round_no,
+                        decision=assessment.decision.value,
+                        reason=assessment.reason,
+                        confidence=assessment.confidence,
+                        error_summary="",
+                    )
+                if resolution.retryable and resolution.review_rounds > len(
+                    resolution.review_attempts
+                ):
+                    self._record_scope_review_tx(
+                        connection,
+                        candidate_id=candidate_id,
+                        review_run_id=record.review_run_id,
+                        round_no=resolution.review_rounds,
+                        decision="AUTO_REVIEW_ERROR",
+                        reason=resolution.assessment.reason,
+                        confidence=0.0,
+                        error_summary=resolution.error_summary,
+                    )
+            snapshot_json = _candidate_snapshot_json_tx(connection, report_date)
+            cursor = connection.execute(
+                """
+                UPDATE screening_versions SET snapshot_json = ?
+                WHERE report_date = ? AND run_id = ? AND status = 'RUNNING'
+                """,
+                (snapshot_json, report_date, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError("找不到本次筛选运行对应的版本记录")
 
     @staticmethod
     def _upsert_scope_candidate_tx(
@@ -1829,6 +1879,13 @@ class ReportStorage:
                 connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
                     (10, int(time.time())),
+                )
+                version = 10
+            if version < 11:
+                self._migration_v11(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at_utc) VALUES (?, ?)",
+                    (11, int(time.time())),
                 )
             connection.commit()
         except Exception:
@@ -2299,6 +2356,28 @@ class ReportStorage:
                 """
             )
 
+    @staticmethod
+    def _migration_v11(connection: sqlite3.Connection) -> None:
+        """Make report idempotency local to one processing run."""
+
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(reports)").fetchall()
+        }
+        if "source_run_id" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE reports
+                ADD COLUMN source_run_id TEXT NOT NULL DEFAULT ''
+                """
+            )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_source_run
+            ON reports(report_date, source_run_id)
+            WHERE source_run_id != ''
+            """
+        )
+
 
 def _community_context_audit_json(audit: CommunityContextAudit) -> str:
     return json.dumps(
@@ -2417,53 +2496,6 @@ def _candidate_snapshot_json_tx(
         ],
         ensure_ascii=False,
         separators=(",", ":"),
-    )
-
-
-def _restore_candidate_snapshot_tx(
-    connection: sqlite3.Connection,
-    report_date: str,
-    snapshot_json: str,
-) -> None:
-    try:
-        raw_items = json.loads(snapshot_json)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise StorageError("筛选版本快照损坏，无法恢复") from exc
-    if not isinstance(raw_items, list) or any(not isinstance(item, dict) for item in raw_items):
-        raise StorageError("筛选版本快照格式无效")
-    items: list[dict[str, object]] = []
-    source_keys: set[str] = set()
-    for raw in raw_items:
-        if any(column not in raw for column in _CANDIDATE_SNAPSHOT_COLUMNS):
-            raise StorageError("筛选版本快照字段不完整")
-        if str(raw["report_date"]) != report_date:
-            raise StorageError("筛选版本快照日期不匹配")
-        source_key = str(raw["source_key"])
-        if not source_key or source_key in source_keys:
-            raise StorageError("筛选版本快照来源键无效")
-        source_keys.add(source_key)
-        items.append(raw)
-
-    current = connection.execute(
-        "SELECT id, source_key FROM question_candidates WHERE report_date = ?",
-        (report_date,),
-    ).fetchall()
-    connection.executemany(
-        "DELETE FROM question_candidates WHERE id = ?",
-        [(int(row["id"]),) for row in current if str(row["source_key"]) not in source_keys],
-    )
-    placeholders = ", ".join("?" for _ in _CANDIDATE_SNAPSHOT_COLUMNS)
-    update_columns = tuple(
-        column for column in _CANDIDATE_SNAPSHOT_COLUMNS if column != "source_key"
-    )
-    update_sql = ", ".join(f"{column} = excluded.{column}" for column in update_columns)
-    connection.executemany(
-        f"""
-        INSERT INTO question_candidates ({', '.join(_CANDIDATE_SNAPSHOT_COLUMNS)})
-        VALUES ({placeholders})
-        ON CONFLICT(source_key) DO UPDATE SET {update_sql}
-        """,  # noqa: S608 -- identifiers are fixed module constants
-        [tuple(item[column] for column in _CANDIDATE_SNAPSHOT_COLUMNS) for item in items],
     )
 
 

@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from nju_report.models import ReportArtifact, StoredMessage
 from nju_report.question_processor import DailyRunResult
 from nju_report.reporting import DeliverySummary, recipient_hash
@@ -384,6 +386,47 @@ def test_normal_history_run_skips_complete_report_but_force_recomputes(tmp_path:
         forced = await workflow.run_date(report_date, force=True)
         assert forced.screening.status == "COMPLETED"
         assert processor.calls == [(report_date, True)]
+        storage.close()
+
+    asyncio.run(run())
+
+
+def test_incomplete_retry_does_not_read_an_older_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        report_date = date(2026, 7, 12)
+        storage = _complete_report_storage(tmp_path, report_date)
+        existing = storage.latest_report(report_date.isoformat())
+        assert existing is not None
+        window = natural_day_window(report_date, "Asia/Shanghai")
+        assert storage.begin_processing_window(window, run_id="retry", force=True)
+        storage.complete_processing_window(
+            report_date.isoformat(),
+            run_id="retry",
+            messages_scanned=1,
+            candidates_saved=1,
+            included_count=0,
+            dropped_count=0,
+            error_count=1,
+        )
+
+        def reject_old_report_read(_report_date: str):
+            raise AssertionError("未完成的重跑不得读取旧报告")
+
+        monkeypatch.setattr(storage, "latest_report", reject_old_report_read)
+        workflow = DailyReportWorkflow(  # type: ignore[arg-type]
+            storage,
+            FakeProcessor(),
+            FakeAggregation(),
+            FakeInvestigation(),
+            FakeReports(existing),
+            FakeKnowledge(),
+            timezone_name="Asia/Shanghai",
+        )
+
+        assert await workflow._completed_result(report_date) is None
         storage.close()
 
     asyncio.run(run())

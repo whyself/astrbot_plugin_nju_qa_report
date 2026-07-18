@@ -380,60 +380,44 @@ def test_all_history_reports_completed_dates_as_skipped(tmp_path: Path) -> None:
     storage.close()
 
 
-def test_force_rerun_reviews_and_preserves_previous_include_before_confirmed_drop(
+def test_force_rerun_uses_only_current_raw_context_for_question_like_drops(
     tmp_path: Path,
 ) -> None:
-    class RegressionScopeService:
-        omit = False
-        rescue_mode = "include"
-        rescue_contexts: list[str] = []
+    class CurrentContextScopeService:
+        review_mode = "include"
+        review_contexts: list[str] = []
 
         async def resolve_batch(self, messages, target_ids):
-            by_id = {item.message_id: item for item in messages}
-            result = {}
-            for message_id in target_ids:
-                content = by_id[message_id].content
-                if "接替这玩意" not in content:
-                    assessment = ScopeAssessment(
-                        decision=ScopeDecision.DROP,
-                        reason="普通聊天陈述",
-                        confidence=0.95,
-                    )
-                elif self.omit:
-                    assessment = ScopeAssessment(
+            del messages
+            return {
+                message_id: ScopeResolution(
+                    ScopeAssessment(
                         decision=ScopeDecision.DROP,
                         reason=BATCH_OMISSION_REASON,
                         confidence=0.8,
-                    )
-                else:
-                    assessment = ScopeAssessment(
-                        decision=ScopeDecision.INCLUDE,
-                        reason="结合上文可还原接替平台问题",
-                        confidence=0.95,
-                        canonical_question="南京大学小百合论坛关闭后的校内接替平台是什么",
-                        category="校园平台/历史",
-                        clarity=Clarity.CLEAR,
-                        knowledge_value=KnowledgeValue.HIGH,
-                    )
-                result[message_id] = ScopeResolution(assessment, review_rounds=0)
-            return result
+                    ),
+                    review_rounds=0,
+                )
+                for message_id in target_ids
+            }
 
         async def resolve(self, message: str, context: str = "") -> ScopeResolution:
             assert message == "那么接替这玩意的是什么呢"
-            assert "上一筛选版本的规范化问题" in context
-            assert "小百合论坛关闭" in context
-            self.rescue_contexts.append(context)
-            if self.rescue_mode == "include":
+            assert "小百合论坛已经关闭了" in context
+            assert "上一筛选版本" not in context
+            assert "不得参考、猜测或沿用任何历史筛选版本" in context
+            self.review_contexts.append(context)
+            if self.review_mode == "include":
                 assessment = ScopeAssessment(
                     decision=ScopeDecision.INCLUDE,
-                    reason="上下文明确指向小百合论坛的接替平台",
+                    reason="本次聊天上下文明确指向小百合论坛的接替平台",
                     confidence=0.98,
-                    canonical_question="小百合关闭后由什么平台接替",
+                    canonical_question="南京大学小百合论坛关闭后的校内接替平台是什么",
                     category="校园平台/历史",
                     clarity=Clarity.CLEAR,
                     knowledge_value=KnowledgeValue.HIGH,
                 )
-            elif self.rescue_mode == "error":
+            elif self.review_mode == "error":
                 assessment = ScopeAssessment(
                     decision=ScopeDecision.AUTO_REVIEW_ERROR,
                     reason="定向复核调用失败",
@@ -442,7 +426,7 @@ def test_force_rerun_reviews_and_preserves_previous_include_before_confirmed_dro
             else:
                 assessment = ScopeAssessment(
                     decision=ScopeDecision.DROP,
-                    reason="明确判断该消息不构成公共问题",
+                    reason="本次上下文不足以构成公共问题",
                     confidence=0.99,
                     clarity=Clarity.CLEAR,
                     knowledge_value=KnowledgeValue.LOW,
@@ -459,42 +443,39 @@ def test_force_rerun_reviews_and_preserves_previous_include_before_confirmed_dro
     storage.insert_message(
         _stored("m-2", "那么接替这玩意的是什么呢", window.start_timestamp + 2)
     )
-    service = RegressionScopeService()
+    service = CurrentContextScopeService()
     processor = DailyQuestionProcessor(
         storage,
         service,  # type: ignore[arg-type]
         timezone_name="Asia/Shanghai",
     )
 
-    first = asyncio.run(processor.process_date(report_date))
+    first = asyncio.run(processor.process_date(report_date, force=True))
     assert first.included_count == 1
-
-    service.omit = True
-    rescued = asyncio.run(processor.process_date(report_date, force=True))
+    assert first.context_reviews == 1
+    assert first.context_included == 1
     candidates, _ = storage.list_question_candidates(report_date=report_date.isoformat())
     target = next(item for item in candidates if "接替这玩意" in item.original_question)
-    assert rescued.regression_reviews == 1
-    assert rescued.regression_preserved == 1
-    assert target.final_decision == "INCLUDE"
     assert target.canonical_question == "南京大学小百合论坛关闭后的校内接替平台是什么"
-    assert "强制重跑防回退" in target.reason
+    assert "当次原始上下文复核" in target.reason
 
-    service.rescue_mode = "error"
+    service.review_mode = "error"
     failed_review = asyncio.run(processor.process_date(report_date, force=True))
-    target = storage.get_question_candidate(target.question_code)
-    assert target is not None
-    assert failed_review.regression_reviews == 2
-    assert failed_review.regression_preserved == 1
-    assert target.final_decision == "INCLUDE"
+    candidates, _ = storage.list_question_candidates(report_date=report_date.isoformat())
+    target = next(item for item in candidates if "接替这玩意" in item.original_question)
+    assert failed_review.status == "RETRY_PENDING"
+    assert failed_review.context_reviews == 1
+    assert target.final_decision == "AUTO_REVIEW_ERROR"
+    assert target.canonical_question == ""
 
-    service.rescue_mode = "drop"
+    service.review_mode = "drop"
     confirmed = asyncio.run(processor.process_date(report_date, force=True))
-    target = storage.get_question_candidate(target.question_code)
-    assert target is not None
-    assert confirmed.regression_reviews == 2
-    assert confirmed.regression_confirmed_drops == 1
+    candidates, _ = storage.list_question_candidates(report_date=report_date.isoformat())
+    target = next(item for item in candidates if "接替这玩意" in item.original_question)
+    assert confirmed.context_reviews == 1
+    assert confirmed.context_confirmed_drops == 1
     assert target.final_decision == "DROP"
-    assert "两次定向复核均明确排除" in target.reason
+    assert "本次上下文不足" in target.reason
     storage.close()
 
 

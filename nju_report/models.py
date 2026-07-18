@@ -104,6 +104,18 @@ class ScopeResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class ScopeResolutionRecord:
+    """One current-run scope result prepared for atomic persistence."""
+
+    source_key: str
+    review_run_id: str
+    resolution: ScopeResolution
+    original_question: str = ""
+    group_alias: str = ""
+    sent_at_utc: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class QuestionCandidate:
     """One locally retained scope-screening result."""
 

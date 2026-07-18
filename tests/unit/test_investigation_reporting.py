@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import threading
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,7 @@ from nju_report.reporting import (
     report_delivery_quality_issues,
 )
 from nju_report.storage import ReportStorage
+from nju_report.time_windows import natural_day_window
 
 
 class FakeKnowledge:
@@ -645,6 +647,17 @@ def test_report_versions_and_mail_delivery_are_idempotent(
 ) -> None:
     async def run() -> None:
         storage, _, cluster, _ = _prepared_case(tmp_path, repository_status="READY")
+        window = natural_day_window(date(2026, 7, 12), "Asia/Shanghai")
+        assert storage.begin_processing_window(window, run_id="report-run")
+        storage.complete_processing_window(
+            cluster.report_date,
+            run_id="report-run",
+            messages_scanned=1,
+            candidates_saved=1,
+            included_count=1,
+            dropped_count=0,
+            error_count=0,
+        )
         storage.save_investigation(
             InvestigationResult(
                 question_code=cluster.question_code,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -13,10 +14,10 @@ from zoneinfo import ZoneInfo
 from .models import (
     Clarity,
     KnowledgeValue,
-    QuestionCandidate,
     ScopeAssessment,
     ScopeDecision,
     ScopeResolution,
+    ScopeResolutionRecord,
     StoredMessage,
 )
 from .privacy import redact_for_report
@@ -36,11 +37,15 @@ _BATCH_MAX_TARGETS = 200
 _BATCH_MAX_TARGET_CHARS = 24_000
 _BATCH_MESSAGE_CHAR_LIMIT = 1_200
 _FINAL_GATE_BATCH_SIZE = 20
-_FORCE_REGRESSION_REVIEW_ATTEMPTS = 2
-_FORCE_REGRESSION_DROP_CONFIDENCE = 0.9
-_FORCE_REGRESSION_AUDIT_PREFIX = "强制重跑防回退"
-_REGRESSION_CONTEXT_RADIUS = 10
-_REGRESSION_CONTEXT_MESSAGE_LIMIT = 320
+_CURRENT_CONTEXT_AUDIT_PREFIX = "当次原始上下文复核"
+_CURRENT_CONTEXT_RADIUS = 10
+_CURRENT_CONTEXT_MESSAGE_LIMIT = 320
+_QUESTION_SIGNAL_RE = re.compile(
+    r"[?？]|(?:什么|怎么|如何|为什么|为啥|为何|多少|几时|几点|哪里|哪儿|"
+    r"哪个|哪栋|是否|能否|可否|有没有|有无|咋|何时|什么时候|谁|干嘛)|"
+    r"(?:吗|嘛|么|呢)\s*[。！!…~～]*$"
+)
+_REPLY_PREFIX_RE = re.compile(r"^\[回复[^\]]*\]\s*", re.DOTALL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,9 +58,9 @@ class DailyRunResult:
     dropped_count: int = 0
     error_count: int = 0
     error_summary: str = ""
-    regression_reviews: int = 0
-    regression_preserved: int = 0
-    regression_confirmed_drops: int = 0
+    context_reviews: int = 0
+    context_included: int = 0
+    context_confirmed_drops: int = 0
 
     @property
     def skipped(self) -> bool:
@@ -83,9 +88,9 @@ class _GateGroup:
 
 
 @dataclass(frozen=True, slots=True)
-class _RegressionAudit:
+class _CurrentContextAudit:
     reviews: int = 0
-    preserved: int = 0
+    included: int = 0
     confirmed_drops: int = 0
 
 
@@ -188,18 +193,6 @@ class DailyQuestionProcessor:
             )
 
         try:
-            previous_candidates = {}
-            if force:
-                existing, _ = await asyncio.to_thread(
-                    self._storage.list_question_candidates,
-                    report_date=report_date.isoformat(),
-                    limit=None,
-                )
-                previous_candidates = {
-                    item.source_key: item
-                    for item in existing
-                    if item.final_decision == ScopeDecision.INCLUDE.value
-                }
             messages = await asyncio.to_thread(
                 self._storage.messages_in_window,
                 window,
@@ -231,23 +224,29 @@ class DailyQuestionProcessor:
                 screened_targets,
                 report_date=report_date.isoformat(),
             )
-            regression_audit = _RegressionAudit()
-            if previous_candidates:
-                screened_targets, regression_audit = (
-                    await self._stabilize_force_regressions(
-                        screened_targets,
-                        chunks=chunks,
-                        previous_candidates=previous_candidates,
-                    )
-                )
+            screened_targets, context_audit = await self._review_current_context_drops(
+                screened_targets,
+                chunks=chunks,
+            )
+            _require_current_run_coverage(screened_targets, chunks)
             screened_targets.sort(key=lambda item: item.index)
-            for item in screened_targets:
-                await self._save_resolution(
-                    item.message,
-                    item.resolution,
-                    report_date=report_date.isoformat(),
+            records = [
+                ScopeResolutionRecord(
+                    source_key=_message_source_key(item.message),
                     review_run_id=f"{run_id}:{item.index}",
+                    resolution=item.resolution,
+                    original_question=redact_for_report(_message_content(item.message)),
+                    group_alias=item.message.group_alias,
+                    sent_at_utc=item.message.sent_at_utc,
                 )
+                for item in screened_targets
+            ]
+            await asyncio.to_thread(
+                self._storage.replace_scope_resolutions,
+                report_date.isoformat(),
+                run_id=run_id,
+                records=records,
+            )
 
             decisions = [item.resolution.assessment.decision for item in screened_targets]
             included_count = sum(item is ScopeDecision.INCLUDE for item in decisions)
@@ -272,9 +271,9 @@ class DailyQuestionProcessor:
                 included_count=included_count,
                 dropped_count=dropped_count,
                 error_count=error_count,
-                regression_reviews=regression_audit.reviews,
-                regression_preserved=regression_audit.preserved,
-                regression_confirmed_drops=regression_audit.confirmed_drops,
+                context_reviews=context_audit.reviews,
+                context_included=context_audit.included,
+                context_confirmed_drops=context_audit.confirmed_drops,
             )
         except asyncio.CancelledError:
             await asyncio.to_thread(
@@ -298,122 +297,59 @@ class DailyQuestionProcessor:
                 error_summary=error_name,
             )
 
-    async def _stabilize_force_regressions(
+    async def _review_current_context_drops(
         self,
         targets: list[_ScreenedTarget],
         *,
         chunks: list[_ScreeningChunk],
-        previous_candidates: dict[str, QuestionCandidate],
-    ) -> tuple[list[_ScreenedTarget], _RegressionAudit]:
+    ) -> tuple[list[_ScreenedTarget], _CurrentContextAudit]:
+        """Recheck question-like drops using only this run's raw conversation."""
+
         chunk_by_message_id = {
             message_id: chunk
             for chunk in chunks
             for message_id, _, _ in chunk.targets
         }
         reviews = 0
-        preserved = 0
+        included = 0
         confirmed_drops = 0
         result: list[_ScreenedTarget] = []
         for target in targets:
-            source_key = _message_source_key(target.message)
-            previous = previous_candidates.get(source_key)
+            assessment = target.resolution.assessment
             if (
-                previous is None
-                or target.resolution.assessment.decision is ScopeDecision.INCLUDE
+                assessment.decision is not ScopeDecision.DROP
+                or assessment.reason != BATCH_OMISSION_REASON
+                or not _looks_question_like(_message_content(target.message))
             ):
                 result.append(target)
                 continue
 
-            chunk = chunk_by_message_id.get(target.message_id)
-            context = _regression_review_context(
-                chunk,
-                target.message_id,
-                previous.canonical_question,
-            )
-            attempts: list[ScopeAssessment] = []
-            for _ in range(_FORCE_REGRESSION_REVIEW_ATTEMPTS):
-                rescue = await self._scope_review_service.resolve(
-                    _message_content(target.message),
-                    context,
-                )
-                reviews += 1
-                attempts.append(rescue.assessment)
-                if rescue.assessment.decision is ScopeDecision.INCLUDE:
-                    break
-
-            explicit_drops = [
-                item
-                for item in attempts
-                if item.decision is ScopeDecision.DROP
-                and item.reason.strip() != BATCH_OMISSION_REASON
-                and item.confidence >= _FORCE_REGRESSION_DROP_CONFIDENCE
-            ]
-            if len(explicit_drops) == _FORCE_REGRESSION_REVIEW_ATTEMPTS:
-                confirmed_drops += 1
-                final_drop = explicit_drops[-1]
-                result.append(
-                    _replace_resolution(
-                        target,
-                        ScopeAssessment(
-                            decision=ScopeDecision.DROP,
-                            reason=(
-                                f"{_FORCE_REGRESSION_AUDIT_PREFIX}：两次定向复核均明确排除；"
-                                f"{final_drop.reason}"
-                            ),
-                            confidence=final_drop.confidence,
-                            clarity=final_drop.clarity,
-                            knowledge_value=final_drop.knowledge_value,
-                            time_sensitive=final_drop.time_sensitive,
-                        ),
-                        attempts,
-                    )
-                )
-                continue
-
-            preserved += 1
-            included = next(
-                (
-                    item
-                    for item in attempts
-                    if item.decision is ScopeDecision.INCLUDE
+            reviewed = await self._scope_review_service.resolve(
+                _message_content(target.message),
+                _current_run_review_context(
+                    chunk_by_message_id.get(target.message_id),
+                    target.message_id,
                 ),
-                None,
             )
-            detail = "；".join(
-                f"{item.decision.value}:{item.reason.strip() or '无理由'}"
-                for item in attempts
-            )
+            reviews += 1
+            assessment = reviewed.assessment
+            if assessment.decision is ScopeDecision.INCLUDE:
+                included += 1
+                assessment = _with_audit_reason(assessment)
+            elif assessment.decision is ScopeDecision.DROP:
+                confirmed_drops += 1
+                assessment = _with_audit_reason(assessment)
+            else:
+                reviewed = _current_context_error_resolution(reviewed)
+                assessment = reviewed.assessment
             result.append(
-                _replace_resolution(
+                _with_current_context_review(
                     target,
-                    ScopeAssessment(
-                        decision=ScopeDecision.INCLUDE,
-                        reason=(
-                            f"{_FORCE_REGRESSION_AUDIT_PREFIX}：本轮由 INCLUDE 回退；"
-                            f"定向复核未连续明确排除，沿用上一筛选版本。{detail}"
-                        ),
-                        confidence=max(
-                            previous.confidence,
-                            included.confidence if included is not None else 0.0,
-                        ),
-                        canonical_question=previous.canonical_question,
-                        category=previous.category,
-                        clarity=Clarity.CLEAR,
-                        knowledge_value=(
-                            included.knowledge_value
-                            if included is not None
-                            and included.knowledge_value
-                            in {KnowledgeValue.HIGH, KnowledgeValue.MEDIUM}
-                            else KnowledgeValue.MEDIUM
-                        ),
-                        time_sensitive=(
-                            included.time_sensitive if included is not None else False
-                        ),
-                    ),
-                    attempts,
+                    reviewed,
+                    assessment=assessment,
                 )
             )
-        return result, _RegressionAudit(reviews, preserved, confirmed_drops)
+        return result, _CurrentContextAudit(reviews, included, confirmed_drops)
 
     async def _screen_chunk(
         self,
@@ -542,36 +478,6 @@ class DailyQuestionProcessor:
             else item
             for item in targets
         ]
-
-    async def _save_resolution(
-        self,
-        message: StoredMessage,
-        resolution: ScopeResolution,
-        *,
-        report_date: str,
-        review_run_id: str,
-    ) -> None:
-        content = message.text.strip() or message.outline.strip()
-
-        source_key = ":".join(
-            (
-                "message",
-                message.platform_id,
-                message.bot_self_id,
-                message.external_message_id,
-            )
-        )
-        await asyncio.to_thread(
-            self._storage.save_scope_resolution,
-            source_key=source_key,
-            report_date=report_date,
-            review_run_id=review_run_id,
-            resolution=resolution,
-            original_question=redact_for_report(content),
-            group_alias=message.group_alias,
-            sent_at_utc=message.sent_at_utc,
-        )
-
 
 def _final_gate_groups(
     targets: list[_ScreenedTarget],
@@ -788,15 +694,14 @@ def _message_source_key(message: StoredMessage) -> str:
     )
 
 
-def _regression_review_context(
+def _current_run_review_context(
     chunk: _ScreeningChunk | None,
     target_message_id: str,
-    previous_question: str,
 ) -> str:
     lines = [
-        "这是强制重跑时发现的筛选回退。请独立判断原消息是否确实提出了可沉淀问题。",
-        f"上一筛选版本的规范化问题：{previous_question}",
-        "按时间排序的聊天上下文：",
+        "只根据本次原始聊天，独立复核目标消息是否提出了可沉淀问题。",
+        "不得参考、猜测或沿用任何历史筛选版本、旧标题或旧报告。",
+        "请结合以下按时间排序的聊天上下文还原代词、省略和回复关系：",
     ]
     if chunk is None:
         lines.append("（没有可用的相邻消息）")
@@ -810,8 +715,8 @@ def _regression_review_context(
         0,
     )
     nearby = chunk.messages[
-        max(0, target_index - _REGRESSION_CONTEXT_RADIUS) :
-        target_index + _REGRESSION_CONTEXT_RADIUS + 1
+        max(0, target_index - _CURRENT_CONTEXT_RADIUS) :
+        target_index + _CURRENT_CONTEXT_RADIUS + 1
     ]
     for item in nearby:
         if item.message_id == target_message_id:
@@ -819,15 +724,48 @@ def _regression_review_context(
         reply = f"，回复 {item.reply_to_id}" if item.reply_to_id else ""
         lines.append(
             f"[{item.message_id}] {item.speaker_id}{reply}："
-            f"{item.content[:_REGRESSION_CONTEXT_MESSAGE_LIMIT]}"
+            f"{item.content[:_CURRENT_CONTEXT_MESSAGE_LIMIT]}"
         )
     return "\n".join(lines)
 
 
-def _replace_resolution(
+def _looks_question_like(content: str) -> bool:
+    target_text = _REPLY_PREFIX_RE.sub("", content.strip(), count=1)
+    return bool(_QUESTION_SIGNAL_RE.search(target_text))
+
+
+def _with_audit_reason(assessment: ScopeAssessment) -> ScopeAssessment:
+    return ScopeAssessment(
+        decision=assessment.decision,
+        reason=f"{_CURRENT_CONTEXT_AUDIT_PREFIX}：{assessment.reason}",
+        confidence=assessment.confidence,
+        canonical_question=assessment.canonical_question,
+        category=assessment.category,
+        clarity=assessment.clarity,
+        knowledge_value=assessment.knowledge_value,
+        time_sensitive=assessment.time_sensitive,
+    )
+
+
+def _current_context_error_resolution(reviewed: ScopeResolution) -> ScopeResolution:
+    detail = reviewed.error_summary or reviewed.assessment.reason
+    return ScopeResolution(
+        assessment=ScopeAssessment(
+            decision=ScopeDecision.AUTO_REVIEW_ERROR,
+            reason="当次原始上下文复核未形成明确结论，将由后台自动重试",
+            confidence=0.0,
+        ),
+        review_rounds=max(1, reviewed.review_rounds),
+        retryable=True,
+        error_summary=f"CurrentContextReviewUnresolved: {detail}"[:1000],
+    )
+
+
+def _with_current_context_review(
     target: _ScreenedTarget,
+    reviewed: ScopeResolution,
+    *,
     assessment: ScopeAssessment,
-    attempts: list[ScopeAssessment],
 ) -> _ScreenedTarget:
     previous = target.resolution
     return _ScreenedTarget(
@@ -836,11 +774,23 @@ def _replace_resolution(
         target.message,
         ScopeResolution(
             assessment=assessment,
-            review_rounds=previous.review_rounds + len(attempts),
+            review_rounds=previous.review_rounds + 1,
             initial_assessment=previous.initial_assessment or previous.assessment,
-            review_attempts=previous.review_attempts + tuple(attempts),
+            review_attempts=previous.review_attempts + (assessment,),
+            retryable=reviewed.retryable,
+            error_summary=reviewed.error_summary,
         ),
     )
+
+
+def _require_current_run_coverage(
+    targets: list[_ScreenedTarget],
+    chunks: list[_ScreeningChunk],
+) -> None:
+    expected = [message_id for chunk in chunks for message_id, _, _ in chunk.targets]
+    actual = [item.message_id for item in targets]
+    if len(actual) != len(set(actual)) or set(actual) != set(expected):
+        raise RuntimeError("本次筛选没有完整覆盖全部目标消息")
 
 
 def today_in_timezone(timezone_name: str) -> date:

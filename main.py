@@ -63,7 +63,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.6.17",
+    "0.6.18",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -1496,16 +1496,16 @@ def _format_full_run_results(results: list[FullReportRunResult]) -> str:
         f"新生成或更新报告：{sum(item.report is not None for item in processed)}",
         f"技术错误：{sum(item.screening.error_count for item in processed)}",
     ]
-    regression_reviews = sum(item.screening.regression_reviews for item in processed)
-    regression_preserved = sum(item.screening.regression_preserved for item in processed)
-    regression_confirmed_drops = sum(
-        item.screening.regression_confirmed_drops for item in processed
+    context_reviews = sum(item.screening.context_reviews for item in processed)
+    context_included = sum(item.screening.context_included for item in processed)
+    context_confirmed_drops = sum(
+        item.screening.context_confirmed_drops for item in processed
     )
-    if regression_reviews:
+    if context_reviews:
         lines.append(
-            "筛选回退复核："
-            f"{regression_reviews} 次调用｜沿用上一版 {regression_preserved}｜"
-            f"确认删除 {regression_confirmed_drops}"
+            "当次原始上下文复核："
+            f"{context_reviews} 条｜补回问题 {context_included}｜"
+            f"确认排除 {context_confirmed_drops}"
         )
     token_usage = TokenUsage(
         input_tokens=sum(item.token_usage.input_tokens for item in results),
