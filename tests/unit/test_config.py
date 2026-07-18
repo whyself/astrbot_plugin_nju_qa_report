@@ -62,6 +62,7 @@ def test_defaults_are_safe_and_exclude_qa_repository() -> None:
     assert config.daily_report_time == "00:00"
     assert config.scope_auto_review_enabled is True
     assert config.scope_auto_review_max_rounds == 2
+    assert config.request_timeout_seconds == 240
     assert config.embedding_model == "text-embedding-3-small"
     assert config.enable_vector_search is True
     assert [item.namespace for item in config.excluded_repositories] == ["qc19gt/ogaye8"]

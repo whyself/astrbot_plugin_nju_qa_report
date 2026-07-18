@@ -386,6 +386,93 @@ def test_final_gate_returns_format_error_to_model_for_repair() -> None:
     assert "修复重试：1/3" in context.prompts[1]
 
 
+def test_final_gate_failure_audit_records_timeout_budget_and_attempts(
+    monkeypatch,
+) -> None:
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("nju_report.scope_ai.asyncio.sleep", no_sleep)
+
+    class Context:
+        calls = 0
+
+        async def llm_generate(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            raise TimeoutError("provider timeout")
+
+    context = Context()
+    client = AstrBotScopeAiClient(
+        context,
+        provider_id="provider",
+        timeout_seconds=240,
+        max_retries=3,
+    )
+
+    with pytest.raises(ScopeAiError) as captured:
+        asyncio.run(
+            client.final_review_batch(
+                [
+                    QuestionGateCandidate(
+                        "c1",
+                        "南京大学校园卡如何补办？",
+                        report_date="2026-07-14",
+                    )
+                ]
+            )
+        )
+
+    summary = str(captured.value)
+    assert context.calls == 4
+    assert "report_date=2026-07-14" in summary
+    assert "candidate_count=1" in summary
+    assert "attempts=4" in summary
+    assert "timeout_seconds=240" in summary
+    assert "attempt_error_types=TimeoutError,TimeoutError,TimeoutError,TimeoutError" in summary
+    assert "last_error=TimeoutError" in summary
+    assert "provider timeout" not in summary
+
+
+def test_final_gate_failure_audit_keeps_sanitized_contract_error(monkeypatch) -> None:
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("nju_report.scope_ai.asyncio.sleep", no_sleep)
+
+    class Response:
+        completion_text = "不是 JSON"
+
+    class Context:
+        async def llm_generate(self, **kwargs):
+            del kwargs
+            return Response()
+
+    client = AstrBotScopeAiClient(
+        Context(),
+        provider_id="provider",
+        timeout_seconds=240,
+        max_retries=3,
+    )
+
+    with pytest.raises(ScopeAiError) as captured:
+        asyncio.run(
+            client.final_review_batch(
+                [
+                    QuestionGateCandidate(
+                        "c1",
+                        "南京大学校园卡如何补办？",
+                        report_date="2026-07-14",
+                    )
+                ]
+            )
+        )
+
+    summary = str(captured.value)
+    assert "last_error=ScopeAiResponseError" in summary
+    assert "last_error_detail=JSON 解析失败" in summary
+
+
 def test_batch_client_returns_format_error_to_model_for_repair() -> None:
     valid = json.dumps({"questions": []}, ensure_ascii=False)
 

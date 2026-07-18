@@ -62,7 +62,7 @@ class PluginConfig:
     embedding_model: str = "text-embedding-3-small"
     enable_vector_search: bool = True
     batch_concurrency: int = 2
-    request_timeout_seconds: int = 120
+    request_timeout_seconds: int = 240
     max_retries: int = 3
     scope_auto_review_enabled: bool = True
     scope_auto_review_max_rounds: int = 2
@@ -143,7 +143,7 @@ class PluginConfig:
             maximum=5,
         )
         batch_concurrency = _integer(raw, "batch_concurrency", 2, minimum=1, maximum=16)
-        request_timeout = _integer(raw, "request_timeout_seconds", 120, minimum=10, maximum=1800)
+        request_timeout = _integer(raw, "request_timeout_seconds", 240, minimum=10, maximum=1800)
         max_retries = _integer(raw, "max_retries", 3, minimum=0, maximum=10)
         smtp_port = _integer(raw, "smtp_port", 465, minimum=1, maximum=65535)
 

@@ -139,7 +139,7 @@
   "request_timeout_seconds": {
     "description": "单次模型或外部请求超时秒数",
     "type": "int",
-    "default": 120
+    "default": 240
   },
   "max_retries": {
     "description": "模型和外部请求的自动重试次数",

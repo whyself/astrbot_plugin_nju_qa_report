@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -17,6 +19,8 @@ from .models import (
 from .privacy import prepare_scope_input
 from .scope_classifier import QuestionGateCandidate, ScopeBatchMessage
 from .token_usage import TokenUsageTracker
+
+logger = logging.getLogger(__name__)
 
 _KNOWLEDGE_BASE_SELECTION_STANDARD = """
 筛选对象只能是“问题”，不是答案。唯一纳入标准：这个问题是否值得由
@@ -324,6 +328,10 @@ class ScopeAiResponseError(ScopeAiError):
     """Raised when the model does not return the required JSON contract."""
 
 
+def _single_line(value: str) -> str:
+    return " ".join(value.split()).strip()
+
+
 class AstrBotScopeAiClient:
     """Use one configured AstrBot chat provider for both independent passes."""
 
@@ -332,7 +340,7 @@ class AstrBotScopeAiClient:
         context: Any,
         *,
         provider_id: str = "",
-        timeout_seconds: int = 120,
+        timeout_seconds: int = 240,
         max_retries: int = 3,
         token_usage: TokenUsageTracker | None = None,
     ) -> None:
@@ -478,7 +486,14 @@ class AstrBotScopeAiClient:
         last_error: Exception | None = None
         retry_limit = min(self._max_retries, 3)
         current_prompt = prompt
+        report_dates = tuple(
+            dict.fromkeys(item.report_date for item in candidates if item.report_date)
+        )
+        report_date = report_dates[0] if len(report_dates) == 1 else ""
+        attempt_error_types: list[str] = []
+        started_at = time.monotonic()
         for attempt in range(retry_limit + 1):
+            attempt_started_at = time.monotonic()
             try:
                 response = await asyncio.wait_for(
                     self._context.llm_generate(
@@ -493,11 +508,36 @@ class AstrBotScopeAiClient:
                 if self._token_usage is not None:
                     self._token_usage.record(response)
                 completion = str(getattr(response, "completion_text", "") or "")
-                return parse_final_question_gate(completion, candidate_ids)
+                result = parse_final_question_gate(completion, candidate_ids)
+                logger.info(
+                    "NJU final gate completed report_date=%s candidate_count=%d "
+                    "attempt=%d/%d timeout_seconds=%d elapsed_seconds=%.3f",
+                    report_date or "unknown",
+                    len(candidate_ids),
+                    attempt + 1,
+                    retry_limit + 1,
+                    self._timeout_seconds,
+                    time.monotonic() - attempt_started_at,
+                )
+                return result
             except asyncio.CancelledError:
                 raise
             except ScopeAiResponseError as exc:
                 last_error = exc
+                attempt_error_types.append(type(exc).__name__)
+                logger.warning(
+                    "NJU final gate attempt failed report_date=%s candidate_count=%d "
+                    "attempt=%d/%d timeout_seconds=%d elapsed_seconds=%.3f "
+                    "error=%s detail=%s",
+                    report_date or "unknown",
+                    len(candidate_ids),
+                    attempt + 1,
+                    retry_limit + 1,
+                    self._timeout_seconds,
+                    time.monotonic() - attempt_started_at,
+                    type(exc).__name__,
+                    _single_line(str(exc))[:300],
+                )
                 if attempt < retry_limit:
                     current_prompt = _final_gate_repair_prompt(
                         prompt,
@@ -508,10 +548,36 @@ class AstrBotScopeAiClient:
                     await asyncio.sleep(min(0.5 * (2**attempt), 4.0))
             except Exception as exc:
                 last_error = exc
+                attempt_error_types.append(type(exc).__name__)
+                logger.warning(
+                    "NJU final gate attempt failed report_date=%s candidate_count=%d "
+                    "attempt=%d/%d timeout_seconds=%d elapsed_seconds=%.3f error=%s",
+                    report_date or "unknown",
+                    len(candidate_ids),
+                    attempt + 1,
+                    retry_limit + 1,
+                    self._timeout_seconds,
+                    time.monotonic() - attempt_started_at,
+                    type(exc).__name__,
+                )
                 if attempt < retry_limit:
                     await asyncio.sleep(min(0.5 * (2**attempt), 4.0))
         error_name = type(last_error).__name__ if last_error else "UnknownError"
-        raise ScopeAiError(f"AI 最终问题复核失败：{error_name}") from last_error
+        detail = (
+            _single_line(str(last_error))[:300]
+            if isinstance(last_error, ScopeAiResponseError)
+            else ""
+        )
+        audit = (
+            f"report_date={report_date or 'unknown'}; candidate_count={len(candidate_ids)}; "
+            f"attempts={retry_limit + 1}; timeout_seconds={self._timeout_seconds}; "
+            f"total_elapsed_seconds={time.monotonic() - started_at:.3f}; "
+            f"attempt_error_types={','.join(attempt_error_types) or error_name}; "
+            f"last_error={error_name}"
+        )
+        if detail:
+            audit += f"; last_error_detail={detail}"
+        raise ScopeAiError(f"AI 最终问题复核失败：{audit}") from last_error
 
     def _resolve_provider_id(self) -> str:
         if self._configured_provider_id:

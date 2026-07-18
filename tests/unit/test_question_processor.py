@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -254,7 +255,8 @@ def test_final_question_gate_drops_subjective_and_merges_duplicate_questions(
 def test_final_question_gate_failure_marks_only_selected_questions_retryable(
     tmp_path: Path,
 ) -> None:
-    storage = ReportStorage(tmp_path / "report.sqlite3")
+    database_path = tmp_path / "report.sqlite3"
+    storage = ReportStorage(database_path)
     storage.initialize()
     report_date = date(2026, 7, 12)
     window = natural_day_window(report_date, "Asia/Shanghai")
@@ -275,6 +277,16 @@ def test_final_question_gate_failure_marks_only_selected_questions_retryable(
     assert candidates[0].final_decision == "AUTO_REVIEW_ERROR"
     assert "最终问题 AI 闸门" in candidates[0].reason
     storage.close()
+    with sqlite3.connect(database_path) as connection:
+        error_summary = connection.execute(
+            "SELECT error_summary FROM scope_review_runs WHERE error_summary != ''"
+        ).fetchone()[0]
+    assert "FinalGateBatchError" in error_summary
+    assert "report_date=2026-07-12" in error_summary
+    assert "batch=1/1" in error_summary
+    assert "batch_candidates=1" in error_summary
+    assert "total_candidates=1" in error_summary
+    assert "cause=TimeoutError: final gate timeout" in error_summary
 
 
 def test_all_history_reports_completed_dates_as_skipped(tmp_path: Path) -> None:

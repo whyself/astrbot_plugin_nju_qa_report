@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from uuid import uuid4
@@ -25,6 +27,8 @@ from .scope_classifier import (
 )
 from .storage import ReportStorage
 from .time_windows import natural_day_window
+
+logger = logging.getLogger(__name__)
 
 _BATCH_MAX_TARGETS = 200
 _BATCH_MAX_TARGET_CHARS = 24_000
@@ -66,6 +70,10 @@ class _ScreenedTarget:
 class _GateGroup:
     candidate: QuestionGateCandidate
     targets: tuple[_ScreenedTarget, ...]
+
+
+class FinalGateBatchError(RuntimeError):
+    """A sanitized, persistable description of one failed final-gate batch."""
 
 
 class DailyQuestionProcessor:
@@ -297,9 +305,22 @@ class DailyQuestionProcessor:
         self._progress_completed = 0
         self._progress_total = len(groups)
         final_assessments: dict[str, ScopeAssessment] = {}
-        try:
-            for start in range(0, len(groups), _FINAL_GATE_BATCH_SIZE):
-                batch = groups[start : start + _FINAL_GATE_BATCH_SIZE]
+        batches = [
+            groups[start : start + _FINAL_GATE_BATCH_SIZE]
+            for start in range(0, len(groups), _FINAL_GATE_BATCH_SIZE)
+        ]
+        for batch_no, batch in enumerate(batches, start=1):
+            started_at = time.monotonic()
+            logger.info(
+                "NJU final gate batch started report_date=%s batch=%d/%d "
+                "batch_candidates=%d total_candidates=%d",
+                report_date,
+                batch_no,
+                len(batches),
+                len(batch),
+                len(groups),
+            )
+            try:
                 reviewed = await self._final_question_reviewer.final_review_batch(
                     [item.candidate for item in batch]
                 )
@@ -308,10 +329,29 @@ class DailyQuestionProcessor:
                     raise RuntimeError("最终问题 AI 闸门未完整返回候选 ID")
                 final_assessments.update(reviewed)
                 self._progress_completed += len(batch)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            return _final_gate_error_targets(targets, groups, exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                detail = " ".join(str(exc).split()).strip()
+                audit_error = FinalGateBatchError(
+                    f"report_date={report_date}; batch={batch_no}/{len(batches)}; "
+                    f"batch_candidates={len(batch)}; total_candidates={len(groups)}; "
+                    f"elapsed_seconds={time.monotonic() - started_at:.3f}; "
+                    f"cause={type(exc).__name__}"
+                    + (f": {detail}" if detail else "")
+                )
+                logger.warning("NJU final gate batch failed: %s", audit_error)
+                return _final_gate_error_targets(targets, groups, audit_error)
+            logger.info(
+                "NJU final gate batch completed report_date=%s batch=%d/%d "
+                "batch_candidates=%d total_candidates=%d elapsed_seconds=%.3f",
+                report_date,
+                batch_no,
+                len(batches),
+                len(batch),
+                len(groups),
+                time.monotonic() - started_at,
+            )
 
         by_message_id: dict[str, ScopeAssessment] = {}
         for group in groups:
