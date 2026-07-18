@@ -71,10 +71,29 @@ def community_context_degraded_count(clusters: list[QuestionCluster]) -> int:
     return sum(item.community_context_degraded for item in clusters)
 
 
+def community_context_degradation_event_count(clusters: list[QuestionCluster]) -> int:
+    return len(
+        {
+            item.community_context_audit.event_id or f"cluster:{item.question_code}"
+            for item in clusters
+            if item.community_context_degraded
+        }
+    )
+
+
+def _community_context_degradation_label(clusters: list[QuestionCluster]) -> str:
+    affected = community_context_degraded_count(clusters)
+    events = community_context_degradation_event_count(clusters)
+    if affected == events:
+        return f"社区上下文降级 {affected}"
+    return f"社区上下文降级 {affected}（独立事件 {events}）"
+
+
 def format_coverage_counts(
     counts: dict[CoverageStatus, int],
     *,
     community_context_degraded: int = 0,
+    community_context_degradation_events: int | None = None,
 ) -> str:
     text = (
         "状态统计："
@@ -83,7 +102,13 @@ def format_coverage_counts(
         f"明确回答 {counts[CoverageStatus.ANSWERABLE]}｜"
         f"程序执行异常 {counts[CoverageStatus.ERROR]}"
     )
-    return text + f"｜社区上下文降级 {community_context_degraded}"
+    degradation = f"社区上下文降级 {community_context_degraded}"
+    if (
+        community_context_degradation_events is not None
+        and community_context_degradation_events != community_context_degraded
+    ):
+        degradation += f"（独立事件 {community_context_degradation_events}）"
+    return text + f"｜{degradation}"
 
 
 def coverage_list_order(status: CoverageStatus) -> int:
@@ -374,6 +399,9 @@ def _summary_payload(
         "groups": sorted({alias for item in clusters for alias in item.group_aliases}),
         "screening_errors": screening_errors,
         "community_context_degraded": community_context_degraded_count(clusters),
+        "community_context_degradation_events": (
+            community_context_degradation_event_count(clusters)
+        ),
         "community_context_degradation_reasons": dict(
             sorted(
                 Counter(
@@ -403,7 +431,6 @@ def _render_mail_text(
     investigations: dict[str, InvestigationResult],
 ) -> str:
     counts = coverage_counts(clusters, investigations)
-    degraded = community_context_degraded_count(clusters)
     lines = [
         f"南大知识缺口日报 {report_date}",
         (
@@ -415,7 +442,7 @@ def _render_mail_text(
         ),
         "",
     ]
-    lines.insert(2, f"社区上下文降级 {degraded}")
+    lines.insert(2, _community_context_degradation_label(clusters))
     for cluster, status in _ordered_mail_items(clusters, investigations):
         answer = _mail_answer(cluster)
         lines.extend(
@@ -451,7 +478,6 @@ def _render_mail_html(
     investigations: dict[str, InvestigationResult],
 ) -> str:
     counts = coverage_counts(clusters, investigations)
-    degraded = community_context_degraded_count(clusters)
     rows: list[str] = []
     for cluster, status in _ordered_mail_items(clusters, investigations):
         foreground, background, border = _MAIL_STATUS_COLORS[status]
@@ -483,7 +509,8 @@ def _render_mail_html(
         f'<div style="font-size:18px;font-weight:700;margin-bottom:4px">南大知识缺口日报 '
         f'{html.escape(report_date)}</div>'
         f'<div style="color:#4b5563;margin-bottom:8px">{html.escape(summary)}</div>'
-        f'<div style="color:#4b5563;margin-bottom:8px">社区上下文降级 {degraded}</div>'
+        f'<div style="color:#4b5563;margin-bottom:8px">'
+        f'{html.escape(_community_context_degradation_label(clusters))}</div>'
         f'{"".join(rows)}'
         '<div style="margin-top:12px;color:#6b7280">完整调查、维护建议和引用见附件 HTML。</div>'
         '</div></body></html>'
@@ -592,7 +619,7 @@ def _render_html(
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;max-width:920px;margin:0 auto;padding:28px;background:#f6f7f9;color:#20242a;line-height:1.7}}
 header,article{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-bottom:18px}}h1,h2,h3{{line-height:1.35}}h2{{font-size:20px}}h3{{font-size:15px;margin-bottom:4px}}.meta{{color:#5b6472}}.stats{{display:flex;flex-wrap:wrap;gap:10px}}.stats span{{background:#eef3ff;border-radius:999px;padding:5px 11px}}a{{color:#185abd}}.command{{background:#f3f4f6;padding:9px 12px;border-radius:7px}}footer{{color:#68707d;font-size:13px;padding:12px}}</style></head>
 <body><header><h1>南大知识缺口日报</h1><p>报告日期：{html.escape(report_date)}｜群聊：{html.escape(groups)}</p>
-<div class="stats"><span>问题 {summary["question_count"]}</span><span>明确回答 {counts[CoverageStatus.ANSWERABLE.value]}</span><span>部分覆盖 {counts[CoverageStatus.PARTIAL.value]}</span><span>未找到可用信息 {counts[CoverageStatus.NO_USABLE_EVIDENCE.value]}</span><span>程序执行异常 {counts[CoverageStatus.ERROR.value]}</span><span>筛选技术错误 {summary["screening_errors"]}</span><span>社区上下文降级 {summary["community_context_degraded"]}</span></div></header>
+<div class="stats"><span>问题 {summary["question_count"]}</span><span>明确回答 {counts[CoverageStatus.ANSWERABLE.value]}</span><span>部分覆盖 {counts[CoverageStatus.PARTIAL.value]}</span><span>未找到可用信息 {counts[CoverageStatus.NO_USABLE_EVIDENCE.value]}</span><span>程序执行异常 {counts[CoverageStatus.ERROR.value]}</span><span>筛选技术错误 {summary["screening_errors"]}</span><span>社区上下文降级 {summary["community_context_degraded"]}（独立事件 {summary["community_context_degradation_events"]}）</span></div></header>
 {"".join(cards) if cards else "<article><p>本日没有纳入日报的问题。</p></article>"}
 <footer>本报告由非官方维护辅助插件生成。群聊回答由 AI 去除身份信息后归纳，内容未经核实；知识结论仅依据配置允许的语雀仓库。</footer></body></html>"""
 

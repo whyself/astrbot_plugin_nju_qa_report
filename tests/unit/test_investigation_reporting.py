@@ -34,6 +34,7 @@ from nju_report.reporting import (
     _render_mail_text,
     _summary_payload,
     _visible_evidence,
+    community_context_degradation_event_count,
     coverage_counts,
     coverage_list_order,
     format_coverage_counts,
@@ -715,10 +716,13 @@ def test_community_context_degradation_has_separate_public_count(tmp_path: Path)
             retry_errors=("invalid Q id",),
             degraded_question_ids=("Q1",),
             fallback_actions=("SAFE_QUESTION_FROM_UNCOVERED_ANCHOR",),
+            event_id="ctx:shared-event",
         ),
     )
     storage.save_question_clusters(cluster.report_date, [degraded])
-    clusters = storage.list_question_clusters(cluster.report_date)
+    stored = storage.list_question_clusters(cluster.report_date)
+    assert stored[0].community_context_audit.event_id == "ctx:shared-event"
+    clusters = [stored[0], replace(stored[0], question_code="20260712-Q002")]
     investigations = storage.investigations_for_date(cluster.report_date)
     counts = coverage_counts(clusters, investigations)
 
@@ -728,7 +732,11 @@ def test_community_context_degradation_has_separate_public_count(tmp_path: Path)
         investigations,
         screening_errors=0,
     )
-    text = format_coverage_counts(counts, community_context_degraded=1)
+    text = format_coverage_counts(
+        counts,
+        community_context_degraded=2,
+        community_context_degradation_events=1,
+    )
     mail_text = _render_mail_text(cluster.report_date, clusters, investigations)
     mail_html = _render_mail_html(cluster.report_date, clusters, investigations)
     detail = format_question_detail(
@@ -743,13 +751,15 @@ def test_community_context_degradation_has_separate_public_count(tmp_path: Path)
         timezone_name="Asia/Shanghai",
     )
 
-    assert summary["community_context_degraded"] == 1
+    assert summary["community_context_degraded"] == 2
+    assert summary["community_context_degradation_events"] == 1
+    assert community_context_degradation_event_count(clusters) == 1
     assert summary["community_context_degradation_reasons"] == {
-        "VALIDATION_UNRESOLVED": 1
+        "VALIDATION_UNRESOLVED": 2
     }
-    assert "社区上下文降级 1" in text
-    assert "社区上下文降级 1" in mail_text
-    assert "社区上下文降级 1" in mail_html
+    assert "社区上下文降级 2（独立事件 1）" in text
+    assert "社区上下文降级 2（独立事件 1）" in mail_text
+    assert "社区上下文降级 2（独立事件 1）" in mail_html
     assert "VALIDATION_UNRESOLVED" in detail
     assert "SAFE_QUESTION_FROM_UNCOVERED_ANCHOR" in detail
     storage.close()

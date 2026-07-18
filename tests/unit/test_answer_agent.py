@@ -88,7 +88,12 @@ def test_agent_finds_answer_in_first_50_messages_with_one_call() -> None:
         assert discovery.answers[0].redacted_text == "应先挂失，再前往服务点处理。"
         assert len(context.calls) == 1
         assert "tools" not in context.calls[0]
-        assert _prompt_payload(context.calls[0])["message_limit"] == 50
+        initial_payload = _prompt_payload(context.calls[0])
+        assert initial_payload["message_limit"] == 50
+        assert "allowed_message_ids" not in initial_payload
+        assert initial_payload["allowed_question_ids"] == ["Q1"]
+        assert initial_payload["allowed_answer_ids"] == ["M1", "M2"]
+        assert "allowed_answer_ids" in context.calls[0]["system_prompt"]
 
     asyncio.run(run())
 
@@ -342,9 +347,16 @@ def test_agent_keeps_valid_group_and_degrades_only_unrepaired_group() -> None:
         assert audit.retained_question_ids == ("Q1",)
         assert audit.degraded_question_ids == ("Q2",)
         assert "SAFE_QUESTION_FROM_UNCOVERED_ANCHOR" in audit.fallback_actions
-        correction = _prompt_payload(context.calls[1])["validation_correction"]
-        assert correction["reserved_question_ids"] == ["Q1"]
-        assert correction["reserved_answer_ids"] == ["M1"]
+        retry_payload = _prompt_payload(context.calls[1])
+        correction = retry_payload["validation_correction"]
+        assert correction["reserved_question_count"] == 1
+        assert correction["reserved_answer_count"] == 1
+        assert retry_payload["allowed_question_ids"] == ["Q2"]
+        assert retry_payload["allowed_answer_ids"] == []
+        assert [item["message_id"] for item in retry_payload["question_anchors"]] == [
+            "Q2"
+        ]
+        assert [item["message_id"] for item in retry_payload["messages"]] == ["Q2"]
 
     asyncio.run(run())
 
@@ -404,9 +416,53 @@ def test_agent_retries_only_the_group_that_reuses_an_answer() -> None:
         assert discovery.questions[0].answers
         assert discovery.questions[1].answers == ()
         assert all(not item.community_context_degraded for item in discovery.questions)
-        correction = _prompt_payload(context.calls[1])["validation_correction"]
-        assert correction["reserved_answer_ids"] == ["M1"]
+        retry_payload = _prompt_payload(context.calls[1])
+        correction = retry_payload["validation_correction"]
+        assert correction["reserved_question_count"] == 1
+        assert correction["reserved_answer_count"] == 1
+        assert retry_payload["allowed_question_ids"] == ["Q2"]
+        assert retry_payload["allowed_answer_ids"] == []
+        assert [item["message_id"] for item in retry_payload["messages"]] == ["Q2"]
+        assert "M1" not in json.dumps(retry_payload, ensure_ascii=False)
         assert any("already belong to another group" in item for item in correction["errors"])
+
+    asyncio.run(run())
+
+
+def test_invalid_extra_group_is_discarded_without_retry_when_all_anchors_are_safe() -> None:
+    async def run() -> None:
+        cluster = _cluster_for("q1")
+        messages = [
+            _message("q1", 100, "u1", "问题一？"),
+            _message("a1", 101, "u2", "问题一的回答。", reply="q1"),
+        ]
+        response = {
+            "question_groups": [
+                {
+                    "question_message_ids": ["Q1"],
+                    "answer_message_ids": ["M1"],
+                    "answer_summary": "问题一已有回答。",
+                },
+                {
+                    "question_message_ids": ["fabricated-id"],
+                    "answer_message_ids": [],
+                    "answer_summary": "",
+                },
+            ]
+        }
+        context = _FakeContext(
+            [SimpleNamespace(completion_text=json.dumps(response, ensure_ascii=False))]
+        )
+
+        discovery = await AstrBotContextAnswerAgent(
+            context, provider_id="provider"
+        ).collect(cluster, messages)
+
+        assert len(context.calls) == 1
+        assert discovery.question_message_ids == ("q1",)
+        assert discovery.answers
+        assert discovery.community_context_degraded is False
+        assert discovery.community_context_audit.initial_errors
 
     asyncio.run(run())
 
@@ -513,8 +569,15 @@ def test_cross_group_question_answer_overlap_retries_both_groups() -> None:
             ("q2",),
         ]
         assert all(not item.community_context_degraded for item in discovery.questions)
-        correction = _prompt_payload(context.calls[1])["validation_correction"]
-        assert correction["reserved_question_ids"] == ["Q2"]
+        retry_payload = _prompt_payload(context.calls[1])
+        correction = retry_payload["validation_correction"]
+        assert correction["reserved_question_count"] == 1
+        assert correction["reserved_answer_count"] == 1
+        assert retry_payload["allowed_question_ids"] == ["Q1"]
+        assert retry_payload["allowed_answer_ids"] == []
+        assert [item["message_id"] for item in retry_payload["messages"]] == ["Q1"]
+        assert "Q2" not in json.dumps(retry_payload, ensure_ascii=False)
+        assert "M1" not in json.dumps(retry_payload, ensure_ascii=False)
         assert any("候选问题锚点" in item for item in correction["errors"])
 
     asyncio.run(run())
@@ -693,6 +756,10 @@ def test_deterministic_fallback_sanitizes_ids_overlap_duplicates_and_summary() -
         assert "REBUILT_SUMMARY_FROM_VISIBLE_MESSAGES" in audit.fallback_actions
         assert "DROPPED_INVALID_ANSWERS_AND_CLEARED_SUMMARY" in audit.fallback_actions
         assert audit.degraded_question_ids == ("Q1", "Q2")
+        assert audit.event_id.startswith("ctx:")
+        assert {
+            item.community_context_audit.event_id for item in discovery.questions
+        } == {audit.event_id}
 
     asyncio.run(run())
 

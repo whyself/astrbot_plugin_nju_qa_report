@@ -34,6 +34,7 @@ from .nju_report.question_processor import (
 from .nju_report.report_query import parse_export_arguments, parse_list_arguments
 from .nju_report.reporting import (
     ReportService,
+    community_context_degradation_event_count,
     community_context_degraded_count,
     coverage_counts,
     coverage_label,
@@ -57,7 +58,7 @@ REPOSITORY_URL = "https://github.com/whyself/astrbot_plugin_nju_qa_report"
     PLUGIN_NAME,
     "whyself",
     "南京大学迎新问答采集与知识缺口日报（非官方）",
-    "0.6.9",
+    "0.6.11",
 )
 class NjuQaReportPlugin(Star):
     """Assemble services and isolate passive capture from AstrBot's reply flow."""
@@ -334,6 +335,9 @@ class NjuQaReportPlugin(Star):
             counts_text = format_coverage_counts(
                 counts,
                 community_context_degraded=community_context_degraded_count(clusters),
+                community_context_degradation_events=(
+                    community_context_degradation_event_count(clusters)
+                ),
             )
             yield event.plain_result(
                 f"{counts_text}\n\n"
@@ -347,6 +351,9 @@ class NjuQaReportPlugin(Star):
             format_coverage_counts(
                 counts,
                 community_context_degraded=community_context_degraded_count(clusters),
+                community_context_degradation_events=(
+                    community_context_degradation_event_count(clusters)
+                ),
             ),
             (
                 f"日报问题（范围：{scope}｜状态：{status_name}｜"

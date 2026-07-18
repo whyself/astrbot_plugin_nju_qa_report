@@ -84,7 +84,9 @@ x1 不得选择，摘要中也不得出现发言人姓名或昵称。
 不能合成一个问题。若 q4 只说“南三后面那栋在翻新吗”且上下文未明确校区，canonical_question
 必须保留“南三”，不得自行写成“仙林校区南三”或“鼓楼校区南园三舍”。
 每个 question_message_ids 至少保留一条，且只能取自 question_anchors；同一锚点只能属于一项。
-answer_message_ids 只能选择输入 messages 中实际存在的编号，不能与任何 question_message_ids 重叠，
+answer_message_ids 只能从输入 allowed_answer_ids 中选择；Q 开头的候选问题锚点绝不能作为回答。
+不得选择只出现在 messages、但未出现在 allowed_answer_ids 中的编号。
+answer_message_ids 不能与任何 question_message_ids 重叠，
 同一回答也不能分给多个问题。回答仅仅同属住宿、选课等大主题并不代表它回答了当前核心问题。
 """.strip()
 
@@ -266,7 +268,6 @@ class ChatContextLookup:
             "category": cluster.category,
             "representative_questions": list(cluster.representative_questions[:5]),
             "allowed_question_ids": list(self.allowed_question_ids),
-            "allowed_message_ids": list(self.allowed_message_ids),
             "allowed_answer_ids": list(self.allowed_answer_ids),
             "question_anchors": [self._message_payload(item) for item in self.anchors],
             "message_limit": limit,
@@ -500,6 +501,13 @@ class AstrBotContextAnswerAgent:
                 ),
                 degraded_question_ids=degraded_ids,
                 fallback_actions=("EXPANDED_PASS_EXCEPTION_SAFE_FALLBACK",),
+                event_id=_community_context_event_id(
+                    cluster.question_code,
+                    (f"expanded context assessment failed: {type(exc).__name__}",),
+                    (),
+                    degraded_ids,
+                    ("EXPANDED_PASS_EXCEPTION_SAFE_FALLBACK",),
+                ),
             )
             merged_audit = _merge_community_context_audits(
                 discovery.community_context_audit,
@@ -550,55 +558,39 @@ class AstrBotContextAnswerAgent:
         latest_groups = groups
         retry_used = False
         if errors and allow_retry:
-            retry_used = True
-            correction = {
-                "errors": list(errors),
-                "allowed_question_ids": list(lookup.allowed_question_ids),
-                "allowed_message_ids": list(lookup.allowed_message_ids),
-                "allowed_answer_ids": list(lookup.allowed_answer_ids),
-                "reserved_question_ids": [
-                    lookup._short_id(external_id)
-                    for item in accepted
-                    for external_id in item.question.question_message_ids
-                ],
-                "reserved_answer_ids": list(
-                    dict.fromkeys(
-                        lookup._short_id(lookup._external_id(answer_id))
-                        for item in accepted
-                        for answer_id in item.assessment.answer_message_ids
-                    )
-                ),
-                "instruction": (
-                    "Return only corrected groups that failed validation. "
-                    "Valid reserved groups are already retained in the final result, so do not "
-                    "repeat them or reuse their IDs."
-                ),
-            }
-            retry_payload = dict(payload)
-            retry_payload["validation_correction"] = correction
-            try:
-                retry_raw = await self._generate(retry_payload)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                retry_errors = (f"validation retry failed: {type(exc).__name__}",)
-                errors = retry_errors
+            retry_payload = _pruned_retry_payload(
+                payload,
+                lookup,
+                accepted,
+                errors,
+            )
+            if not retry_payload["allowed_question_ids"]:
+                errors = ()
             else:
-                retry_groups, retry_parse_errors = _parse_answer_groups(retry_raw)
-                latest_groups = retry_groups
-                accepted_for_retry, retry_groups, conflict_errors = (
-                    _reject_repair_cross_conflicts(accepted, retry_groups, lookup)
-                )
-                repaired, retry_errors = _validate_groups(
-                    retry_groups,
-                    lookup,
-                    cluster,
-                    accepted=accepted_for_retry,
-                    initial_errors=(*retry_parse_errors, *conflict_errors),
-                )
-                accepted = (*accepted_for_retry, *repaired)
-                errors = retry_errors
-                retry_errors = errors
+                retry_used = True
+                try:
+                    retry_raw = await self._generate(retry_payload)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    retry_errors = (f"validation retry failed: {type(exc).__name__}",)
+                    errors = retry_errors
+                else:
+                    retry_groups, retry_parse_errors = _parse_answer_groups(retry_raw)
+                    latest_groups = (*retry_groups, *groups)
+                    accepted_for_retry, retry_groups, conflict_errors = (
+                        _reject_repair_cross_conflicts(accepted, retry_groups, lookup)
+                    )
+                    repaired, retry_errors = _validate_groups(
+                        retry_groups,
+                        lookup,
+                        cluster,
+                        accepted=accepted_for_retry,
+                        initial_errors=(*retry_parse_errors, *conflict_errors),
+                    )
+                    accepted = (*accepted_for_retry, *repaired)
+                    errors = retry_errors
+                    retry_errors = errors
 
         questions = [item.question for item in accepted]
         fallback_actions: list[str] = []
@@ -689,6 +681,17 @@ class AstrBotContextAnswerAgent:
             retained_question_ids=tuple(dict.fromkeys(retained_ids)),
             degraded_question_ids=tuple(dict.fromkeys(degraded_ids)),
             fallback_actions=tuple(dict.fromkeys(fallback_actions)),
+            event_id=(
+                _community_context_event_id(
+                    cluster.question_code,
+                    (*initial_errors, *retry_errors),
+                    tuple(dict.fromkeys(retained_ids)),
+                    tuple(dict.fromkeys(degraded_ids)),
+                    tuple(dict.fromkeys(fallback_actions)),
+                )
+                if degraded_ids
+                else ""
+            ),
         )
         questions = [
             replace(
@@ -742,6 +745,109 @@ class AstrBotContextAnswerAgent:
         if not provider_id:
             raise AnswerAgentError("AstrBot 默认 Provider 没有有效 ID")
         return provider_id
+
+
+def _pruned_retry_payload(
+    payload: dict[str, Any],
+    lookup: ChatContextLookup,
+    accepted: Sequence[_AcceptedGroup],
+    errors: Sequence[str],
+) -> dict[str, Any]:
+    reserved_question_ids = tuple(
+        dict.fromkeys(
+            lookup._short_id(external_id)
+            for item in accepted
+            for external_id in item.question.question_message_ids
+        )
+    )
+    reserved_answer_ids = tuple(
+        dict.fromkeys(
+            lookup._short_id(lookup._external_id(answer_id))
+            for item in accepted
+            for answer_id in item.assessment.answer_message_ids
+        )
+    )
+    reserved_ids = {*reserved_question_ids, *reserved_answer_ids}
+    allowed_question_ids = tuple(
+        item for item in lookup.allowed_question_ids if item not in reserved_ids
+    )
+    allowed_answer_ids = tuple(
+        item for item in lookup.allowed_answer_ids if item not in reserved_ids
+    )
+    visible_ids = {*allowed_question_ids, *allowed_answer_ids}
+
+    def visible_message(item: object) -> dict[str, Any] | None:
+        if not isinstance(item, dict) or item.get("message_id") not in visible_ids:
+            return None
+        result = dict(item)
+        if result.get("reply_to_message_id") not in visible_ids:
+            result["reply_to_message_id"] = ""
+        return result
+
+    retry_payload = dict(payload)
+    retry_payload.pop("allowed_message_ids", None)
+    retry_payload["allowed_question_ids"] = list(allowed_question_ids)
+    retry_payload["allowed_answer_ids"] = list(allowed_answer_ids)
+    retry_payload["question_anchors"] = [
+        item
+        for item in payload.get("question_anchors", [])
+        if isinstance(item, dict) and item.get("message_id") in allowed_question_ids
+    ]
+    retry_payload["messages"] = [
+        visible
+        for item in payload.get("messages", [])
+        if (visible := visible_message(item)) is not None
+    ]
+    retry_payload["validation_correction"] = {
+        "errors": [
+            _redact_reserved_aliases(item, reserved_ids)[:500] for item in errors
+        ],
+        "allowed_question_ids": list(allowed_question_ids),
+        "allowed_answer_ids": list(allowed_answer_ids),
+        "reserved_question_count": len(reserved_question_ids),
+        "reserved_answer_count": len(reserved_answer_ids),
+        "retry_scope": "failed_groups_only",
+        "instruction": (
+            "Return only corrected groups for the remaining question anchors. "
+            "Previously accepted groups and their IDs have been removed from this input. "
+            "Use question IDs only from allowed_question_ids and answer IDs only from "
+            "allowed_answer_ids."
+        ),
+    }
+    return retry_payload
+
+
+def _redact_reserved_aliases(value: str, reserved_ids: set[str]) -> str:
+    result = value
+    for reserved_id in sorted(reserved_ids, key=len, reverse=True):
+        result = re.sub(
+            rf"(?<![A-Za-z0-9_]){re.escape(reserved_id)}(?![A-Za-z0-9_])",
+            "[RESERVED_ID]",
+            result,
+        )
+    return result
+
+
+def _community_context_event_id(
+    question_code: str,
+    errors: Sequence[str],
+    retained_ids: Sequence[str],
+    degraded_ids: Sequence[str],
+    fallback_actions: Sequence[str],
+) -> str:
+    payload = json.dumps(
+        {
+            "question_code": question_code,
+            "errors": list(errors),
+            "retained_ids": list(retained_ids),
+            "degraded_ids": list(degraded_ids),
+            "fallback_actions": list(fallback_actions),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"ctx:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:20]}"
 
 
 def _parse_answer_groups(
@@ -851,7 +957,6 @@ def _reject_repair_cross_conflicts(
     tuple[_AnswerAssessment, ...],
     tuple[str, ...],
 ]:
-    rejected_accepted: set[int] = set()
     rejected_repairs: set[int] = set()
     errors: list[str] = []
     for repair_index, repair in enumerate(repair_groups):
@@ -861,7 +966,7 @@ def _reject_repair_cross_conflicts(
         repair_answer_ids = {
             lookup._external_id(item) for item in repair.answer_message_ids
         }
-        for accepted_index, item in enumerate(accepted):
+        for item in accepted:
             accepted_question_ids = set(item.question.question_message_ids)
             accepted_answer_ids = {
                 lookup._external_id(answer_id)
@@ -872,15 +977,15 @@ def _reject_repair_cross_conflicts(
             )
             if not overlap:
                 continue
-            rejected_accepted.add(accepted_index)
             rejected_repairs.add(repair_index)
             errors.append(
                 f"repair group {repair_index + 1}: question/answer overlap with a "
-                "reserved group; both groups require safe fallback: "
+                "reserved group; the valid reserved group was retained and the repair "
+                "group was rejected: "
                 + ", ".join(sorted(lookup._short_id(value) for value in overlap))
             )
     return (
-        tuple(item for index, item in enumerate(accepted) if index not in rejected_accepted),
+        tuple(accepted),
         tuple(
             item for index, item in enumerate(repair_groups) if index not in rejected_repairs
         ),
@@ -1100,6 +1205,7 @@ def _merge_community_context_audits(
         fallback_actions=tuple(
             dict.fromkeys((*first.fallback_actions, *second.fallback_actions))
         ),
+        event_id=second.event_id or first.event_id,
     )
 
 

@@ -230,6 +230,7 @@ class CommunityContextAudit:
     retained_question_ids: tuple[str, ...] = ()
     degraded_question_ids: tuple[str, ...] = ()
     fallback_actions: tuple[str, ...] = ()
+    event_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)

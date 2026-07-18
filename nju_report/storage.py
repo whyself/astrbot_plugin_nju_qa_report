@@ -2254,6 +2254,7 @@ def _community_context_audit_json(audit: CommunityContextAudit) -> str:
             "retained_question_ids": list(audit.retained_question_ids),
             "degraded_question_ids": list(audit.degraded_question_ids),
             "fallback_actions": list(audit.fallback_actions),
+            "event_id": audit.event_id,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -2281,6 +2282,11 @@ def _community_context_audit_from_json(raw: str) -> CommunityContextAudit:
         retained_question_ids=strings("retained_question_ids"),
         degraded_question_ids=strings("degraded_question_ids"),
         fallback_actions=strings("fallback_actions"),
+        event_id=(
+            str(data.get("event_id", ""))[:200]
+            if isinstance(data.get("event_id", ""), str)
+            else ""
+        ),
     )
 
 
