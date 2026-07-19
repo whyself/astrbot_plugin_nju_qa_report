@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 from nju_report.answer_agent import (
@@ -46,6 +47,15 @@ def test_context_window_contains_only_the_question_group() -> None:
     assert discovery.question_message_ids == ("q1",)
     assert discovery.answers[0].redacted_text == "应先在信息门户挂失，再前往服务点处理。"
     assert discovery.answers[0].direct_reply is True
+
+
+def test_context_payload_exposes_explicit_screening_merge_lock() -> None:
+    cluster, messages = _case()
+    cluster = replace(cluster, screening_merge_locked=True)
+
+    payload = ChatContextLookup(cluster, messages).context_payload(cluster, limit=50)
+
+    assert payload["screening_merge_locked"] is True
 
 
 def test_context_window_excludes_configured_historical_bot_before_ai() -> None:

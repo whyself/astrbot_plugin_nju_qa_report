@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from .merge_markers import with_final_merge_marker, without_final_merge_marker
 from .models import (
     Clarity,
     KnowledgeValue,
@@ -40,12 +40,6 @@ _FINAL_GATE_BATCH_SIZE = 20
 _CURRENT_CONTEXT_AUDIT_PREFIX = "当次原始上下文复核"
 _CURRENT_CONTEXT_RADIUS = 10
 _CURRENT_CONTEXT_MESSAGE_LIMIT = 320
-_QUESTION_SIGNAL_RE = re.compile(
-    r"[?？]|(?:什么|怎么|如何|为什么|为啥|为何|多少|几时|几点|哪里|哪儿|"
-    r"哪个|哪栋|是否|能否|可否|有没有|有无|咋|何时|什么时候|谁|干嘛)|"
-    r"(?:吗|嘛|么|呢)\s*[。！!…~～]*$"
-)
-_REPLY_PREFIX_RE = re.compile(r"^\[回复[^\]]*\]\s*", re.DOTALL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,53 +297,72 @@ class DailyQuestionProcessor:
         *,
         chunks: list[_ScreeningChunk],
     ) -> tuple[list[_ScreenedTarget], _CurrentContextAudit]:
-        """Recheck question-like drops using only this run's raw conversation."""
+        """Recheck every batch omission using only this run's raw conversation."""
 
         chunk_by_message_id = {
             message_id: chunk
             for chunk in chunks
             for message_id, _, _ in chunk.targets
         }
-        reviews = 0
-        included = 0
-        confirmed_drops = 0
-        result: list[_ScreenedTarget] = []
+        reviewable: list[_ScreenedTarget] = []
         for target in targets:
             assessment = target.resolution.assessment
             if (
-                assessment.decision is not ScopeDecision.DROP
-                or assessment.reason != BATCH_OMISSION_REASON
-                or not _looks_question_like(_message_content(target.message))
+                assessment.decision is ScopeDecision.DROP
+                and assessment.reason == BATCH_OMISSION_REASON
             ):
-                result.append(target)
-                continue
+                reviewable.append(target)
 
-            reviewed = await self._scope_review_service.resolve(
-                _message_content(target.message),
-                _current_run_review_context(
-                    chunk_by_message_id.get(target.message_id),
-                    target.message_id,
-                ),
-            )
-            reviews += 1
+        semaphore = asyncio.Semaphore(self._concurrency)
+
+        async def review_target(
+            target: _ScreenedTarget,
+        ) -> tuple[_ScreenedTarget, bool, bool]:
+            async with semaphore:
+                reviewed = await self._scope_review_service.resolve(
+                    _message_content(target.message),
+                    _current_run_review_context(
+                        chunk_by_message_id.get(target.message_id),
+                        target.message_id,
+                    ),
+                )
+
             assessment = reviewed.assessment
+            was_included = False
+            was_confirmed_drop = False
             if assessment.decision is ScopeDecision.INCLUDE:
-                included += 1
+                was_included = True
                 assessment = _with_audit_reason(assessment)
             elif assessment.decision is ScopeDecision.DROP:
-                confirmed_drops += 1
+                was_confirmed_drop = True
                 assessment = _with_audit_reason(assessment)
             else:
                 reviewed = _current_context_error_resolution(reviewed)
                 assessment = reviewed.assessment
-            result.append(
+            return (
                 _with_current_context_review(
                     target,
                     reviewed,
                     assessment=assessment,
-                )
+                ),
+                was_included,
+                was_confirmed_drop,
             )
-        return result, _CurrentContextAudit(reviews, included, confirmed_drops)
+
+        reviewed_results = await asyncio.gather(
+            *(review_target(target) for target in reviewable)
+        )
+        replacements = {
+            target.message_id: target for target, _, _ in reviewed_results
+        }
+        result = [replacements.get(target.message_id, target) for target in targets]
+        return result, _CurrentContextAudit(
+            reviews=len(reviewable),
+            included=sum(was_included for _, was_included, _ in reviewed_results),
+            confirmed_drops=sum(
+                was_confirmed_drop for _, _, was_confirmed_drop in reviewed_results
+            ),
+        )
 
     async def _screen_chunk(
         self,
@@ -452,6 +465,12 @@ class DailyQuestionProcessor:
                 len(groups),
                 time.monotonic() - started_at,
             )
+
+        final_assessments = _mark_final_merge_assessments(
+            groups,
+            final_assessments,
+            failed_candidate_ids=failed_candidate_ids,
+        )
 
         by_message_id: dict[str, ScopeAssessment] = {}
         invalid_groups: list[_GateGroup] = []
@@ -561,6 +580,53 @@ def _valid_final_assessment(assessment: ScopeAssessment) -> bool:
         and assessment.knowledge_value in {KnowledgeValue.HIGH, KnowledgeValue.MEDIUM}
         and 0 <= assessment.confidence <= 1
     )
+
+
+def _mark_final_merge_assessments(
+    groups: list[_GateGroup],
+    assessments: dict[str, ScopeAssessment],
+    *,
+    failed_candidate_ids: set[str],
+) -> dict[str, ScopeAssessment]:
+    result = {
+        candidate_id: replace(
+            assessment,
+            reason=without_final_merge_marker(assessment.reason),
+        )
+        for candidate_id, assessment in assessments.items()
+    }
+    merge_buckets: dict[str, list[_GateGroup]] = {}
+    for group in groups:
+        candidate_id = group.candidate.candidate_id
+        if candidate_id in failed_candidate_ids:
+            continue
+        assessment = result.get(candidate_id)
+        if (
+            assessment is None
+            or assessment.decision is not ScopeDecision.INCLUDE
+            or not _valid_final_assessment(assessment)
+        ):
+            continue
+        canonical_key = " ".join(assessment.canonical_question.split()).casefold()
+        merge_buckets.setdefault(canonical_key, []).append(group)
+
+    for bucket in merge_buckets.values():
+        if len(bucket) < 2:
+            continue
+        member_message_ids = tuple(
+            target.message_id for group in bucket for target in group.targets
+        )
+        for group in bucket:
+            candidate_id = group.candidate.candidate_id
+            assessment = result[candidate_id]
+            result[candidate_id] = replace(
+                assessment,
+                reason=with_final_merge_marker(
+                    assessment.reason,
+                    member_message_ids,
+                ),
+            )
+    return result
 
 
 def _final_gate_error_targets(
@@ -727,11 +793,6 @@ def _current_run_review_context(
             f"{item.content[:_CURRENT_CONTEXT_MESSAGE_LIMIT]}"
         )
     return "\n".join(lines)
-
-
-def _looks_question_like(content: str) -> bool:
-    target_text = _REPLY_PREFIX_RE.sub("", content.strip(), count=1)
-    return bool(_QUESTION_SIGNAL_RE.search(target_text))
 
 
 def _with_audit_reason(assessment: ScopeAssessment) -> ScopeAssessment:

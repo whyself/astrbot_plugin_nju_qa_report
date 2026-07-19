@@ -12,6 +12,7 @@ from nju_report.aggregation import (
     context_dependent_question_title,
 )
 from nju_report.answer_agent import AnswerDiscoveryResult, DiscoveredQuestion
+from nju_report.merge_markers import with_final_merge_marker
 from nju_report.models import (
     CommunityAnswer,
     CommunityContextAudit,
@@ -89,6 +90,55 @@ def test_different_categories_do_not_merge_even_with_similar_text() -> None:
     ]
 
     assert len(_aggregate(candidates, [])) == 2
+
+
+def test_structured_merge_lock_is_not_erased_by_unlocked_similar_candidate() -> None:
+    canonical = "南京大学2026级新生学号查询时间及方式"
+    merge_reason = with_final_merge_marker(
+        "同一问题，合并处理",
+        ("q157", "q163"),
+    )
+    candidates = [
+        _candidate(
+            "20260712-Q157",
+            "message:qq:bot:q157",
+            "现在学号查得到不",
+            canonical,
+            "招生报到",
+            100,
+            reason=merge_reason,
+        ),
+        _candidate(
+            "20260712-Q163",
+            "message:qq:bot:q163",
+            "这个咋查的",
+            canonical,
+            "招生报到",
+            101,
+            reason=merge_reason,
+        ),
+        _candidate(
+            "20260712-Q181",
+            "message:qq:bot:q181",
+            ".nju.edu.cn哪里查学号",
+            "南京大学.nju.edu.cn服务如何查询学号",
+            "招生报到",
+            102,
+        ),
+    ]
+
+    clusters = _aggregate(candidates, [])
+
+    assert len(clusters) == 2
+    locked = next(item for item in clusters if item.screening_merge_locked)
+    assert locked.question_code == "20260712-Q157"
+    assert locked.candidate_source_keys == (
+        "message:qq:bot:q157",
+        "message:qq:bot:q163",
+    )
+    assert next(
+        item for item in clusters if not item.screening_merge_locked
+    ).question_code == "20260712-Q181"
 
 
 def test_answer_lookup_progress_counts_completed_clusters() -> None:
@@ -371,6 +421,100 @@ def test_answer_agent_can_split_one_overmerged_cluster_into_two_questions() -> N
     asyncio.run(run())
 
 
+def test_explicit_screening_merge_cannot_be_split_by_answer_agent() -> None:
+    canonical = "南京大学鼓楼校区和仙林校区各宿舍楼的床尺寸规格"
+    merge_reason = with_final_merge_marker(
+        "两个候选语义相同，予以合并",
+        ("q647", "q689"),
+    )
+
+    class Storage:
+        saved: list[QuestionCluster] = []
+
+        def list_question_candidates(self, *, report_date: str, limit):
+            del report_date, limit
+            return (
+                [
+                    _candidate(
+                        "20260718-Q647",
+                        "message:qq:bot:q647",
+                        "是不是每个楼的床尺寸不一样",
+                        canonical,
+                        "住宿食堂",
+                        100,
+                        reason=merge_reason,
+                    ),
+                    _candidate(
+                        "20260718-Q689",
+                        "message:qq:bot:q689",
+                        "仙林床多大啊",
+                        canonical,
+                        "宿舍设施",
+                        101,
+                        reason=merge_reason,
+                    ),
+                ],
+                2,
+            )
+
+        def messages_in_window(self, window):
+            del window
+            return [
+                _message("q647", 100, "u1", "是不是每个楼的床尺寸不一样"),
+                _message("q689", 101, "u2", "仙林床多大啊"),
+            ]
+
+        def save_question_clusters(self, report_date: str, clusters):
+            del report_date
+            self.saved = list(clusters)
+
+    class SplittingAgent:
+        async def collect(self, cluster, messages):
+            del messages
+            assert cluster.screening_merge_locked is True
+            return AnswerDiscoveryResult(
+                ("q647",),
+                (),
+                "不同宿舍楼的床尺寸是否不同",
+                "住宿食堂",
+                (
+                    DiscoveredQuestion(
+                        ("q689",),
+                        (),
+                        "仙林宿舍床尺寸",
+                        "住宿食堂",
+                    ),
+                ),
+            )
+
+    async def run() -> None:
+        storage = Storage()
+        service = QuestionAggregationService(  # type: ignore[arg-type]
+            storage,
+            SplittingAgent(),
+            timezone_name="Asia/Shanghai",
+            concurrency=1,
+        )
+
+        clusters = await service.aggregate_date(date(2026, 7, 18))
+
+        assert len(clusters) == 1
+        assert clusters[0].question_code == "20260718-Q647"
+        assert clusters[0].canonical_question == canonical
+        assert clusters[0].candidate_source_keys == (
+            "message:qq:bot:q647",
+            "message:qq:bot:q689",
+        )
+        assert clusters[0].screening_merge_locked is True
+        assert (
+            "SCREENING_MERGE_LOCK_ENFORCED"
+            in clusters[0].community_context_audit.fallback_actions
+        )
+        assert storage.saved == clusters
+
+    asyncio.run(run())
+
+
 def test_single_question_keeps_screening_canonical_when_agent_regresses_to_pronoun() -> None:
     class Storage:
         saved: list[QuestionCluster] = []
@@ -556,6 +700,8 @@ def _candidate(
     canonical: str,
     category: str,
     sent_at: int,
+    *,
+    reason: str = "",
 ) -> QuestionCandidate:
     return QuestionCandidate(
         question_code=code,
@@ -566,7 +712,7 @@ def _candidate(
         category=category,
         initial_decision="INCLUDE",
         final_decision="INCLUDE",
-        reason="",
+        reason=reason,
         confidence=0.9,
         status="RESOLVED",
         group_alias="南京大学迎新群",

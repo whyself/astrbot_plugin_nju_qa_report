@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
+from nju_report.merge_markers import final_merge_marker
 from nju_report.models import (
     Clarity,
     KnowledgeValue,
@@ -280,6 +281,82 @@ def test_final_question_gate_drops_subjective_and_merges_duplicate_questions(
     assert candidates[0].final_decision == "DROP"
     assert candidates[1].canonical_question == candidates[2].canonical_question
     assert candidates[1].canonical_question == "南京大学2026级本科生大二宿舍如何分配？"
+    assert final_merge_marker(candidates[1].reason)
+    assert final_merge_marker(candidates[1].reason) == final_merge_marker(
+        candidates[2].reason
+    )
+    storage.close()
+
+
+def test_final_gate_does_not_lock_one_pregrouped_upstream_candidate(
+    tmp_path: Path,
+) -> None:
+    canonical = "陶二条件如何，大二能否住上翻新宿舍"
+
+    class PregroupedScopeService:
+        async def resolve_batch(self, messages, target_ids):
+            del messages
+            return {
+                message_id: ScopeResolution(
+                    ScopeAssessment(
+                        decision=ScopeDecision.INCLUDE,
+                        reason="初筛暂时归为同一问题",
+                        confidence=0.9,
+                        canonical_question=canonical,
+                        category="住宿食堂",
+                        clarity=Clarity.CLEAR,
+                        knowledge_value=KnowledgeValue.HIGH,
+                    ),
+                    review_rounds=0,
+                )
+                for message_id in target_ids
+            }
+
+    class MarkerLikeFinalGate:
+        seen: list[QuestionGateCandidate] = []
+
+        async def final_review_batch(self, candidates):
+            self.seen.extend(candidates)
+            return {
+                item.candidate_id: ScopeAssessment(
+                    decision=ScopeDecision.INCLUDE,
+                    reason="[FINAL_MERGE:aaaaaaaaaaaaaaaa] 保留上游问题",
+                    confidence=0.95,
+                    canonical_question=canonical,
+                    category="住宿食堂",
+                    clarity=Clarity.CLEAR,
+                    knowledge_value=KnowledgeValue.HIGH,
+                )
+                for item in candidates
+            }
+
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    report_date = date(2026, 7, 12)
+    window = natural_day_window(report_date, "Asia/Shanghai")
+    storage.insert_message(
+        _stored("m-1", "陶二条件怎么样？", window.start_timestamp + 1)
+    )
+    storage.insert_message(
+        _stored("m-2", "大二能住上翻新宿舍吗？", window.start_timestamp + 2)
+    )
+    gate = MarkerLikeFinalGate()
+    processor = DailyQuestionProcessor(
+        storage,
+        PregroupedScopeService(),  # type: ignore[arg-type]
+        final_question_reviewer=gate,  # type: ignore[arg-type]
+        timezone_name="Asia/Shanghai",
+    )
+
+    result = asyncio.run(processor.process_date(report_date))
+
+    assert result.status == "COMPLETED"
+    assert len(gate.seen) == 1
+    assert gate.seen[0].source_count == 2
+    candidates, _ = storage.list_question_candidates(report_date=report_date.isoformat())
+    assert len(candidates) == 2
+    assert all(not final_merge_marker(item.reason) for item in candidates)
+    assert {item.reason for item in candidates} == {"保留上游问题"}
     storage.close()
 
 
@@ -380,7 +457,7 @@ def test_all_history_reports_completed_dates_as_skipped(tmp_path: Path) -> None:
     storage.close()
 
 
-def test_force_rerun_uses_only_current_raw_context_for_question_like_drops(
+def test_force_rerun_reviews_every_batch_omission_using_only_current_raw_context(
     tmp_path: Path,
 ) -> None:
     class CurrentContextScopeService:
@@ -402,11 +479,20 @@ def test_force_rerun_uses_only_current_raw_context_for_question_like_drops(
             }
 
         async def resolve(self, message: str, context: str = "") -> ScopeResolution:
-            assert message == "那么接替这玩意的是什么呢"
-            assert "小百合论坛已经关闭了" in context
             assert "上一筛选版本" not in context
             assert "不得参考、猜测或沿用任何历史筛选版本" in context
             self.review_contexts.append(context)
+            if message == "小百合论坛已经关闭了":
+                return ScopeResolution(
+                    ScopeAssessment(
+                        decision=ScopeDecision.DROP,
+                        reason="这是陈述消息",
+                        confidence=0.99,
+                    ),
+                    review_rounds=0,
+                )
+            assert message == "那么接替这玩意的是什么呢"
+            assert "小百合论坛已经关闭了" in context
             if self.review_mode == "include":
                 assessment = ScopeAssessment(
                     decision=ScopeDecision.INCLUDE,
@@ -452,8 +538,9 @@ def test_force_rerun_uses_only_current_raw_context_for_question_like_drops(
 
     first = asyncio.run(processor.process_date(report_date, force=True))
     assert first.included_count == 1
-    assert first.context_reviews == 1
+    assert first.context_reviews == 2
     assert first.context_included == 1
+    assert first.context_confirmed_drops == 1
     candidates, _ = storage.list_question_candidates(report_date=report_date.isoformat())
     target = next(item for item in candidates if "接替这玩意" in item.original_question)
     assert target.canonical_question == "南京大学小百合论坛关闭后的校内接替平台是什么"
@@ -464,7 +551,8 @@ def test_force_rerun_uses_only_current_raw_context_for_question_like_drops(
     candidates, _ = storage.list_question_candidates(report_date=report_date.isoformat())
     target = next(item for item in candidates if "接替这玩意" in item.original_question)
     assert failed_review.status == "RETRY_PENDING"
-    assert failed_review.context_reviews == 1
+    assert failed_review.context_reviews == 2
+    assert failed_review.context_confirmed_drops == 1
     assert target.final_decision == "AUTO_REVIEW_ERROR"
     assert target.canonical_question == ""
 
@@ -472,10 +560,130 @@ def test_force_rerun_uses_only_current_raw_context_for_question_like_drops(
     confirmed = asyncio.run(processor.process_date(report_date, force=True))
     candidates, _ = storage.list_question_candidates(report_date=report_date.isoformat())
     target = next(item for item in candidates if "接替这玩意" in item.original_question)
-    assert confirmed.context_reviews == 1
-    assert confirmed.context_confirmed_drops == 1
+    assert confirmed.context_reviews == 2
+    assert confirmed.context_confirmed_drops == 2
     assert target.final_decision == "DROP"
     assert "本次上下文不足" in target.reason
+    storage.close()
+
+
+def test_batch_omission_is_reviewed_without_question_shape_rules(tmp_path: Path) -> None:
+    class OmittedScopeService:
+        async def resolve_batch(self, messages, target_ids):
+            del messages
+            return {
+                message_id: ScopeResolution(
+                    ScopeAssessment(
+                        decision=ScopeDecision.DROP,
+                        reason=BATCH_OMISSION_REASON,
+                        confidence=0.8,
+                    ),
+                    review_rounds=0,
+                )
+                for message_id in target_ids
+            }
+
+        async def resolve(self, message: str, context: str = "") -> ScopeResolution:
+            assert message == "小百合是啥"
+            assert "不得参考、猜测或沿用任何历史筛选版本" in context
+            return ScopeResolution(
+                ScopeAssessment(
+                    decision=ScopeDecision.INCLUDE,
+                    reason="这是可沉淀的南京大学校园历史问题",
+                    confidence=0.98,
+                    canonical_question="南京大学小百合是什么",
+                    category="校园平台/历史",
+                    clarity=Clarity.CLEAR,
+                    knowledge_value=KnowledgeValue.HIGH,
+                ),
+                review_rounds=0,
+            )
+
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    report_date = date(2026, 7, 12)
+    window = natural_day_window(report_date, "Asia/Shanghai")
+    storage.insert_message(_stored("m-1", "小百合是啥", window.start_timestamp + 1))
+    processor = DailyQuestionProcessor(
+        storage,
+        OmittedScopeService(),  # type: ignore[arg-type]
+        timezone_name="Asia/Shanghai",
+    )
+
+    result = asyncio.run(processor.process_date(report_date, force=True))
+
+    assert result.context_reviews == 1
+    assert result.context_included == 1
+    candidates, _ = storage.list_question_candidates(report_date=report_date.isoformat())
+    assert candidates[0].final_decision == "INCLUDE"
+    assert candidates[0].canonical_question == "南京大学小百合是什么"
+    storage.close()
+
+
+def test_batch_omission_reviews_use_bounded_concurrency(tmp_path: Path) -> None:
+    class ConcurrentOmissionScopeService:
+        active = 0
+        peak = 0
+        seen: list[str] = []
+
+        async def resolve_batch(self, messages, target_ids):
+            del messages
+            return {
+                message_id: ScopeResolution(
+                    ScopeAssessment(
+                        decision=ScopeDecision.DROP,
+                        reason=BATCH_OMISSION_REASON,
+                        confidence=0.8,
+                    ),
+                    review_rounds=0,
+                )
+                for message_id in target_ids
+            }
+
+        async def resolve(self, message: str, context: str = "") -> ScopeResolution:
+            del context
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            try:
+                await asyncio.sleep(0.01)
+                self.seen.append(message)
+                return ScopeResolution(
+                    ScopeAssessment(
+                        decision=ScopeDecision.DROP,
+                        reason="模型明确判定为普通陈述",
+                        confidence=0.99,
+                    ),
+                    review_rounds=0,
+                )
+            finally:
+                self.active -= 1
+
+    storage = ReportStorage(tmp_path / "report.sqlite3")
+    storage.initialize()
+    report_date = date(2026, 7, 12)
+    window = natural_day_window(report_date, "Asia/Shanghai")
+    for index in range(6):
+        storage.insert_message(
+            _stored(
+                f"m-{index}",
+                f"普通陈述 {index}",
+                window.start_timestamp + index + 1,
+            )
+        )
+    service = ConcurrentOmissionScopeService()
+    processor = DailyQuestionProcessor(
+        storage,
+        service,  # type: ignore[arg-type]
+        timezone_name="Asia/Shanghai",
+        concurrency=2,
+    )
+
+    result = asyncio.run(processor.process_date(report_date, force=True))
+
+    assert result.context_reviews == 6
+    assert result.context_confirmed_drops == 6
+    assert sorted(service.seen) == [f"普通陈述 {index}" for index in range(6)]
+    assert service.peak == 2
     storage.close()
 
 

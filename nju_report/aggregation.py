@@ -9,7 +9,8 @@ from dataclasses import dataclass, field, replace
 from datetime import date
 from difflib import SequenceMatcher
 
-from .answer_agent import CommunityAnswerAgent
+from .answer_agent import CommunityAnswerAgent, DiscoveredQuestion
+from .merge_markers import final_merge_marker
 from .models import (
     CommunityContextAudit,
     CommunityContextDegradationReason,
@@ -23,6 +24,7 @@ from .time_windows import natural_day_window
 logger = logging.getLogger(__name__)
 
 _CANONICAL_RESTORED_ACTION = "CANONICAL_QUESTION_RESTORED_FROM_SCREENING"
+_SCREENING_MERGE_LOCK_ACTION = "SCREENING_MERGE_LOCK_ENFORCED"
 _CONTEXT_DEPENDENT_TITLE_RE = re.compile(
     r"(?:这玩意|那玩意|这东西|那东西|这个(?:呢|吗|是|怎么|如何)|"
     r"那个(?:呢|吗|是|怎么|如何)|上述|前者|后者|它(?:呢|是|怎么|如何)|"
@@ -33,12 +35,17 @@ _CONTEXT_DEPENDENT_TITLE_RE = re.compile(
 @dataclass(slots=True)
 class _ClusterBuilder:
     candidates: list[QuestionCandidate] = field(default_factory=list)
+    merge_marker: str = ""
 
     @property
     def representative(self) -> QuestionCandidate:
         return max(
             self.candidates, key=lambda item: (len(item.canonical_question), -item.sent_at_utc)
         )
+
+    @property
+    def merge_locked(self) -> bool:
+        return bool(self.merge_marker) and len(self.candidates) > 1
 
 
 class QuestionAggregationService:
@@ -125,6 +132,16 @@ class QuestionAggregationService:
                     }
                     split_results: list[QuestionCluster] = []
                     discovered_questions = discovery.questions
+                    if (
+                        cluster.screening_merge_locked
+                        and len(discovered_questions) > 1
+                    ):
+                        discovered_questions = (
+                            _collapse_screening_locked_questions(
+                                cluster,
+                                discovered_questions,
+                            ),
+                        )
                     is_true_split = len(discovered_questions) > 1
                     for question in discovered_questions:
                         refined_source_keys = tuple(
@@ -132,6 +149,8 @@ class QuestionAggregationService:
                             for item in question.question_message_ids
                             if item in source_by_external_id
                         )
+                        if cluster.screening_merge_locked:
+                            refined_source_keys = cluster.candidate_source_keys
                         refined_messages = [
                             message_by_external_id[item]
                             for item in question.question_message_ids
@@ -226,9 +245,28 @@ def _aggregate(
 ) -> list[QuestionCluster]:
     del messages  # Kept for compatibility; answer discovery is now Agent-driven.
     builders: list[_ClusterBuilder] = []
+    unlocked: list[QuestionCandidate] = []
+    locked_by_marker: dict[str, _ClusterBuilder] = {}
     for candidate in sorted(candidates, key=lambda item: (item.sent_at_utc, item.question_code)):
+        marker = final_merge_marker(candidate.reason)
+        if not marker:
+            unlocked.append(candidate)
+            continue
+        builder = locked_by_marker.get(marker)
+        if builder is None:
+            builder = _ClusterBuilder(merge_marker=marker)
+            locked_by_marker[marker] = builder
+            builders.append(builder)
+        builder.candidates.append(candidate)
+
+    for candidate in unlocked:
         match = next(
-            (builder for builder in builders if _same_question(candidate, builder.representative)),
+            (
+                builder
+                for builder in builders
+                if not builder.merge_marker
+                and _same_question(candidate, builder.representative)
+            ),
             None,
         )
         if match is None:
@@ -259,6 +297,7 @@ def _aggregate(
                 ),
                 first_sent_at_utc=min(item.sent_at_utc for item in ordered),
                 last_sent_at_utc=max(item.sent_at_utc for item in ordered),
+                screening_merge_locked=builder.merge_locked,
             )
         )
     return sorted(result, key=lambda item: item.question_code)
@@ -280,6 +319,66 @@ def _same_question(left: QuestionCandidate, right: QuestionCandidate) -> bool:
     right_terms = _bigrams(right_text)
     union = left_terms | right_terms
     return bool(union) and len(left_terms & right_terms) / len(union) >= 0.72
+def _collapse_screening_locked_questions(
+    cluster: QuestionCluster,
+    questions: tuple[DiscoveredQuestion, ...],
+) -> DiscoveredQuestion:
+    question_ids = tuple(
+        dict.fromkeys(
+            external_id
+            for question in questions
+            for external_id in question.question_message_ids
+        )
+    )
+    answers_by_id = {
+        answer.external_message_id: answer
+        for question in questions
+        for answer in question.answers
+    }
+    audits = [question.community_context_audit for question in questions]
+    degradation_reason = next(
+        (
+            question.community_context_degradation_reason
+            for question in questions
+            if question.community_context_degradation_reason
+            is not CommunityContextDegradationReason.NONE
+        ),
+        CommunityContextDegradationReason.NONE,
+    )
+    audit = CommunityContextAudit(
+        initial_errors=tuple(
+            dict.fromkeys(item for audit in audits for item in audit.initial_errors)
+        ),
+        retry_errors=tuple(
+            dict.fromkeys(item for audit in audits for item in audit.retry_errors)
+        ),
+        retained_question_ids=tuple(
+            dict.fromkeys(item for audit in audits for item in audit.retained_question_ids)
+        ),
+        degraded_question_ids=tuple(
+            dict.fromkeys(item for audit in audits for item in audit.degraded_question_ids)
+        ),
+        fallback_actions=tuple(
+            dict.fromkeys(
+                (
+                    *(item for audit in audits for item in audit.fallback_actions),
+                    _SCREENING_MERGE_LOCK_ACTION,
+                )
+            )
+        ),
+        event_id=next((audit.event_id for audit in audits if audit.event_id), ""),
+    )
+    return DiscoveredQuestion(
+        question_message_ids=question_ids,
+        answers=tuple(answers_by_id.values()),
+        canonical_question=cluster.canonical_question,
+        category=cluster.category,
+        community_context_degraded=any(
+            question.community_context_degraded for question in questions
+        ),
+        community_context_degradation_reason=degradation_reason,
+        community_context_audit=audit,
+    )
 
 
 def _resolved_canonical_question(

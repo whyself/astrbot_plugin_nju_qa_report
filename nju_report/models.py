@@ -271,6 +271,7 @@ class QuestionCluster:
         CommunityContextDegradationReason.NONE
     )
     community_context_audit: CommunityContextAudit = CommunityContextAudit()
+    screening_merge_locked: bool = False
 
     @property
     def occurrence_count(self) -> int:
